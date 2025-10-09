@@ -8,10 +8,19 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 .
 ├── README.md
 ├── server/
-│   └── provision/
-│       ├── install.sh
-│       └── templates/
-│           └── wg0.conf.template
+│   ├── provision/
+│   │   ├── env.example
+│   │   ├── templates/
+│   │   │   ├── client.conf.template
+│   │   │   └── wg0.conf.template
+│   │   ├── wg-add-peer.sh
+│   │   ├── wg-install.sh
+│   │   ├── wg-list-peers.sh
+│   │   ├── wg-qrcode.sh
+│   │   ├── wg-revoke-peer.sh
+│   │   └── wg-uninstall.sh
+│   └── split/
+│       └── README.md
 ├── core/
 │   ├── config-schema.json
 │   └── generate_wg_conf.py
@@ -24,10 +33,24 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 │       └── README.md
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   └── DEV-SETUP.md
+│   ├── DEV-SETUP.md
+│   └── SERVER-OPERATIONS.md
 └── .github/
     └── ISSUE_TEMPLATE.md
 ```
+
+## 服务器快速开始
+
+服务器侧的一键部署、运维与故障排查指南请参见
+[SERVER-OPERATIONS.md](docs/SERVER-OPERATIONS.md)。核心流程概览：
+
+1. `sudo bash server/provision/wg-install.sh --dry-run` 先预览即将执行的操作；
+2. `sudo bash server/provision/wg-install.sh --port 51820 --ifname wg0 --wan-if eth0`
+   真正完成安装并启动服务；
+3. 使用 `sudo bash server/provision/wg-add-peer.sh --name iphone --qrcode`
+   生成客户端配置并在 WireGuard App 中扫码导入。
+
+更多参数说明、升级/回滚方案和安全建议均在文档中详细记录。
 
 ## 开发路线图（前 10 轮迭代概览）
 
