@@ -1,13 +1,18 @@
-# 这是占位实现：PrivateTunnel WireGuard 服务器配置模板。
-# 请在后续迭代中根据 core/config-schema.json 生成的配置填充具体值。
+# WireGuard server configuration managed by PrivateTunnel provisioning scripts.
+# Do not edit manually unless you know what you are doing—use wg-install.sh or
+# peer management helpers so backups and sync operations remain consistent.
 
 [Interface]
-# Address = 10.7.0.1/24
-# ListenPort = 51820
-# PrivateKey = <SERVER_PRIVATE_KEY>
-# PostUp = iptables ...
-# PostDown = iptables ...
+Address = {{SERVER_ADDR}}
+{{SERVER_ADDR_V6}}
+ListenPort = {{PORT}}
+PrivateKey = {{SERVER_PRIVATE_KEY}}
+SaveConfig = false
 
-# [Peer]
-# PublicKey = <CLIENT_PUBLIC_KEY>
-# AllowedIPs = 10.7.0.2/32
+# The provisioning script dynamically injects firewall/NAT commands below. They
+# run automatically when systemd brings the interface up or down.
+{{POST_UP_BLOCK}}
+{{POST_DOWN_BLOCK}}
+
+# Additional peers are appended after this section. Use wg-add-peer.sh to manage
+# client entries safely.
