@@ -23,7 +23,16 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 │       └── README.md
 ├── core/
 │   ├── config-schema.json
-│   └── generate_wg_conf.py
+│   ├── examples/
+│   │   ├── minimal.json
+│   │   └── whitelist.json
+│   ├── qr/
+│   │   ├── README.md
+│   │   └── gen_qr.sh
+│   └── tools/
+│       ├── generate_wg_conf.py
+│       ├── render_from_env.py
+│       └── validate_config.py
 ├── apps/
 │   ├── ios/
 │   │   └── README.md
@@ -55,7 +64,7 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 ## 开发路线图（前 10 轮迭代概览）
 
 1. ✅ 搭建 monorepo 脚手架与占位脚本（当前）
-2. 设计 WireGuard 服务器配置生成逻辑与配置管理工具
+2. ✅ 设计 WireGuard 客户端配置与生成工具（详见 [CONFIG.md](docs/CONFIG.md)）
 3. 实现服务器自动化部署脚本（支持多节点与健康检查）
 4. 构建 iOS PacketTunnel Extension 原型，支持基本连接/断开
 5. 开发 macOS 桌面壳应用，集成自动更新配置
