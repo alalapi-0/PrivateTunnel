@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/privatetunnel/config.schema.json",
+  "title": "PrivateTunnel 配置模式 (占位版)",
+  "description": "这是占位实现：约束 PrivateTunnel server/client 配置文件的结构，后续迭代需要手工确认字段是否满足实际部署需求。",
+  "type": "object",
+  "required": ["server", "clients"],
+  "properties": {
+    "server": {
+      "type": "object",
+      "required": ["name", "endpoint", "listenPort", "address", "privateKeyPath"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "服务器标识名。"
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "WireGuard 服务器对外地址（例如 example.com:51820）。"
+        },
+        "listenPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "WireGuard 监听端口。"
+        },
+        "address": {
+          "type": "string",
+          "description": "服务器内网地址（CIDR 格式，例如 10.7.0.1/24）。"
+        },
+        "dns": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "hostname"
+          },
+          "description": "客户端可选 DNS 服务器列表。"
+        },
+        "privateKeyPath": {
+          "type": "string",
+          "description": "服务器私钥文件路径（应手工保管，脚本不会自动生成）。"
+        },
+        "postUp": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "接口启动时要执行的命令（需手工确认安全性）。"
+        },
+        "postDown": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "接口关闭时要执行的命令。"
+        }
+      }
+    },
+    "clients": {
+      "type": "array",
+      "description": "客户端配置列表。",
+      "items": {
+        "type": "object",
+        "required": ["name", "address", "publicKey", "allowedIPs"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "客户端名称，用于识别用途或设备。"
+          },
+          "address": {
+            "type": "string",
+            "description": "客户端分配的内网地址（CIDR 格式，例如 10.7.0.2/32）。"
+          },
+          "publicKey": {
+            "type": "string",
+            "description": "客户端公钥（需手工确认，脚本不生成密钥）。"
+          },
+          "presharedKeyPath": {
+            "type": "string",
+            "description": "可选的预共享密钥文件路径。"
+          },
+          "allowedIPs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "允许通过隧道的 IP 段。"
+          },
+          "persistentKeepalive": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535,
+            "description": "可选的 keepalive 间隔秒数。"
+          }
+        }
+      }
+    }
+  }
+}
