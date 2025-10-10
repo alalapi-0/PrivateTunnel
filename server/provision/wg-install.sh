@@ -15,6 +15,10 @@
 # Important: The script prints a summary including the public key and endpoint
 # details. Store secrets securely and audit backups stored in
 # /etc/wireguard/wg0.conf.bak-YYYYmmdd-HHMMSS when changes occur.
+#
+# Round 8 note: when enabling domain-based split routing, export `WAN_IF` and
+# `WG_CLIENT_CIDR` to match this server before running the helper scripts in
+# `server/split/`. See docs/SPLIT-IPSET.md for the full workflow.
 
 set -Eeuo pipefail
 

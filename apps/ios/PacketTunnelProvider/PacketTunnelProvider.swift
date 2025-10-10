@@ -81,6 +81,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 lastReconnectAt = nil
                 nextRetryDeadline = nil
             }
+            if config.routing.mode == .whitelist {
+                Logger.logInfo("Server-side ipset split active. Client will route full traffic set through tunnel.")
+            }
         } catch {
             Logger.logError("Failed to parse configuration: \(error.localizedDescription)")
             completionHandler(error)
@@ -296,6 +299,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 engine.setTrafficBlocked(true)
             }
 
+            if config.routing.mode == .whitelist {
+                Logger.logWarn("Whitelist routing in effect; 若持续异常，可在容器 App 中切换回 Global 模式排查。")
+            }
+
             let delay = self.backoff.nextDelay()
             self.reconnectAttemptCount += 1
             self.lastReconnectAt = Date()
@@ -373,7 +380,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let ipv4Settings = NEIPv4Settings(addresses: [address], subnetMasks: [mask])
         ipv4Settings.includedRoutes = [NEIPv4Route.default()]
         if config.routing.mode == .whitelist {
-            Logger.logWarn("whitelist 模式暂未细化，临时使用默认全局路由。")
+            Logger.logInfo("Whitelist mode: retaining default IPv4 route while server-side ipset filters destinations.")
         }
         settings.ipv4Settings = ipv4Settings
 

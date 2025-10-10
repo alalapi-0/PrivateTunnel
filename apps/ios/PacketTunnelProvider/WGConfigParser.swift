@@ -72,7 +72,11 @@ enum WGConfigParser {
                 }
             }
         } else {
-            Logger.logWarn("whitelist 模式暂时退化为全量路由，Round 8 将补全精细分流。")
+            if let allowed = config.routing.allowedIPs {
+                for cidr in allowed where !isValidCIDR(cidr) {
+                    throw WGConfigParserError.jsonDecodingFailed("AllowedIPs 包含非法 CIDR：\(cidr)")
+                }
+            }
         }
 
         return config
