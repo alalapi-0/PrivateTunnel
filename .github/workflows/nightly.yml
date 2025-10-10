@@ -1,0 +1,31 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  nightly-maintenance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Validate documentation links
+        run: |
+          python3 scripts/check_links.py README.md docs
+      - name: Resolve split domains (dry run)
+        run: |
+          set +e
+          python3 server/split/resolve_domains.py
+          status=$?
+          if [[ $status -ne 0 ]]; then
+            echo "::warning::Domain resolver exited with $status"
+          fi
+          exit 0
+      - name: Upload resolver state
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: nightly-split-state
+          path: server/split/state/resolved.json
