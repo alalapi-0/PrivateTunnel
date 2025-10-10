@@ -12,6 +12,7 @@
 //
 import SwiftUI
 import NetworkExtension
+import UIKit
 
 struct AlertDescriptor: Identifiable {
     let id = UUID()
@@ -56,6 +57,10 @@ struct ContentView: View {
     @State private var isPerformingAction = false
     @State private var killSwitchEnabled = false
     @State private var selectedRoutingMode: RoutingModeOption = .global
+    @State private var isPresentingExportConfirmation = false
+    @State private var isExportingDiagnostics = false
+    @State private var diagnosticsURL: URL?
+    @State private var showShareSheet = false
 
     private static let splitDocURL = URL(string: "https://github.com/PrivateTunnel/PrivateTunnel/blob/main/docs/SPLIT-IPSET.md")
 
@@ -171,11 +176,26 @@ struct ContentView: View {
             .alert(item: $alertDescriptor) { descriptor in
                 Alert(title: Text(descriptor.title), message: Text(descriptor.message), dismissButton: .default(Text("好的")))
             }
+            .confirmationDialog("导出诊断包", isPresented: $isPresentingExportConfirmation, titleVisibility: .visible) {
+                Button("确认导出") {
+                    startDiagnosticsExport()
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("诊断包包含最近日志与脱敏配置，用于排查问题。私钥与令牌已被遮蔽。")
+            }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: { configManager.reloadStoredConfigs() }) {
                         Label("刷新", systemImage: "arrow.clockwise")
                     }
+                }
+            }
+            .sheet(isPresented: $showShareSheet, onDismiss: { diagnosticsURL = nil }) {
+                if let url = diagnosticsURL {
+                    ActivityView(activityItems: [url])
+                } else {
+                    Text("未找到诊断文件")
                 }
             }
             .onAppear {
@@ -247,6 +267,10 @@ struct ContentView: View {
             .toggleStyle(SwitchToggleStyle(tint: .red))
             .padding(.vertical, 4)
 
+            if !tunnelManager.recentEvents.isEmpty {
+                eventTimeline
+            }
+
             HStack(spacing: 16) {
                 Button(action: connectSelectedConfig) {
                     if isPerformingAction {
@@ -267,6 +291,22 @@ struct ContentView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(isPerformingAction || tunnelManager.status() == .disconnected || tunnelManager.status() == .invalid)
+            }
+
+            Button(action: { isPresentingExportConfirmation = true }) {
+                Label("导出诊断包", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(isExportingDiagnostics)
+
+            if isExportingDiagnostics {
+                HStack {
+                    ProgressView()
+                    Text("正在打包诊断信息…")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
             }
         }
     }
@@ -325,6 +365,29 @@ struct ContentView: View {
         }
     }
 
+    private func startDiagnosticsExport() {
+        let activeConfig: TunnelConfig?
+        if let profile = selectedProfileName {
+            activeConfig = configManager.storedConfigs.first(where: { $0.profile_name == profile })
+        } else {
+            activeConfig = nil
+        }
+
+        isExportingDiagnostics = true
+        tunnelManager.exportDiagnostics(activeConfig: activeConfig) { result in
+            DispatchQueue.main.async {
+                isExportingDiagnostics = false
+                switch result {
+                case .failure(let error):
+                    alertDescriptor = AlertDescriptor(title: "导出失败", message: error.localizedDescription)
+                case .success(let url):
+                    diagnosticsURL = url
+                    showShareSheet = true
+                }
+            }
+        }
+    }
+
     private func statusDescription(for status: NEVPNStatus) -> String {
         switch status {
         case .connected:
@@ -346,6 +409,33 @@ struct ContentView: View {
 }
 
 extension ContentView {
+    private var eventTimeline: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("最近事件")
+                .font(.headline)
+            ForEach(Array(tunnelManager.recentEvents.suffix(12).reversed())) { entry in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: entry.level.symbolName)
+                        .foregroundColor(color(for: entry.level))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("\(timelineFormatter.string(from: entry.timestamp)) · \(entry.code)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text(entry.message)
+                            .font(.subheadline)
+                        if !entry.metadata.isEmpty {
+                            Text(entry.metadata.map { "\($0.key)=\($0.value)" }.joined(separator: ", "))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
     private var routingModeControls: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("分流模式")
@@ -447,6 +537,36 @@ extension ContentView {
         formatter.unitsStyle = .full
         return formatter.localizedString(for: date, relativeTo: Date())
     }
+}
+
+private let timelineFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateStyle = .none
+    formatter.timeStyle = .medium
+    return formatter
+}()
+
+private func color(for level: DiagnosticLogLevel) -> Color {
+    switch level {
+    case .info:
+        return .accentColor
+    case .warn:
+        return .yellow
+    case .error:
+        return .red
+    case .security:
+        return .purple
+    }
+}
+
+struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 struct ConfigDetailView: View {

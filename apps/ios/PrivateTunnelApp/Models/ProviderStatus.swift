@@ -127,17 +127,23 @@ struct ProviderStatus: Decodable {
         let timestamp: Date
         let code: String
         let message: String
+        let level: String
+        let metadata: [String: String]
 
         private enum CodingKeys: String, CodingKey {
             case timestamp
             case code
             case message
+            case level
+            case metadata
         }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             code = try container.decode(String.self, forKey: .code)
             message = try container.decode(String.self, forKey: .message)
+            level = try container.decodeIfPresent(String.self, forKey: .level) ?? "INFO"
+            metadata = try container.decodeIfPresent([String: String].self, forKey: .metadata) ?? [:]
             let raw = try container.decode(String.self, forKey: .timestamp)
             timestamp = ProviderStatus.isoFormatter.date(from: raw) ?? Date()
         }

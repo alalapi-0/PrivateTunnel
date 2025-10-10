@@ -78,7 +78,7 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 6. ✅ Round 6：实现 toy UDP/TUN 通道用于端到端联调（仅开发用途，详见 [TOY-TUN-END2END.md](docs/TOY-TUN-END2END.md)）。
 7. ✅ Round 7：iOS 健康检查、自动重连与软 Kill Switch（见 [HEALTH-AUTO-RECONNECT.md](docs/HEALTH-AUTO-RECONNECT.md)）。
 8. ✅ Round 8：域名分流（服务器 ipset/nftables + iOS 白名单模式，见 [SPLIT-IPSET.md](docs/SPLIT-IPSET.md)）。
-9. ☐ Round 9：开发 Windows 客户端壳应用（调用 WireGuard 官方驱动）。
+9. ✅ Round 9：安全审计与日志体系（详见 [SECURITY-HARDENING.md](docs/SECURITY-HARDENING.md) 与 [LOGGING.md](docs/LOGGING.md)）。
 10. ☐ Round 10：引入分流策略配置与灰度发布机制。
 11. ☐ Round 11：搭建状态监控与健康检查服务，提供仪表板。
 12. ☐ Round 12：完善 CI/CD、自动化测试与安全审计。

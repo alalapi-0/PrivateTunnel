@@ -34,6 +34,17 @@ a small VPS without additional dependencies.
    */5 * * * * TARGET_HTTP=https://www.apple.com RESTART_COMMAND="systemctl restart toy-watchdog" /opt/privatetunnel/watchdog/endpoint_probe.sh >> /var/log/endpoint_probe.log 2>&1
    ```
 
+## Logging
+
+- Runtime logs for the gateway and probe scripts should be stored under
+  `/var/log/private-tunnel/`. The sample `server/security/logrotate/` configs
+  rotate these files daily (toy gateway) or weekly (WireGuard journal export).
+- After deploying, symlink the sample logrotate files into
+  `/etc/logrotate.d/` and verify permissions via `server/security/audit.sh`.
+- Journald persistence defaults can be applied via
+  `server/security/journald/20-private-tunnel.conf` to retain a limited history
+  even across reboots.
+
 ## Troubleshooting
 
 - **Repeated ICMP failures** – Check cloud firewall/ security group rules. Some
