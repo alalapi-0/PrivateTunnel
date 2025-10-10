@@ -76,7 +76,7 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 4. ✅ Round 4：构建 iOS 容器 App，支持扫码/文件导入配置（详见 [IOS-APP.md](docs/IOS-APP.md)）。
 5. ✅ Round 5：集成 iOS PacketTunnel 扩展，建立基础的连接/断开流程（详见 [IOS-PACKET-TUNNEL.md](docs/IOS-PACKET-TUNNEL.md)）。
 6. ✅ Round 6：实现 toy UDP/TUN 通道用于端到端联调（仅开发用途，详见 [TOY-TUN-END2END.md](docs/TOY-TUN-END2END.md)）。
-7. ☐ Round 7：开发 macOS 桌面壳应用，集成自动更新配置。
+7. ✅ Round 7：iOS 健康检查、自动重连与软 Kill Switch（见 [HEALTH-AUTO-RECONNECT.md](docs/HEALTH-AUTO-RECONNECT.md)）。
 8. ☐ Round 8：开发 Windows 客户端壳应用（调用 WireGuard 官方驱动）。
 9. ☐ Round 9：引入分流策略配置与灰度发布机制。
 10. ☐ Round 10：搭建状态监控与健康检查服务，提供仪表板。

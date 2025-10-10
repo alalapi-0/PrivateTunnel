@@ -41,17 +41,20 @@ final class TunnelManager: ObservableObject {
     }
 
     @Published private(set) var currentStatus: NEVPNStatus = .invalid
+    @Published private(set) var providerStatus: ProviderStatus?
 
     private let providerBundleIdentifier = "com.privatetunnel.PacketTunnelProvider"
     private let providerConfigKey = "pt_config_json"
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
+    private var statusTimer: Timer?
 
     deinit {
         if let observer = statusObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        statusTimer?.invalidate()
     }
 
     func loadOrCreateProvider(completion: @escaping (Result<NETunnelProviderManager, Error>) -> Void) {
@@ -86,6 +89,7 @@ final class TunnelManager: ObservableObject {
 
             self?.observeStatusUpdates(for: targetManager)
             self?.manager = targetManager
+            self?.startStatusPolling()
 
             DispatchQueue.main.async {
                 completion(.success(targetManager))
@@ -170,6 +174,7 @@ final class TunnelManager: ObservableObject {
 
                     do {
                         try manager.connection.startVPNTunnel()
+                        self.requestStatusUpdate()
                         DispatchQueue.main.async {
                             completion?(.success(()))
                         }
@@ -186,6 +191,7 @@ final class TunnelManager: ObservableObject {
     func disconnect(completion: ((Result<Void, Error>) -> Void)? = nil) {
         if let manager {
             manager.connection.stopVPNTunnel()
+            stopStatusPolling()
             DispatchQueue.main.async {
                 completion?(.success(()))
             }
@@ -196,6 +202,7 @@ final class TunnelManager: ObservableObject {
                     completion?(.failure(error))
                 case .success(let manager):
                     manager.connection.stopVPNTunnel()
+                    self.stopStatusPolling()
                     DispatchQueue.main.async {
                         completion?(.success(()))
                     }
@@ -218,7 +225,45 @@ final class TunnelManager: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             self?.currentStatus = manager.connection.status
+            self?.requestStatusUpdate()
         }
         currentStatus = manager.connection.status
+    }
+
+    private func startStatusPolling() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.statusTimer?.invalidate()
+            let timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                self?.requestStatusUpdate()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.statusTimer = timer
+        }
+    }
+
+    private func stopStatusPolling() {
+        DispatchQueue.main.async { [weak self] in
+            self?.statusTimer?.invalidate()
+            self?.statusTimer = nil
+            self?.providerStatus = nil
+        }
+    }
+
+    private func requestStatusUpdate() {
+        guard let manager else { return }
+        let message = (try? JSONSerialization.data(withJSONObject: ["command": "status"], options: [])) ?? Data()
+        do {
+            try manager.connection.sendProviderMessage(message) { [weak self] data in
+                guard let data, let status = try? JSONDecoder().decode(ProviderStatus.self, from: data) else { return }
+                DispatchQueue.main.async {
+                    self?.providerStatus = status
+                }
+            }
+        } catch {
+            DispatchQueue.main.async { [weak self] in
+                self?.providerStatus = nil
+            }
+        }
     }
 }

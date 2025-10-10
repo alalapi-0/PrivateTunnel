@@ -5,21 +5,51 @@
 //  Purpose: Entry point of the Network Extension. It reconstructs the WGConfig
 //  passed by the container app, applies NEPacketTunnelNetworkSettings, and
 //  launches either the mock engine or the toy UDP/TUN bridge for development
-//  validation.
+//  validation. Round 7 extends the provider with unified health checking,
+//  automatic reconnect (with exponential backoff), and a best-effort kill switch.
 //
+
 import Foundation
 import NetworkExtension
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
-    private enum ActiveEngine {
-        case mock(WGEngineMock)
-        case toy(WGEngineToy)
-    }
-
     private let providerConfigKey = "pt_config_json"
-    private var engine: ActiveEngine?
+
+    private var engine: TunnelEngine?
+    private var engineKind: WGConfig.Engine = .mock
     private var currentConfig: WGConfig?
-    private var killSwitchEnabled = false
+    private var providerOptions: [String: Any] = [:]
+
+    private var healthChecker: HealthChecker?
+    private var latestHealthSnapshot: HealthSnapshot?
+    private var backoff = BackoffPolicy()
+    private var reconnectTimer: DispatchSourceTimer?
+    private var reconnectAttemptCount = 0
+    private var lastReconnectAt: Date?
+    private var nextRetryDeadline: Date?
+
+    private let controlQueue = DispatchQueue(label: "com.privatetunnel.provider.control", qos: .utility)
+    private let isoFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private let killSwitch = KillSwitch()
+    private var killSwitchState = KillSwitchState(enabled: false, engaged: false, reason: nil)
+
+    override init() {
+        super.init()
+        killSwitch.onStateChange = { [weak self] state in
+            guard let self else { return }
+            self.killSwitchState = state
+            if state.enabled && state.engaged {
+                self.engine?.setTrafficBlocked(true)
+            } else if !state.engaged {
+                self.engine?.setTrafficBlocked(false)
+            }
+        }
+    }
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         Logger.logInfo("PacketTunnelProvider.startTunnel invoked")
@@ -30,7 +60,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        guard let jsonString = protocolConfiguration.providerConfiguration?[providerConfigKey] as? String,
+        providerOptions = protocolConfiguration.providerConfiguration ?? [:]
+
+        guard let jsonString = providerOptions[providerConfigKey] as? String,
               let data = jsonString.data(using: .utf8) else {
             Logger.logError("Missing pt_config_json in providerConfiguration")
             completionHandler(NSError(domain: "PacketTunnel", code: -2, userInfo: [NSLocalizedDescriptionKey: "缺少配置数据"]))
@@ -41,7 +73,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         do {
             config = try WGConfigParser.parse(from: data)
             currentConfig = config
-            killSwitchEnabled = config.enableKillSwitch
+            controlQueue.sync {
+                reconnectTimer?.cancel()
+                reconnectTimer = nil
+                backoff.reset()
+                reconnectAttemptCount = 0
+                lastReconnectAt = nil
+                nextRetryDeadline = nil
+            }
         } catch {
             Logger.logError("Failed to parse configuration: \(error.localizedDescription)")
             completionHandler(error)
@@ -56,54 +95,274 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            self.startEngine(for: config)
-
-            Logger.logInfo("PacketTunnelProvider started successfully")
-            completionHandler(nil)
+            do {
+                try self.startEngine(for: config)
+                self.configureKillSwitch(enabled: config.enableKillSwitch)
+                self.setupHealthChecker(using: config)
+                Logger.logInfo("PacketTunnelProvider started successfully")
+                completionHandler(nil)
+            } catch {
+                Logger.logError("Engine start failed: \(error.localizedDescription)")
+                completionHandler(error)
+            }
         }
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         Logger.logInfo("PacketTunnelProvider.stopTunnel invoked. Reason: \(reason.rawValue)")
+        controlQueue.sync {
+            reconnectTimer?.cancel()
+            reconnectTimer = nil
+            backoff.reset()
+            reconnectAttemptCount = 0
+            lastReconnectAt = nil
+            nextRetryDeadline = nil
+        }
+        healthChecker?.stop()
+        healthChecker = nil
+        latestHealthSnapshot = nil
         stopActiveEngine()
         currentConfig = nil
-
-        // Placeholder: kill-switch strategy to be defined in later rounds.
-        if killSwitchEnabled {
-            Logger.logWarn("Kill switch requested but not yet implemented — traffic will follow system defaults.")
-        }
-        killSwitchEnabled = false
+        killSwitch.configure(enabled: false)
+        killSwitchState = killSwitch.currentState()
         completionHandler()
     }
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)? = nil) {
-        Logger.logInfo("Received app message of size \(messageData.count)")
         guard let handler = completionHandler else { return }
 
+        var command: String = "status"
+        if !messageData.isEmpty,
+           let object = try? JSONSerialization.jsonObject(with: messageData, options: []),
+           let dict = object as? [String: Any],
+           let providedCommand = dict["command"] as? String {
+            command = providedCommand
+        }
+
+        switch command {
+        case "status":
+            let response = buildStatusResponse()
+            let data = try? JSONSerialization.data(withJSONObject: response, options: [])
+            handler(data)
+        default:
+            handler(nil)
+        }
+    }
+
+    private func buildStatusResponse() -> [String: Any] {
         var response: [String: Any] = [
             "status": connection.status.rawValue
         ]
         if let config = currentConfig {
             response["profile_name"] = config.profileName
-            response["engine"] = config.engine.rawValue
+            response["engine"] = engineKind.rawValue
         }
 
-        if case .toy(let toy)? = engine {
-            let stats = toy.stats()
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            response["toy_stats"] = [
-                "packets_sent": stats.packetsSent,
-                "packets_received": stats.packetsReceived,
-                "bytes_sent": stats.bytesSent,
-                "bytes_received": stats.bytesReceived,
-                "last_activity": formatter.string(from: stats.lastActivity),
+        if let snapshot = latestHealthSnapshot {
+            var health: [String: Any] = [
+                "state": snapshot.state.rawValue,
+                "consecutive_fails": snapshot.consecutiveFails,
+                "consecutive_success": snapshot.consecutiveSuccess,
+                "reason_code": snapshot.reasonCode,
+                "reason_message": snapshot.reasonMessage
+            ]
+            if let last = snapshot.lastSuccessAt {
+                health["last_success_at"] = isoFormatter.string(from: last)
+            }
+            if let lastFail = snapshot.lastFailureAt {
+                health["last_failure_at"] = isoFormatter.string(from: lastFail)
+            }
+            response["health"] = health
+        }
+
+        if let engine = engine {
+            let stats = engine.stats()
+            var statsDict: [String: Any] = [
+                "tx_packets": stats.txPackets,
+                "rx_packets": stats.rxPackets,
+                "tx_bytes": stats.txBytes,
+                "rx_bytes": stats.rxBytes,
+                "endpoint": stats.endpoint,
                 "heartbeats_missed": stats.heartbeatsMissed
             ]
+            if let last = stats.lastAliveAt {
+                statsDict["last_alive_at"] = isoFormatter.string(from: last)
+            }
+            response["engine_stats"] = statsDict
         }
 
-        let data = try? JSONSerialization.data(withJSONObject: response, options: [])
-        handler(data)
+        controlQueue.sync {
+            var reconnect: [String: Any] = [
+                "attempts": reconnectAttemptCount
+            ]
+            if let last = lastReconnectAt {
+                reconnect["last_started_at"] = isoFormatter.string(from: last)
+            }
+            if let deadline = nextRetryDeadline {
+                reconnect["next_retry_in"] = max(0, deadline.timeIntervalSinceNow)
+            }
+            if backoff.lastDelay > 0 {
+                reconnect["last_delay"] = backoff.lastDelay
+            }
+            response["reconnect"] = reconnect
+        }
+
+        response["kill_switch"] = [
+            "enabled": killSwitchState.enabled,
+            "engaged": killSwitchState.engaged,
+            "reason": killSwitchState.reason ?? ""
+        ]
+
+        let events = Logger.recentEvents(limit: 20).map { record in
+            [
+                "timestamp": isoFormatter.string(from: record.timestamp),
+                "code": record.code,
+                "message": record.message
+            ]
+        }
+        response["events"] = events
+        return response
+    }
+
+    private func configureKillSwitch(enabled: Bool) {
+        killSwitch.configure(enabled: enabled)
+        killSwitchState = killSwitch.currentState()
+    }
+
+    private func setupHealthChecker(using config: WGConfig) {
+        healthChecker?.stop()
+        guard let engine else { return }
+
+        let probeInterval = (providerOptions["probe_interval_sec"] as? Double).map(TimeInterval.init) ?? 10
+        let failThreshold = providerOptions["fail_threshold"] as? Int ?? 3
+        let successThreshold = providerOptions["success_threshold"] as? Int ?? 2
+        let httpsURLs: [URL]
+        if let raw = providerOptions["https_probe_urls"] as? [String] {
+            httpsURLs = raw.compactMap { URL(string: $0) }
+        } else {
+            httpsURLs = [
+                URL(string: "https://1.1.1.1/cdn-cgi/trace")!,
+                URL(string: "https://api.openai.com/robots.txt")!
+            ]
+        }
+        let dnsHost = providerOptions["dns_probe_host"] as? String ?? "api.openai.com"
+
+        let configuration = HealthChecker.Configuration(
+            probeInterval: probeInterval,
+            failThreshold: failThreshold,
+            successThreshold: successThreshold,
+            httpsProbeURLs: httpsURLs,
+            dnsHost: dnsHost
+        )
+
+        let checker = HealthChecker(engine: engine, configuration: configuration)
+        checker.onSnapshot = { [weak self] snapshot in
+            self?.latestHealthSnapshot = snapshot
+        }
+        checker.onHealthChange = { [weak self] isHealthy, reason in
+            self?.handleHealthChange(isHealthy: isHealthy, reason: reason)
+        }
+        checker.start()
+        healthChecker = checker
+        latestHealthSnapshot = checker.currentSnapshot()
+    }
+
+    private func handleHealthChange(isHealthy: Bool, reason: HealthReason) {
+        if isHealthy {
+            backoff.reset()
+            controlQueue.async { [weak self] in
+                guard let self else { return }
+                self.reconnectTimer?.cancel()
+                self.reconnectTimer = nil
+                self.lastReconnectAt = nil
+                self.nextRetryDeadline = nil
+            }
+            killSwitch.disengage(reason: "Tunnel healthy")
+        } else {
+            scheduleReconnect(reason: reason)
+        }
+    }
+
+    private func scheduleReconnect(reason: HealthReason) {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.reconnectTimer == nil else { return }
+            guard let config = self.currentConfig, let engine = self.engine else { return }
+
+            self.healthChecker?.pause()
+            engine.stop()
+            if self.killSwitchState.enabled {
+                self.killSwitch.engage(reason: "Tunnel unhealthy: \(reason.message)")
+                engine.setTrafficBlocked(true)
+            }
+
+            let delay = self.backoff.nextDelay()
+            self.reconnectAttemptCount += 1
+            self.lastReconnectAt = Date()
+            self.nextRetryDeadline = self.lastReconnectAt?.addingTimeInterval(delay)
+            Logger.record(code: .eventEngineReconnect, message: "Scheduling reconnect in \(String(format: "%.1f", delay))s")
+
+            let timer = DispatchSource.makeTimerSource(queue: self.controlQueue)
+            timer.schedule(deadline: .now() + delay)
+            timer.setEventHandler { [weak self] in
+                self?.performReconnect()
+            }
+            timer.resume()
+            self.reconnectTimer = timer
+        }
+    }
+
+    private func performReconnect() {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.reconnectTimer?.cancel()
+            self.reconnectTimer = nil
+            self.nextRetryDeadline = nil
+            guard let config = self.currentConfig, let engine = self.engine else { return }
+            do {
+                try engine.start(with: config)
+                self.healthChecker?.resume()
+            } catch {
+                Logger.record(code: .errorEngineConfig, message: "Failed to restart engine: \(error.localizedDescription)")
+                self.scheduleReconnect(reason: .udpPingTimeout(error.localizedDescription))
+            }
+        }
+    }
+
+    private func startEngine(for config: WGConfig) throws {
+        if engine == nil || engineKind != config.engine {
+            let created = instantiateEngine(for: config)
+            engine = created.engine
+            engineKind = created.kind
+            if killSwitchState.enabled && killSwitchState.engaged {
+                engine?.setTrafficBlocked(true)
+            }
+        }
+        guard let engine else {
+            throw NSError(domain: "PacketTunnel", code: -3, userInfo: [NSLocalizedDescriptionKey: "Engine unavailable"])
+        }
+        try engine.start(with: config)
+    }
+
+    private func instantiateEngine(for config: WGConfig) -> (engine: TunnelEngine, kind: WGConfig.Engine) {
+        switch config.engine {
+        case .mock:
+            return (WGEngineMock(packetFlow: packetFlow), .mock)
+        case .toy:
+            guard config.routing.mode == .global else {
+                Logger.logWarn("Toy engine currently supports global routing only; falling back to mock engine.")
+                return (WGEngineMock(packetFlow: packetFlow), .mock)
+            }
+            return (WGEngineToy(packetFlow: packetFlow), .toy)
+        case .wireguard:
+            Logger.logWarn("WireGuard engine not yet integrated; using mock placeholder.")
+            return (WGEngineMock(packetFlow: packetFlow), .mock)
+        }
+    }
+
+    private func stopActiveEngine() {
+        engine?.stop()
+        engine = nil
     }
 
     private func applyNetworkSettings(for config: WGConfig, completion: @escaping (Error?) -> Void) {
@@ -151,42 +410,5 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             mask <<= 8
         }
         return octets.joined(separator: ".")
-    }
-
-    private func startEngine(for config: WGConfig) {
-        switch config.engine {
-        case .mock:
-            let engine = WGEngineMock(packetFlow: packetFlow)
-            engine.start(configuration: config)
-            self.engine = .mock(engine)
-        case .toy:
-            guard config.routing.mode == .global else {
-                Logger.logWarn("Toy engine currently supports global routing only; falling back to mock engine.")
-                let engine = WGEngineMock(packetFlow: packetFlow)
-                engine.start(configuration: config)
-                self.engine = .mock(engine)
-                return
-            }
-            let toyEngine = WGEngineToy(packetFlow: packetFlow)
-            toyEngine.start(configuration: config)
-            self.engine = .toy(toyEngine)
-        case .wireguard:
-            Logger.logWarn("WireGuard engine not yet integrated; using mock placeholder.")
-            let engine = WGEngineMock(packetFlow: packetFlow)
-            engine.start(configuration: config)
-            self.engine = .mock(engine)
-        }
-    }
-
-    private func stopActiveEngine() {
-        switch engine {
-        case .mock(let mock):
-            mock.stop()
-        case .toy(let toy):
-            toy.stop()
-        case .none:
-            break
-        }
-        engine = nil
     }
 }

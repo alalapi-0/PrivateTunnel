@@ -29,6 +29,7 @@ struct ContentView: View {
     @State private var alertDescriptor: AlertDescriptor?
     @State private var selectedProfileName: String?
     @State private var isPerformingAction = false
+    @State private var killSwitchEnabled = false
 
     var body: some View {
         NavigationStack {
@@ -67,6 +68,7 @@ struct ContentView: View {
                                 .contentShape(Rectangle())
                                 .onTapGesture {
                                     selectedProfileName = config.profile_name
+                                    killSwitchEnabled = config.enable_kill_switch
                                 }
                             }
                             .onDelete { indexSet in
@@ -150,6 +152,7 @@ struct ContentView: View {
             .onAppear {
                 if selectedProfileName == nil {
                     selectedProfileName = configManager.storedConfigs.first?.profile_name
+                    killSwitchEnabled = configManager.storedConfigs.first?.enable_kill_switch ?? false
                 }
                 tunnelManager.loadOrCreateProvider { result in
                     if case .failure(let error) = result {
@@ -161,8 +164,16 @@ struct ContentView: View {
                 if let currentSelection = selectedProfileName,
                    !configs.contains(where: { $0.profile_name == currentSelection }) {
                     selectedProfileName = configs.first?.profile_name
+                    killSwitchEnabled = configs.first?.enable_kill_switch ?? false
                 } else if selectedProfileName == nil {
                     selectedProfileName = configs.first?.profile_name
+                    killSwitchEnabled = configs.first?.enable_kill_switch ?? false
+                }
+            }
+            .onChange(of: selectedProfileName) { newValue in
+                if let name = newValue,
+                   let config = configManager.storedConfigs.first(where: { $0.profile_name == name }) {
+                    killSwitchEnabled = config.enable_kill_switch
                 }
             }
         }
@@ -187,6 +198,14 @@ struct ContentView: View {
                     .fontWeight(.semibold)
                 Spacer()
             }
+
+            healthSummary
+
+            Toggle(isOn: $killSwitchEnabled) {
+                Text("Enable Kill Switch（实验性）")
+            }
+            .toggleStyle(SwitchToggleStyle(tint: .red))
+            .padding(.vertical, 4)
 
             HStack(spacing: 16) {
                 Button(action: connectSelectedConfig) {
@@ -219,8 +238,19 @@ struct ContentView: View {
             return
         }
 
+        var updatedConfig = config
+        updatedConfig.enable_kill_switch = killSwitchEnabled
+        if updatedConfig.enable_kill_switch != config.enable_kill_switch {
+            do {
+                try configManager.save(config: updatedConfig)
+            } catch {
+                alertDescriptor = AlertDescriptor(title: "更新 Kill Switch 失败", message: error.localizedDescription)
+                return
+            }
+        }
+
         isPerformingAction = true
-        tunnelManager.save(configuration: config) { result in
+        tunnelManager.save(configuration: updatedConfig) { result in
             switch result {
             case .failure(let error):
                 isPerformingAction = false
@@ -269,6 +299,77 @@ struct ContentView: View {
     }
 }
 
+extension ContentView {
+    private var healthSummary: some View {
+        Group {
+            if let status = tunnelManager.providerStatus {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let health = status.health {
+                        Text("健康状态：\(health.state.capitalized)")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                        if let last = health.lastSuccessAt {
+                            Text("最近成功：\(relativeDateString(last))")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                        if let failure = health.lastFailureAt {
+                            Text("最近失败：\(relativeDateString(failure)) — \(health.reasonMessage)")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                    } else {
+                        Text("健康状态：未知")
+                            .font(.subheadline)
+                    }
+
+                    if let reconnect = status.reconnect {
+                        Text("重连次数：\(reconnect.attempts)")
+                            .font(.footnote)
+                        if let next = reconnect.nextRetryIn, next > 0 {
+                            Text("下次重连倒计时：约 \(Int(next)) 秒")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    if let kill = status.killSwitch, kill.enabled {
+                        if kill.engaged {
+                            Text("网络受限（重连中）：\(kill.reason)")
+                                .font(.footnote)
+                                .foregroundColor(.red)
+                        } else {
+                            Text("Kill Switch 已开启，但当前未触发。")
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    if let event = status.events.first {
+                        Text("最近事件：\(event.code) — \(event.message)")
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(Color(uiColor: .secondarySystemBackground))
+                .cornerRadius(10)
+            } else {
+                Text("尚未获取健康数据。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private func relativeDateString(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
 struct ConfigDetailView: View {
     let config: TunnelConfig
 
@@ -297,6 +398,9 @@ struct ConfigDetailView: View {
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }
+            Text("Kill Switch: \(config.enable_kill_switch ? "启用" : "关闭")")
+                .font(.footnote)
+                .foregroundColor(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding()

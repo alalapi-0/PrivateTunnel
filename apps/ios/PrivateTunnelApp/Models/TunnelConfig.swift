@@ -46,6 +46,7 @@ struct TunnelConfig: Codable, Identifiable {
     var client: Client
     var routing: Routing
     var notes: String?
+    var enable_kill_switch: Bool
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -54,15 +55,17 @@ struct TunnelConfig: Codable, Identifiable {
         case client
         case routing
         case notes
+        case enable_kill_switch = "enable_kill_switch"
     }
 
-    init(version: String, profile_name: String, endpoint: Endpoint, client: Client, routing: Routing, notes: String? = nil) {
+    init(version: String, profile_name: String, endpoint: Endpoint, client: Client, routing: Routing, notes: String? = nil, enable_kill_switch: Bool = false) {
         self.version = version
         self.profile_name = profile_name
         self.endpoint = endpoint
         self.client = client
         self.routing = routing
         self.notes = notes
+        self.enable_kill_switch = enable_kill_switch
     }
 
     init(from decoder: Decoder) throws {
@@ -73,6 +76,7 @@ struct TunnelConfig: Codable, Identifiable {
         client = try container.decode(Client.self, forKey: .client)
         routing = try container.decode(Routing.self, forKey: .routing)
         notes = try container.decodeIfPresent(String.self, forKey: .notes)
+        enable_kill_switch = try container.decodeIfPresent(Bool.self, forKey: .enable_kill_switch) ?? false
         id = UUID()
     }
 
@@ -84,6 +88,7 @@ struct TunnelConfig: Codable, Identifiable {
         try container.encode(client, forKey: .client)
         try container.encode(routing, forKey: .routing)
         try container.encodeIfPresent(notes, forKey: .notes)
+        try container.encode(enable_kill_switch, forKey: .enable_kill_switch)
     }
 
     static func from(jsonData: Data) throws -> TunnelConfig {
