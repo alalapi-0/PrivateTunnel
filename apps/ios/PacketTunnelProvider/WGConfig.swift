@@ -54,11 +54,18 @@ struct WGConfig: Decodable {
         }
     }
 
+    enum Engine: String, Decodable {
+        case mock
+        case toy
+        case wireguard
+    }
+
     let profileName: String
     let endpoint: Endpoint
     let client: Client
     let routing: Routing
     let enableKillSwitch: Bool
+    let engine: Engine
 
     enum CodingKeys: String, CodingKey {
         case profileName = "profile_name"
@@ -66,14 +73,16 @@ struct WGConfig: Decodable {
         case client
         case routing
         case enableKillSwitch = "enable_kill_switch"
+        case engine
     }
 
-    init(profileName: String, endpoint: Endpoint, client: Client, routing: Routing, enableKillSwitch: Bool = false) {
+    init(profileName: String, endpoint: Endpoint, client: Client, routing: Routing, enableKillSwitch: Bool = false, engine: Engine = .mock) {
         self.profileName = profileName
         self.endpoint = endpoint
         self.client = client
         self.routing = routing
         self.enableKillSwitch = enableKillSwitch
+        self.engine = engine
     }
 
     init(from decoder: Decoder) throws {
@@ -83,5 +92,6 @@ struct WGConfig: Decodable {
         client = try container.decode(Client.self, forKey: .client)
         routing = try container.decode(Routing.self, forKey: .routing)
         enableKillSwitch = try container.decodeIfPresent(Bool.self, forKey: .enableKillSwitch) ?? false
+        engine = try container.decodeIfPresent(Engine.self, forKey: .engine) ?? .mock
     }
 }

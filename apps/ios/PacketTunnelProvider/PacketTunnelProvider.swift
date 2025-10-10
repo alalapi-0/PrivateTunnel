@@ -4,14 +4,20 @@
 //
 //  Purpose: Entry point of the Network Extension. It reconstructs the WGConfig
 //  passed by the container app, applies NEPacketTunnelNetworkSettings, and
-//  launches the mock WireGuard engine to validate lifecycle flows.
+//  launches either the mock engine or the toy UDP/TUN bridge for development
+//  validation.
 //
 import Foundation
 import NetworkExtension
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
+    private enum ActiveEngine {
+        case mock(WGEngineMock)
+        case toy(WGEngineToy)
+    }
+
     private let providerConfigKey = "pt_config_json"
-    private var engine: WGEngineMock?
+    private var engine: ActiveEngine?
     private var currentConfig: WGConfig?
     private var killSwitchEnabled = false
 
@@ -50,9 +56,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            let engine = WGEngineMock(packetFlow: self.packetFlow)
-            engine.start(configuration: config)
-            self.engine = engine
+            self.startEngine(for: config)
 
             Logger.logInfo("PacketTunnelProvider started successfully")
             completionHandler(nil)
@@ -61,8 +65,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         Logger.logInfo("PacketTunnelProvider.stopTunnel invoked. Reason: \(reason.rawValue)")
-        engine?.stop()
-        engine = nil
+        stopActiveEngine()
         currentConfig = nil
 
         // Placeholder: kill-switch strategy to be defined in later rounds.
@@ -82,6 +85,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ]
         if let config = currentConfig {
             response["profile_name"] = config.profileName
+            response["engine"] = config.engine.rawValue
+        }
+
+        if case .toy(let toy)? = engine {
+            let stats = toy.stats()
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            response["toy_stats"] = [
+                "packets_sent": stats.packetsSent,
+                "packets_received": stats.packetsReceived,
+                "bytes_sent": stats.bytesSent,
+                "bytes_received": stats.bytesReceived,
+                "last_activity": formatter.string(from: stats.lastActivity),
+                "heartbeats_missed": stats.heartbeatsMissed
+            ]
         }
 
         let data = try? JSONSerialization.data(withJSONObject: response, options: [])
@@ -133,5 +151,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             mask <<= 8
         }
         return octets.joined(separator: ".")
+    }
+
+    private func startEngine(for config: WGConfig) {
+        switch config.engine {
+        case .mock:
+            let engine = WGEngineMock(packetFlow: packetFlow)
+            engine.start(configuration: config)
+            self.engine = .mock(engine)
+        case .toy:
+            guard config.routing.mode == .global else {
+                Logger.logWarn("Toy engine currently supports global routing only; falling back to mock engine.")
+                let engine = WGEngineMock(packetFlow: packetFlow)
+                engine.start(configuration: config)
+                self.engine = .mock(engine)
+                return
+            }
+            let toyEngine = WGEngineToy(packetFlow: packetFlow)
+            toyEngine.start(configuration: config)
+            self.engine = .toy(toyEngine)
+        case .wireguard:
+            Logger.logWarn("WireGuard engine not yet integrated; using mock placeholder.")
+            let engine = WGEngineMock(packetFlow: packetFlow)
+            engine.start(configuration: config)
+            self.engine = .mock(engine)
+        }
+    }
+
+    private func stopActiveEngine() {
+        switch engine {
+        case .mock(let mock):
+            mock.stop()
+        case .toy(let toy):
+            toy.stop()
+        case .none:
+            break
+        }
+        engine = nil
     }
 }
