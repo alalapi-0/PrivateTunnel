@@ -23,4 +23,8 @@ enum Logger {
     static func logError(_ message: String) {
         os_log("%{public}@", log: generalLog, type: .error, message)
     }
+
+    static func logDebug(_ message: String) {
+        os_log("%{public}@", log: generalLog, type: .debug, message)
+    }
 }

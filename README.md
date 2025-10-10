@@ -19,8 +19,13 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 │   │   ├── wg-qrcode.sh
 │   │   ├── wg-revoke-peer.sh
 │   │   └── wg-uninstall.sh
-│   └── split/
-│       └── README.md
+│   ├── split/
+│   │   └── README.md
+│   └── toy-gateway/
+│       ├── .env.example
+│       ├── setup_tun.sh
+│       ├── teardown_tun.sh
+│       └── toy_tun_gateway.py
 ├── core/
 │   ├── config-schema.json
 │   ├── examples/
@@ -47,7 +52,8 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 │   ├── DEV-SETUP.md
 │   ├── IOS-APP.md
 │   ├── IOS-PACKET-TUNNEL.md
-│   └── SERVER-OPERATIONS.md
+│   ├── SERVER-OPERATIONS.md
+│   └── TOY-TUN-END2END.md
 └── .github/
     └── ISSUE_TEMPLATE.md
 ```
@@ -69,11 +75,20 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 3. ✅ Round 3：实现服务器侧自动化脚本与配置二维码生成。
 4. ✅ Round 4：构建 iOS 容器 App，支持扫码/文件导入配置（详见 [IOS-APP.md](docs/IOS-APP.md)）。
 5. ✅ Round 5：集成 iOS PacketTunnel 扩展，建立基础的连接/断开流程（详见 [IOS-PACKET-TUNNEL.md](docs/IOS-PACKET-TUNNEL.md)）。
-6. ☐ Round 6：开发 macOS 桌面壳应用，集成自动更新配置。
-7. ☐ Round 7：开发 Windows 客户端壳应用（调用 WireGuard 官方驱动）。
-8. ☐ Round 8：引入分流策略配置与灰度发布机制。
-9. ☐ Round 9：搭建状态监控与健康检查服务，提供仪表板。
-10. ☐ Round 10：完善 CI/CD、自动化测试与安全审计。
+6. ✅ Round 6：实现 toy UDP/TUN 通道用于端到端联调（仅开发用途，详见 [TOY-TUN-END2END.md](docs/TOY-TUN-END2END.md)）。
+7. ☐ Round 7：开发 macOS 桌面壳应用，集成自动更新配置。
+8. ☐ Round 8：开发 Windows 客户端壳应用（调用 WireGuard 官方驱动）。
+9. ☐ Round 9：引入分流策略配置与灰度发布机制。
+10. ☐ Round 10：搭建状态监控与健康检查服务，提供仪表板。
+11. ☐ Round 11：完善 CI/CD、自动化测试与安全审计。
+
+## Toy 通道安全提醒
+
+Round 6 引入的 toy UDP/TUN 引擎仅用于在真机上验证通道是否贯通。**该实现没有任何加密或鉴权能力**，请务必：
+
+- 在受控环境下短时使用，测试完成后立即停止 `toy_tun_gateway.py` 并执行 `teardown_tun.sh`；
+- 使用云防火墙或安全组限制 UDP 监听端口的来源 IP；
+- 计划上线或长期使用时，务必更换为正式的 WireGuard 数据面。
 
 ## 开发前需要确认的事项
 
