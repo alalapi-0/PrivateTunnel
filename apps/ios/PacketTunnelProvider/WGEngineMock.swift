@@ -10,7 +10,7 @@ import Foundation
 import NetworkExtension
 import Darwin
 
-final class WGEngineMock {
+final class WGEngineMock: TunnelEngine {
     private let packetFlow: NEPacketTunnelFlow
     private let queue = DispatchQueue(label: "com.privatetunnel.mockengine", qos: .utility)
 
@@ -24,7 +24,7 @@ final class WGEngineMock {
         self.packetFlow = packetFlow
     }
 
-    func start(configuration: WGConfig) {
+    func start(with configuration: WGConfig) throws {
         guard !isRunning else { return }
         isRunning = true
         packetsRead = 0
@@ -44,6 +44,22 @@ final class WGEngineMock {
         healthTimer?.cancel()
         healthTimer = nil
         Logger.logInfo("[MockEngine] Stopped. Total read: \(packetsRead) packets, written: \(packetsWritten)")
+    }
+
+    func sendPing(completion: @escaping (Result<Void, Error>) -> Void) {
+        completion(.success(()))
+    }
+
+    func stats() -> EngineStats {
+        EngineStats(
+            txPackets: packetsWritten,
+            rxPackets: packetsRead,
+            txBytes: packetsWritten,
+            rxBytes: packetsRead,
+            lastAliveAt: lastActivity,
+            endpoint: "mock",
+            heartbeatsMissed: 0
+        )
     }
 
     private func scheduleReadLoop() {
