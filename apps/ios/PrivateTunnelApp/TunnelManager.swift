@@ -42,6 +42,7 @@ final class TunnelManager: ObservableObject {
 
     @Published private(set) var currentStatus: NEVPNStatus = .invalid
     @Published private(set) var providerStatus: ProviderStatus?
+    @Published private(set) var recentEvents: [DiagnosticLogEntry] = []
 
     private let providerBundleIdentifier = "com.privatetunnel.PacketTunnelProvider"
     private let providerConfigKey = "pt_config_json"
@@ -50,12 +51,22 @@ final class TunnelManager: ObservableObject {
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
     private var statusTimer: Timer?
+    private let logBuffer = LogRingBuffer()
+    private var knownExtensionEventKeys = Set<String>()
 
     deinit {
         if let observer = statusObserver {
             NotificationCenter.default.removeObserver(observer)
         }
         statusTimer?.invalidate()
+    }
+
+    private func appendAppLog(level: DiagnosticLogLevel, code: String, message: String, metadata: [String: String] = [:]) {
+        logBuffer.append(level: level, code: code, message: message, metadata: metadata)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.recentEvents = self.logBuffer.recent(limit: 100)
+        }
     }
 
     func loadOrCreateProvider(completion: @escaping (Result<NETunnelProviderManager, Error>) -> Void) {
@@ -168,14 +179,17 @@ final class TunnelManager: ObservableObject {
     }
 
     func connect(completion: ((Result<Void, Error>) -> Void)? = nil) {
+        appendAppLog(level: .info, code: "APP_CONNECT", message: "用户触发连接请求")
         loadOrCreateProvider { [weak self] result in
             guard let self else { return }
             switch result {
             case .failure(let error):
+                self.appendAppLog(level: .error, code: "APP_CONNECT_FAIL", message: "加载 VPN 配置失败", metadata: ["error": error.localizedDescription])
                 completion?(.failure(error))
             case .success(let manager):
                 manager.loadFromPreferences { error in
                     if let error {
+                        self.appendAppLog(level: .error, code: "APP_CONNECT_FAIL", message: "同步 VPN 配置失败", metadata: ["error": error.localizedDescription])
                         DispatchQueue.main.async {
                             completion?(.failure(error))
                         }
@@ -185,10 +199,12 @@ final class TunnelManager: ObservableObject {
                     do {
                         try manager.connection.startVPNTunnel()
                         self.requestStatusUpdate()
+                        self.appendAppLog(level: .info, code: "APP_CONNECT_OK", message: "VPN 启动命令已发送")
                         DispatchQueue.main.async {
                             completion?(.success(()))
                         }
                     } catch {
+                        self.appendAppLog(level: .error, code: "APP_CONNECT_FAIL", message: "启动隧道失败", metadata: ["error": error.localizedDescription])
                         DispatchQueue.main.async {
                             completion?(.failure(TunnelError.startFailed(error)))
                         }
@@ -199,20 +215,25 @@ final class TunnelManager: ObservableObject {
     }
 
     func disconnect(completion: ((Result<Void, Error>) -> Void)? = nil) {
+        appendAppLog(level: .info, code: "APP_DISCONNECT", message: "用户触发断开请求")
         if let manager {
             manager.connection.stopVPNTunnel()
             stopStatusPolling()
+            appendAppLog(level: .info, code: "APP_DISCONNECT_OK", message: "VPN 停止命令已发送")
             DispatchQueue.main.async {
                 completion?(.success(()))
             }
         } else {
-            loadOrCreateProvider { result in
+            loadOrCreateProvider { [weak self] result in
+                guard let self else { return }
                 switch result {
                 case .failure(let error):
+                    self.appendAppLog(level: .error, code: "APP_DISCONNECT_FAIL", message: "加载 VPN 管理器失败", metadata: ["error": error.localizedDescription])
                     completion?(.failure(error))
                 case .success(let manager):
                     manager.connection.stopVPNTunnel()
                     self.stopStatusPolling()
+                    self.appendAppLog(level: .info, code: "APP_DISCONNECT_OK", message: "VPN 停止命令已发送")
                     DispatchQueue.main.async {
                         completion?(.success(()))
                     }
@@ -223,6 +244,59 @@ final class TunnelManager: ObservableObject {
 
     func status() -> NEVPNStatus {
         manager?.connection.status ?? currentStatus
+    }
+
+    func fetchExtensionEvents(limit: Int = 200, completion: @escaping (Result<[ProviderStatus.Event], Error>) -> Void) {
+        guard let manager else {
+            completion(.failure(TunnelError.configurationUnavailable))
+            return
+        }
+        let payload: [String: Any] = [
+            "command": "events",
+            "limit": limit
+        ]
+        let message = (try? JSONSerialization.data(withJSONObject: payload, options: [])) ?? Data()
+        do {
+            try manager.connection.sendProviderMessage(message) { data in
+                guard let data else {
+                    completion(.success([]))
+                    return
+                }
+                do {
+                    let envelope = try JSONDecoder().decode(EventsEnvelope.self, from: data)
+                    completion(.success(envelope.events))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        } catch {
+            completion(.failure(error))
+        }
+    }
+
+    func exportDiagnostics(activeConfig: TunnelConfig?, completion: @escaping (Result<URL, Error>) -> Void) {
+        fetchExtensionEvents(limit: 200) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let events):
+                let appLogs = self.logBuffer.recent(limit: 200)
+                var additional: [String: Data] = [:]
+                if let status = self.providerStatus {
+                    if let data = try? JSONSerialization.data(withJSONObject: self.providerStatusDictionary(status), options: [.prettyPrinted, .sortedKeys]) {
+                        additional["provider_status.json"] = data
+                    }
+                }
+                let snapshot = DiagnosticsSnapshot(appLogs: appLogs, extensionEvents: events, activeConfig: activeConfig, additionalFiles: additional)
+                do {
+                    let url = try ExportDiagnostics.buildArchive(from: snapshot)
+                    completion(.success(url))
+                } catch {
+                    completion(.failure(error))
+                }
+            }
+        }
     }
 
     private func observeStatusUpdates(for manager: NETunnelProviderManager) {
@@ -269,11 +343,116 @@ final class TunnelManager: ObservableObject {
                 DispatchQueue.main.async {
                     self?.providerStatus = status
                 }
+                self?.ingestExtensionEvents(status.events)
             }
         } catch {
             DispatchQueue.main.async { [weak self] in
                 self?.providerStatus = nil
             }
         }
+    }
+
+    private func ingestExtensionEvents(_ events: [ProviderStatus.Event]) {
+        guard !events.isEmpty else { return }
+        var added = false
+        for event in events.sorted(by: { $0.timestamp < $1.timestamp }) {
+            let key = "\(event.code)|\(event.message)|\(event.timestamp.timeIntervalSince1970)"
+            if knownExtensionEventKeys.contains(key) { continue }
+            knownExtensionEventKeys.insert(key)
+            let level = DiagnosticLogLevel(rawValue: event.level.uppercased()) ?? .info
+            let entry = DiagnosticLogEntry(timestamp: event.timestamp, level: level, code: event.code, message: event.message, metadata: event.metadata)
+            logBuffer.append(entry)
+            added = true
+        }
+        if added {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.recentEvents = self.logBuffer.recent(limit: 100)
+            }
+        }
+    }
+}
+
+private struct EventsEnvelope: Decodable {
+    let events: [ProviderStatus.Event]
+}
+
+extension TunnelManager {
+    private func providerStatusDictionary(_ status: ProviderStatus) -> [String: Any] {
+        var dict: [String: Any] = [
+            "status": status.status
+        ]
+        if let name = status.profileName {
+            dict["profile_name"] = name
+        }
+        if let engine = status.engine {
+            dict["engine"] = engine
+        }
+        if let health = status.health {
+            var healthDict: [String: Any] = [
+                "state": health.state,
+                "consecutive_fails": health.consecutiveFails,
+                "consecutive_success": health.consecutiveSuccess,
+                "reason_code": health.reasonCode,
+                "reason_message": health.reasonMessage
+            ]
+            if let lastSuccess = health.lastSuccessAt {
+                healthDict["last_success_at"] = ProviderStatus.isoFormatter.string(from: lastSuccess)
+            }
+            if let lastFailure = health.lastFailureAt {
+                healthDict["last_failure_at"] = ProviderStatus.isoFormatter.string(from: lastFailure)
+            }
+            dict["health"] = healthDict
+        }
+        if let reconnect = status.reconnect {
+            var reconnectDict: [String: Any] = [
+                "attempts": reconnect.attempts
+            ]
+            if let last = reconnect.lastStartedAt {
+                reconnectDict["last_started_at"] = ProviderStatus.isoFormatter.string(from: last)
+            }
+            if let next = reconnect.nextRetryIn {
+                reconnectDict["next_retry_in"] = next
+            }
+            if let delay = reconnect.lastDelay {
+                reconnectDict["last_delay"] = delay
+            }
+            dict["reconnect"] = reconnectDict
+        }
+        if let kill = status.killSwitch {
+            dict["kill_switch"] = [
+                "enabled": kill.enabled,
+                "engaged": kill.engaged,
+                "reason": kill.reason
+            ]
+        }
+        if let stats = status.engineStats {
+            var statsDict: [String: Any] = [
+                "tx_packets": stats.txPackets,
+                "rx_packets": stats.rxPackets,
+                "tx_bytes": stats.txBytes,
+                "rx_bytes": stats.rxBytes,
+                "endpoint": stats.endpoint,
+                "heartbeats_missed": stats.heartbeatsMissed
+            ]
+            if let last = stats.lastAliveAt {
+                statsDict["last_alive_at"] = ProviderStatus.isoFormatter.string(from: last)
+            }
+            dict["engine_stats"] = statsDict
+        }
+        if !status.events.isEmpty {
+            let events = status.events.map { event -> [String: Any] in
+                var entry: [String: Any] = [
+                    "timestamp": ProviderStatus.isoFormatter.string(from: event.timestamp),
+                    "code": event.code,
+                    "message": event.message,
+                    "level": event.level,
+                    "metadata": event.metadata
+                ]
+                return entry
+            }
+            dict["events"] = events
+        }
+        return dict
     }
 }

@@ -144,7 +144,7 @@ final class HealthChecker {
             guard !self.isRunning else { return }
             self.isRunning = true
             self.isPaused = false
-            Logger.record(code: .eventHealthInit, message: HealthReason.initial.message)
+            Logger.log(event: .eventHealthInit, level: .info, message: HealthReason.initial.message)
             self.updateSnapshot(state: .probing, reason: .initial)
             self.performHealthCheck()
             self.startTimer()
@@ -325,7 +325,7 @@ final class HealthChecker {
         }
         updateSnapshot(state: state, reason: reason)
         if state == .healthy && previous != .healthy {
-            Logger.record(code: .eventHealthPass, message: reason.message)
+            Logger.log(event: .eventHealthPass, level: .info, message: reason.message)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.onHealthChange?(true, reason)
@@ -341,11 +341,11 @@ final class HealthChecker {
         lastReason = reason
         switch reason {
         case .udpPingTimeout:
-            Logger.record(code: .errorPingTimeout, message: reason.message)
+            Logger.log(event: .errorPingTimeout, level: .error, message: reason.message)
         case .httpsFailed:
-            Logger.record(code: .errorHTTPSUnreachable, message: reason.message)
+            Logger.log(event: .errorHTTPSUnreachable, level: .error, message: reason.message)
         case .dnsFailed:
-            Logger.record(code: .errorDNSFailure, message: reason.message)
+            Logger.log(event: .errorDNSFailure, level: .error, message: reason.message)
         default:
             break
         }
@@ -356,7 +356,7 @@ final class HealthChecker {
         }
         updateSnapshot(state: state, reason: reason)
         if state == .unhealthy && previous != .unhealthy {
-            Logger.record(code: .eventHealthFail, message: reason.message)
+            Logger.log(event: .eventHealthFail, level: .warn, message: reason.message)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.onHealthChange?(false, reason)

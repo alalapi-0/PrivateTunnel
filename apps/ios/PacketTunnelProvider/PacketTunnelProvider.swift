@@ -45,17 +45,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.killSwitchState = state
             if state.enabled && state.engaged {
                 self.engine?.setTrafficBlocked(true)
+                Logger.log(event: .eventKillSwitchEngaged, level: .security, message: "Kill switch engaged", meta: ["reason": state.reason ?? ""])
             } else if !state.engaged {
                 self.engine?.setTrafficBlocked(false)
+                Logger.log(event: .eventKillSwitchReleased, level: .security, message: "Kill switch disengaged", meta: ["enabled": state.enabled ? "true" : "false"])
+            } else {
+                Logger.log(event: .securityKillSwitch, level: .security, message: "Kill switch state changed", meta: ["enabled": state.enabled ? "true" : "false", "engaged": state.engaged ? "true" : "false"])
             }
         }
     }
 
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        Logger.logInfo("PacketTunnelProvider.startTunnel invoked")
+        Logger.log(event: .eventConnectStart, level: .info, message: "PacketTunnelProvider.startTunnel invoked")
 
         guard let protocolConfiguration = protocolConfiguration as? NETunnelProviderProtocol else {
-            Logger.logError("Protocol configuration is not NETunnelProviderProtocol")
+            Logger.log(event: .errorEngineConfig, level: .error, message: "Protocol configuration is not NETunnelProviderProtocol")
             completionHandler(NSError(domain: "PacketTunnel", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid protocol configuration"]))
             return
         }
@@ -64,7 +68,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         guard let jsonString = providerOptions[providerConfigKey] as? String,
               let data = jsonString.data(using: .utf8) else {
-            Logger.logError("Missing pt_config_json in providerConfiguration")
+            Logger.log(event: .errorEngineConfig, level: .error, message: "Missing pt_config_json in providerConfiguration")
             completionHandler(NSError(domain: "PacketTunnel", code: -2, userInfo: [NSLocalizedDescriptionKey: "缺少配置数据"]))
             return
         }
@@ -81,11 +85,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 lastReconnectAt = nil
                 nextRetryDeadline = nil
             }
-            if config.routing.mode == .whitelist {
-                Logger.logInfo("Server-side ipset split active. Client will route full traffic set through tunnel.")
+            do {
+                try AuditGuards.assertConfigSane(config)
+                try AuditGuards.assertKeychainAccess()
+            } catch {
+                Logger.log(event: .errorAuditFailure, level: .error, message: "Audit guard failed: \(error.localizedDescription)")
+                completionHandler(error)
+                return
             }
         } catch {
-            Logger.logError("Failed to parse configuration: \(error.localizedDescription)")
+            Logger.log(event: .errorEngineConfig, level: .error, message: "Failed to parse configuration: \(error.localizedDescription)")
             completionHandler(error)
             return
         }
@@ -93,7 +102,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         applyNetworkSettings(for: config) { [weak self] error in
             guard let self else { return }
             if let error {
-                Logger.logError("Failed to apply network settings: \(error.localizedDescription)")
+                Logger.log(event: .errorEngineConfig, level: .error, message: "Failed to apply network settings: \(error.localizedDescription)")
                 completionHandler(error)
                 return
             }
@@ -102,17 +111,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 try self.startEngine(for: config)
                 self.configureKillSwitch(enabled: config.enableKillSwitch)
                 self.setupHealthChecker(using: config)
-                Logger.logInfo("PacketTunnelProvider started successfully")
+                Logger.log(event: .eventConnectSuccess, level: .info, message: "PacketTunnelProvider started successfully")
                 completionHandler(nil)
             } catch {
-                Logger.logError("Engine start failed: \(error.localizedDescription)")
+                Logger.log(event: .errorEngineConfig, level: .error, message: "Engine start failed: \(error.localizedDescription)")
                 completionHandler(error)
             }
         }
     }
 
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
-        Logger.logInfo("PacketTunnelProvider.stopTunnel invoked. Reason: \(reason.rawValue)")
+        Logger.log(event: .eventDisconnect, level: .info, message: "PacketTunnelProvider.stopTunnel invoked.", meta: ["reason": String(reason.rawValue)])
         controlQueue.sync {
             reconnectTimer?.cancel()
             reconnectTimer = nil
@@ -145,6 +154,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         switch command {
         case "status":
             let response = buildStatusResponse()
+            let data = try? JSONSerialization.data(withJSONObject: response, options: [])
+            handler(data)
+        case "events":
+            let limit = (dict["limit"] as? Int) ?? 100
+            let response = buildEventsResponse(limit: limit)
             let data = try? JSONSerialization.data(withJSONObject: response, options: [])
             handler(data)
         default:
@@ -216,15 +230,34 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             "reason": killSwitchState.reason ?? ""
         ]
 
-        let events = Logger.recentEvents(limit: 20).map { record in
+        let events = Logger.recentEvents(limit: 50).map { record in
             [
                 "timestamp": isoFormatter.string(from: record.timestamp),
-                "code": record.code,
-                "message": record.message
+                "code": record.code.rawValue,
+                "message": record.message,
+                "level": record.level.rawValue,
+                "metadata": record.metadata ?? [:]
             ]
         }
         response["events"] = events
         return response
+    }
+
+    private func buildEventsResponse(limit: Int) -> [String: Any] {
+        let records = Logger.recentEvents(limit: limit)
+        let events = records.map { record -> [String: Any] in
+            var entry: [String: Any] = [
+                "timestamp": isoFormatter.string(from: record.timestamp),
+                "code": record.code.rawValue,
+                "message": record.message,
+                "level": record.level.rawValue
+            ]
+            if let meta = record.metadata {
+                entry["metadata"] = meta
+            }
+            return entry
+        }
+        return ["events": events]
     }
 
     private func configureKillSwitch(enabled: Bool) {
@@ -297,17 +330,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if self.killSwitchState.enabled {
                 self.killSwitch.engage(reason: "Tunnel unhealthy: \(reason.message)")
                 engine.setTrafficBlocked(true)
+                Logger.log(event: .eventKillSwitchEngaged, level: .security, message: "Kill switch engaged due to health failure", meta: ["reason": reason.code])
             }
 
             if config.routing.mode == .whitelist {
-                Logger.logWarn("Whitelist routing in effect; 若持续异常，可在容器 App 中切换回 Global 模式排查。")
+                Logger.log(event: .eventEngineWaiting, level: .warn, message: "Whitelist routing in effect; 若持续异常，可在容器 App 中切换回 Global 模式排查。")
             }
 
             let delay = self.backoff.nextDelay()
             self.reconnectAttemptCount += 1
             self.lastReconnectAt = Date()
             self.nextRetryDeadline = self.lastReconnectAt?.addingTimeInterval(delay)
-            Logger.record(code: .eventEngineReconnect, message: "Scheduling reconnect in \(String(format: "%.1f", delay))s")
+            Logger.log(event: .eventEngineReconnect, level: .info, message: "Scheduling reconnect in \(String(format: "%.1f", delay))s")
 
             let timer = DispatchSource.makeTimerSource(queue: self.controlQueue)
             timer.schedule(deadline: .now() + delay)
@@ -329,8 +363,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             do {
                 try engine.start(with: config)
                 self.healthChecker?.resume()
+                Logger.log(event: .eventEngineReady, level: .info, message: "Engine restarted after reconnect attempt")
             } catch {
-                Logger.record(code: .errorEngineConfig, message: "Failed to restart engine: \(error.localizedDescription)")
+                Logger.log(event: .errorEngineConfig, level: .error, message: "Failed to restart engine: \(error.localizedDescription)")
                 self.scheduleReconnect(reason: .udpPingTimeout(error.localizedDescription))
             }
         }
@@ -357,12 +392,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return (WGEngineMock(packetFlow: packetFlow), .mock)
         case .toy:
             guard config.routing.mode == .global else {
-                Logger.logWarn("Toy engine currently supports global routing only; falling back to mock engine.")
+                Logger.log(event: .eventEngineWaiting, level: .warn, message: "Toy engine currently supports global routing only; falling back to mock engine.")
                 return (WGEngineMock(packetFlow: packetFlow), .mock)
             }
             return (WGEngineToy(packetFlow: packetFlow), .toy)
         case .wireguard:
-            Logger.logWarn("WireGuard engine not yet integrated; using mock placeholder.")
+            Logger.log(event: .eventEngineWaiting, level: .warn, message: "WireGuard engine not yet integrated; using mock placeholder.")
             return (WGEngineMock(packetFlow: packetFlow), .mock)
         }
     }
@@ -380,7 +415,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let ipv4Settings = NEIPv4Settings(addresses: [address], subnetMasks: [mask])
         ipv4Settings.includedRoutes = [NEIPv4Route.default()]
         if config.routing.mode == .whitelist {
-            Logger.logInfo("Whitelist mode: retaining default IPv4 route while server-side ipset filters destinations.")
+            Logger.log(event: .eventEngineWaiting, level: .info, message: "Whitelist mode: retaining default IPv4 route while server-side ipset filters destinations.")
         }
         settings.ipv4Settings = ipv4Settings
 
@@ -392,7 +427,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             settings.mtu = NSNumber(value: mtu)
         }
 
-        Logger.logInfo("Applying network settings: address=\(address) mask=\(mask) dns=\(config.client.dns)")
+        Logger.log(event: .engineStart, level: .info, message: "Applying network settings", meta: [
+            "address": address,
+            "mask": mask,
+            "dns": config.client.dns.joined(separator: ",")
+        ])
 
         setTunnelNetworkSettings(settings) { error in
             completion(error)
