@@ -35,6 +35,8 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 │       └── validate_config.py
 ├── apps/
 │   ├── ios/
+│   │   ├── PrivateTunnelApp/
+│   │   ├── PacketTunnelProvider/
 │   │   └── README.md
 │   ├── mac/
 │   │   └── README.md
@@ -43,6 +45,7 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── DEV-SETUP.md
+│   ├── IOS-APP.md
 │   └── SERVER-OPERATIONS.md
 └── .github/
     └── ISSUE_TEMPLATE.md
@@ -50,29 +53,26 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 
 ## 服务器快速开始
 
-服务器侧的一键部署、运维与故障排查指南请参见
-[SERVER-OPERATIONS.md](docs/SERVER-OPERATIONS.md)。核心流程概览：
+服务器侧的一键部署、运维与故障排查指南请参见 [SERVER-OPERATIONS.md](docs/SERVER-OPERATIONS.md)。核心流程概览：
 
 1. `sudo bash server/provision/wg-install.sh --dry-run` 先预览即将执行的操作；
-2. `sudo bash server/provision/wg-install.sh --port 51820 --ifname wg0 --wan-if eth0`
-   真正完成安装并启动服务；
-3. 使用 `sudo bash server/provision/wg-add-peer.sh --name iphone --qrcode`
-   生成客户端配置并在 WireGuard App 中扫码导入。
+2. `sudo bash server/provision/wg-install.sh --port 51820 --ifname wg0 --wan-if eth0` 真正完成安装并启动服务；
+3. 使用 `sudo bash server/provision/wg-add-peer.sh --name iphone --qrcode` 生成客户端配置并在 WireGuard App 中扫码导入。
 
 更多参数说明、升级/回滚方案和安全建议均在文档中详细记录。
 
 ## 开发路线图（前 10 轮迭代概览）
 
-1. ✅ 搭建 monorepo 脚手架与占位脚本（当前）
-2. ✅ 设计 WireGuard 客户端配置与生成工具（详见 [CONFIG.md](docs/CONFIG.md)）
-3. 实现服务器自动化部署脚本（支持多节点与健康检查）
-4. 构建 iOS PacketTunnel Extension 原型，支持基本连接/断开
-5. 开发 macOS 桌面壳应用，集成自动更新配置
-6. 开发 Windows 客户端壳应用（调用 WireGuard 官方驱动）
-7. 引入分流策略配置（基于域名/IP 规则）与灰度发布机制
-8. 搭建状态监控与健康检查服务，提供仪表板
-9. 对接 CI/CD（Lint/Test/Build），完善文档与自动化测试
-10. 安全审计、性能调优以及高可用部署策略
+1. ✅ Round 1：搭建 monorepo 脚手架与占位脚本。
+2. ✅ Round 2：设计 WireGuard 客户端配置与生成工具（详见 [CONFIG.md](docs/CONFIG.md)）。
+3. ✅ Round 3：实现服务器侧自动化脚本与配置二维码生成。
+4. ✅ Round 4：构建 iOS 容器 App，支持扫码/文件导入配置（详见 [IOS-APP.md](docs/IOS-APP.md)）。
+5. ☐ Round 5：集成 iOS PacketTunnel 扩展，建立基础的连接/断开流程。
+6. ☐ Round 6：开发 macOS 桌面壳应用，集成自动更新配置。
+7. ☐ Round 7：开发 Windows 客户端壳应用（调用 WireGuard 官方驱动）。
+8. ☐ Round 8：引入分流策略配置与灰度发布机制。
+9. ☐ Round 9：搭建状态监控与健康检查服务，提供仪表板。
+10. ☐ Round 10：完善 CI/CD、自动化测试与安全审计。
 
 ## 开发前需要确认的事项
 
