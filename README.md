@@ -46,6 +46,7 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 │   ├── ARCHITECTURE.md
 │   ├── DEV-SETUP.md
 │   ├── IOS-APP.md
+│   ├── IOS-PACKET-TUNNEL.md
 │   └── SERVER-OPERATIONS.md
 └── .github/
     └── ISSUE_TEMPLATE.md
@@ -67,7 +68,7 @@ PrivateTunnel 是一个面向个人/小团队使用的私有 VPN/隧道一键连
 2. ✅ Round 2：设计 WireGuard 客户端配置与生成工具（详见 [CONFIG.md](docs/CONFIG.md)）。
 3. ✅ Round 3：实现服务器侧自动化脚本与配置二维码生成。
 4. ✅ Round 4：构建 iOS 容器 App，支持扫码/文件导入配置（详见 [IOS-APP.md](docs/IOS-APP.md)）。
-5. ☐ Round 5：集成 iOS PacketTunnel 扩展，建立基础的连接/断开流程。
+5. ✅ Round 5：集成 iOS PacketTunnel 扩展，建立基础的连接/断开流程（详见 [IOS-PACKET-TUNNEL.md](docs/IOS-PACKET-TUNNEL.md)）。
 6. ☐ Round 6：开发 macOS 桌面壳应用，集成自动更新配置。
 7. ☐ Round 7：开发 Windows 客户端壳应用（调用 WireGuard 官方驱动）。
 8. ☐ Round 8：引入分流策略配置与灰度发布机制。

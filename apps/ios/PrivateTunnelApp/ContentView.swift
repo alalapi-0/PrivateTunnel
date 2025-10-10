@@ -11,6 +11,7 @@
 //          .environmentObject(ConfigManager())
 //
 import SwiftUI
+import NetworkExtension
 
 struct AlertDescriptor: Identifiable {
     let id = UUID()
@@ -20,11 +21,14 @@ struct AlertDescriptor: Identifiable {
 
 struct ContentView: View {
     @EnvironmentObject private var configManager: ConfigManager
+    @StateObject private var tunnelManager = TunnelManager()
 
     @State private var isPresentingScanner = false
     @State private var isPresentingFileImporter = false
     @State private var importedConfig: TunnelConfig?
     @State private var alertDescriptor: AlertDescriptor?
+    @State private var selectedProfileName: String?
+    @State private var isPerformingAction = false
 
     var body: some View {
         NavigationStack {
@@ -42,15 +46,28 @@ struct ContentView: View {
                         Section(header: Text("已保存的配置")) {
                             ForEach(configManager.storedConfigs, id: \.profile_name) { config in
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text(config.profile_name)
-                                        .font(.headline)
-                                    Text("Endpoint: \(config.endpoint.host):\(config.endpoint.port)")
-                                        .font(.subheadline)
-                                    Text("Mode: \(config.routing.mode)")
-                                        .font(.footnote)
-                                        .foregroundColor(.secondary)
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(config.profile_name)
+                                                .font(.headline)
+                                            Text("Endpoint: \(config.endpoint.host):\(config.endpoint.port)")
+                                                .font(.subheadline)
+                                            Text("Mode: \(config.routing.mode)")
+                                                .font(.footnote)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        if selectedProfileName == config.profile_name {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundColor(.accentColor)
+                                        }
+                                    }
                                 }
                                 .padding(.vertical, 6)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    selectedProfileName = config.profile_name
+                                }
                             }
                             .onDelete { indexSet in
                                 indexSet.forEach { index in
@@ -74,7 +91,7 @@ struct ContentView: View {
                     Button(action: {
                         do {
                             try configManager.save(config: importedConfig)
-                            alertDescriptor = AlertDescriptor(title: "保存成功", message: "配置已保存，可在后续版本中启动隧道。")
+                            alertDescriptor = AlertDescriptor(title: "保存成功", message: "配置已保存，可在上方列表中选择并连接。")
                             self.importedConfig = nil
                         } catch {
                             alertDescriptor = AlertDescriptor(title: "保存失败", message: error.localizedDescription)
@@ -90,6 +107,10 @@ struct ContentView: View {
                 }
 
                 Spacer()
+
+                if !configManager.storedConfigs.isEmpty {
+                    connectionControls
+                }
 
                 HStack {
                     Button(action: { isPresentingScanner = true }) {
@@ -126,6 +147,24 @@ struct ContentView: View {
                     }
                 }
             }
+            .onAppear {
+                if selectedProfileName == nil {
+                    selectedProfileName = configManager.storedConfigs.first?.profile_name
+                }
+                tunnelManager.loadOrCreateProvider { result in
+                    if case .failure(let error) = result {
+                        alertDescriptor = AlertDescriptor(title: "加载 VPN 管理器失败", message: error.localizedDescription)
+                    }
+                }
+            }
+            .onReceive(configManager.$storedConfigs) { configs in
+                if let currentSelection = selectedProfileName,
+                   !configs.contains(where: { $0.profile_name == currentSelection }) {
+                    selectedProfileName = configs.first?.profile_name
+                } else if selectedProfileName == nil {
+                    selectedProfileName = configs.first?.profile_name
+                }
+            }
         }
     }
 
@@ -135,6 +174,97 @@ struct ContentView: View {
             importedConfig = config
         case .failure(let error):
             alertDescriptor = AlertDescriptor(title: "解析失败", message: error.localizedDescription)
+        }
+    }
+
+    private var connectionControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Divider()
+
+            HStack {
+                Text("当前状态：")
+                Text(statusDescription(for: tunnelManager.status()))
+                    .fontWeight(.semibold)
+                Spacer()
+            }
+
+            HStack(spacing: 16) {
+                Button(action: connectSelectedConfig) {
+                    if isPerformingAction {
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Text("Connect")
+                            .frame(maxWidth: .infinity)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isPerformingAction || selectedProfileName == nil)
+
+                Button(action: disconnectTunnel) {
+                    Text("Disconnect")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isPerformingAction || tunnelManager.status() == .disconnected || tunnelManager.status() == .invalid)
+            }
+        }
+    }
+
+    private func connectSelectedConfig() {
+        guard let profile = selectedProfileName,
+              let config = configManager.storedConfigs.first(where: { $0.profile_name == profile }) else {
+            alertDescriptor = AlertDescriptor(title: "未选择配置", message: "请选择要连接的配置。")
+            return
+        }
+
+        isPerformingAction = true
+        tunnelManager.save(configuration: config) { result in
+            switch result {
+            case .failure(let error):
+                isPerformingAction = false
+                alertDescriptor = AlertDescriptor(title: "保存配置失败", message: error.localizedDescription)
+            case .success:
+                tunnelManager.connect { connectResult in
+                    isPerformingAction = false
+                    switch connectResult {
+                    case .success:
+                        alertDescriptor = AlertDescriptor(title: "连接中", message: "请稍候，系统将提示 VPN 状态。")
+                    case .failure(let error):
+                        alertDescriptor = AlertDescriptor(title: "连接失败", message: error.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
+    private func disconnectTunnel() {
+        isPerformingAction = true
+        tunnelManager.disconnect { result in
+            isPerformingAction = false
+            if case .failure(let error) = result {
+                alertDescriptor = AlertDescriptor(title: "断开失败", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func statusDescription(for status: NEVPNStatus) -> String {
+        switch status {
+        case .connected:
+            return "Connected"
+        case .connecting:
+            return "Connecting"
+        case .disconnected:
+            return "Disconnected"
+        case .disconnecting:
+            return "Disconnecting"
+        case .invalid:
+            return "Invalid"
+        case .reasserting:
+            return "Reasserting"
+        @unknown default:
+            return "Unknown"
         }
     }
 }
