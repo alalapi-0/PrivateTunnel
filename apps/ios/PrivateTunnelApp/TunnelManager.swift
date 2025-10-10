@@ -45,6 +45,7 @@ final class TunnelManager: ObservableObject {
 
     private let providerBundleIdentifier = "com.privatetunnel.PacketTunnelProvider"
     private let providerConfigKey = "pt_config_json"
+    private let routingModeDefaultsKeyPrefix = "com.privatetunnel.routing.mode."
 
     private var manager: NETunnelProviderManager?
     private var statusObserver: NSObjectProtocol?
@@ -126,6 +127,7 @@ final class TunnelManager: ObservableObject {
                     proto.serverAddress = "\(configuration.endpoint.host):\(configuration.endpoint.port)"
                     var providerConfig = proto.providerConfiguration ?? [:]
                     providerConfig[self.providerConfigKey] = jsonString
+                    providerConfig["routing_mode"] = configuration.routing.mode
                     proto.providerConfiguration = providerConfig
                     manager.protocolConfiguration = proto
                     manager.localizedDescription = configuration.profile_name
@@ -155,6 +157,14 @@ final class TunnelManager: ObservableObject {
                 }
             }
         }
+    }
+
+    func persistedRoutingMode(for profile: String) -> String? {
+        UserDefaults.standard.string(forKey: routingModeDefaultsKeyPrefix + profile)
+    }
+
+    func rememberRoutingMode(_ mode: String, for profile: String) {
+        UserDefaults.standard.set(mode, forKey: routingModeDefaultsKeyPrefix + profile)
     }
 
     func connect(completion: ((Result<Void, Error>) -> Void)? = nil) {

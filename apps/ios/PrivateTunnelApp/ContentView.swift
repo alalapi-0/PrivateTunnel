@@ -19,6 +19,31 @@ struct AlertDescriptor: Identifiable {
     let message: String
 }
 
+enum RoutingModeOption: String, CaseIterable, Identifiable {
+    case global
+    case whitelist
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .global:
+            return "Global"
+        case .whitelist:
+            return "Whitelist"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .global:
+            return "所有流量均通过隧道出口。"
+        case .whitelist:
+            return "所有流量进入隧道，由服务器 ipset/nftables 决定真正出网的目标。"
+        }
+    }
+}
+
 struct ContentView: View {
     @EnvironmentObject private var configManager: ConfigManager
     @StateObject private var tunnelManager = TunnelManager()
@@ -30,6 +55,9 @@ struct ContentView: View {
     @State private var selectedProfileName: String?
     @State private var isPerformingAction = false
     @State private var killSwitchEnabled = false
+    @State private var selectedRoutingMode: RoutingModeOption = .global
+
+    private static let splitDocURL = URL(string: "https://github.com/PrivateTunnel/PrivateTunnel/blob/main/docs/SPLIT-IPSET.md")
 
     var body: some View {
         NavigationStack {
@@ -69,6 +97,7 @@ struct ContentView: View {
                                 .onTapGesture {
                                     selectedProfileName = config.profile_name
                                     killSwitchEnabled = config.enable_kill_switch
+                                    selectedRoutingMode = routingMode(for: config)
                                 }
                             }
                             .onDelete { indexSet in
@@ -153,6 +182,9 @@ struct ContentView: View {
                 if selectedProfileName == nil {
                     selectedProfileName = configManager.storedConfigs.first?.profile_name
                     killSwitchEnabled = configManager.storedConfigs.first?.enable_kill_switch ?? false
+                    if let config = configManager.storedConfigs.first {
+                        selectedRoutingMode = routingMode(for: config)
+                    }
                 }
                 tunnelManager.loadOrCreateProvider { result in
                     if case .failure(let error) = result {
@@ -165,15 +197,22 @@ struct ContentView: View {
                    !configs.contains(where: { $0.profile_name == currentSelection }) {
                     selectedProfileName = configs.first?.profile_name
                     killSwitchEnabled = configs.first?.enable_kill_switch ?? false
+                    if let config = configs.first {
+                        selectedRoutingMode = routingMode(for: config)
+                    }
                 } else if selectedProfileName == nil {
                     selectedProfileName = configs.first?.profile_name
                     killSwitchEnabled = configs.first?.enable_kill_switch ?? false
+                    if let config = configs.first {
+                        selectedRoutingMode = routingMode(for: config)
+                    }
                 }
             }
             .onChange(of: selectedProfileName) { newValue in
                 if let name = newValue,
                    let config = configManager.storedConfigs.first(where: { $0.profile_name == name }) {
                     killSwitchEnabled = config.enable_kill_switch
+                    selectedRoutingMode = routingMode(for: config)
                 }
             }
         }
@@ -199,6 +238,7 @@ struct ContentView: View {
                 Spacer()
             }
 
+            routingModeControls
             healthSummary
 
             Toggle(isOn: $killSwitchEnabled) {
@@ -238,19 +278,25 @@ struct ContentView: View {
             return
         }
 
-        var updatedConfig = config
-        updatedConfig.enable_kill_switch = killSwitchEnabled
-        if updatedConfig.enable_kill_switch != config.enable_kill_switch {
+        var persistentConfig = config
+        persistentConfig.enable_kill_switch = killSwitchEnabled
+        if persistentConfig.enable_kill_switch != config.enable_kill_switch {
             do {
-                try configManager.save(config: updatedConfig)
+                try configManager.save(config: persistentConfig)
             } catch {
                 alertDescriptor = AlertDescriptor(title: "更新 Kill Switch 失败", message: error.localizedDescription)
                 return
             }
         }
 
+        var runtimeConfig = persistentConfig
+        runtimeConfig.routing.mode = selectedRoutingMode.rawValue
+        runtimeConfig.routing.allowed_ips = normalizedAllowedIPs(for: config, desiredMode: selectedRoutingMode)
+
+        tunnelManager.rememberRoutingMode(selectedRoutingMode.rawValue, for: config.profile_name)
+
         isPerformingAction = true
-        tunnelManager.save(configuration: updatedConfig) { result in
+        tunnelManager.save(configuration: runtimeConfig) { result in
             switch result {
             case .failure(let error):
                 isPerformingAction = false
@@ -300,6 +346,39 @@ struct ContentView: View {
 }
 
 extension ContentView {
+    private var routingModeControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("分流模式")
+                .font(.headline)
+            Picker("Routing Mode", selection: $selectedRoutingMode) {
+                ForEach(RoutingModeOption.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(selectedRoutingMode.description)
+                .font(.footnote)
+                .foregroundColor(.secondary)
+
+            if selectedRoutingMode == .whitelist {
+                Text("服务器侧的 ipset/nftables 策略将决定哪些域名出公网，其他目的地将保持私网源地址返回。若出现异常，可切回 Global 验证。")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+
+            if let url = Self.splitDocURL {
+                Link(destination: url) {
+                    Label("查看分流运维说明", systemImage: "book")
+                }
+                .font(.footnote)
+            }
+        }
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemBackground))
+        .cornerRadius(10)
+    }
+
     private var healthSummary: some View {
         Group {
             if let status = tunnelManager.providerStatus {
@@ -413,5 +492,31 @@ struct ContentView_Previews: PreviewProvider {
     static var previews: some View {
         ContentView()
             .environmentObject(ConfigManager())
+    }
+}
+
+extension ContentView {
+    private func routingMode(for config: TunnelConfig) -> RoutingModeOption {
+        if let stored = tunnelManager.persistedRoutingMode(for: config.profile_name),
+           let mode = RoutingModeOption(rawValue: stored) {
+            return mode
+        }
+        return RoutingModeOption(rawValue: config.routing.mode) ?? .global
+    }
+
+    private func normalizedAllowedIPs(for config: TunnelConfig, desiredMode: RoutingModeOption) -> [String] {
+        var base = (config.routing.allowed_ips ?? []).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        if base.isEmpty {
+            base = ["0.0.0.0/0"]
+        }
+        switch desiredMode {
+        case .global:
+            return base
+        case .whitelist:
+            if !base.contains("0.0.0.0/0") {
+                base.insert("0.0.0.0/0", at: 0)
+            }
+            return base
+        }
     }
 }
