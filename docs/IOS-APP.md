@@ -29,7 +29,7 @@ App 主界面包含标题「Private Tunnel Configurator」、已保存配置列�
 2. 将 Round 3 生成的二维码置于取景框内。
 3. 扫描成功后，App 会解析二维码中的 JSON 字符串并展示配置详情。
 
-> ![扫码示意图占位](images/ios-round4-scan-placeholder.png)
+> 扫码示意图待补充，可在实际 PR 中替换为真机截图。
 
 ### 4.2 文件导入
 1. 点击「📂 从文件导入」。

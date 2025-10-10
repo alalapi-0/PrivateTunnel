@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint-and-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      - name: Install shellcheck (optional)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+        continue-on-error: true
+      - name: Bash syntax check
+        run: |
+          find scripts server -name '*.sh' -print0 | xargs -0 -n1 bash -n
+      - name: ShellCheck analysis
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            find scripts server -name '*.sh' -print0 | xargs -0 -n1 shellcheck
+          else
+            echo "ShellCheck not available; skipping."
+          fi
+      - name: Python bytecode compilation
+        run: |
+          python -m compileall scripts server core
+      - name: WireGuard installer dry run
+        env:
+          WAN_IF: dummy
+        run: |
+          bash server/provision/wg-install.sh --dry-run
+      - name: Split resolver help
+        run: |
+          python3 server/split/resolve_domains.py --help
+      - name: Security audit dry run
+        run: |
+          if [[ -x server/security/audit.sh ]]; then
+            set +e
+            bash server/security/audit.sh --json
+            status=$?
+            if [[ $status -ne 0 ]]; then
+              echo "::warning::server/security/audit.sh exited with $status"
+            fi
+            exit 0
+          else
+            echo "::warning::server/security/audit.sh is not executable"
+          fi
+      - name: Troubleshooting guidance
+        if: failure()
+        run: |
+          echo "See docs/BUILD_IOS.md and docs/TROUBLESHOOTING.md for remediation steps."
+
+  ios-build-check:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Xcode version
+        run: xcodebuild -version
+      - name: Build PrivateTunnelApp
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project apps/ios/PrivateTunnelApp/PrivateTunnelApp.xcodeproj \
+            -scheme PrivateTunnelApp \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            clean build CODE_SIGNING_ALLOWED=NO | tee private_tunnel_app.log
+      - name: Build PacketTunnelProvider extension
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project apps/ios/PrivateTunnelApp/PrivateTunnelApp.xcodeproj \
+            -scheme PacketTunnelProvider \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            clean build CODE_SIGNING_ALLOWED=NO | tee packet_tunnel_extension.log
+      - name: Upload build logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: xcode-build-logs
+          path: |
+            private_tunnel_app.log
+            packet_tunnel_extension.log
+      - name: Troubleshooting guidance
+        if: failure()
+        run: |
+          echo "Compilation failed. Review docs/BUILD_IOS.md and docs/TROUBLESHOOTING.md."
