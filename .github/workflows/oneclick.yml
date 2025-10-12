@@ -93,13 +93,13 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.ssh/id_ed25519.pub
           chmod 644 ~/.ssh/id_ed25519.pub
-          cat <<'CFG' > ~/.ssh/config
-Host *
-  StrictHostKeyChecking no
-  UserKnownHostsFile /dev/null
-  IdentitiesOnly yes
-  IdentityFile ~/.ssh/id_ed25519
-CFG
+          {
+            echo "Host *"
+            echo "  StrictHostKeyChecking no"
+            echo "  UserKnownHostsFile /dev/null"
+            echo "  IdentitiesOnly yes"
+            echo "  IdentityFile ~/.ssh/id_ed25519"
+          } > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
       - name: Ensure Vultr SSH key
