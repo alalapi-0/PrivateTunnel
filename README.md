@@ -1,3 +1,7 @@
+> **当前仓库为 Windows 本地自用版**：目标是一键创建 Vultr VPS、部署 WireGuard 并生成手机可扫的二维码。  
+> 非 Windows / 非本地一键流程的代码与 CI 已移除或归档至 `legacy/`。  
+> 详见：`PROJECT_PRUNE_REPORT.md` 与 `PROJECT_HEALTH_REPORT.md`。
+
 # PrivateTunnel
 
 ## 🖥️ GUI 快速生成 WireGuard 配置
