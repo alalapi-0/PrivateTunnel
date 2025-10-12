@@ -1,23 +1,15 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
-HOST="${1:-}"
+set -Eeuo pipefail
+HOST="${1:?host required}"
 TIMEOUT="${2:-600}"
-
-if [ -z "$HOST" ]; then
-  echo "Usage: $0 <host> [timeout_seconds]" >&2
-  exit 1
-fi
-
-DEADLINE=$(( $(date +%s) + TIMEOUT ))
-
-while true; do
-  if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$HOST" exit 0; then
+DEADLINE=$((SECONDS + TIMEOUT))
+while (( SECONDS < DEADLINE )); do
+  if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@"$HOST" "echo ok" >/dev/null 2>&1; then
+    echo "[wait_for_ssh] ready"
     exit 0
   fi
-  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-    echo "Timeout waiting for SSH on $HOST" >&2
-    exit 2
-  fi
+  echo "[wait_for_ssh] waiting ssh on $HOST..."
   sleep 10
 done
+echo "[wait_for_ssh] timeout ${TIMEOUT}s" >&2
+exit 1
