@@ -53,6 +53,7 @@ PrivateTunnel 是一个面向个人/小团队自建的私有 VPN/隧道解决方
   - [ROADMAP.md](docs/ROADMAP.md)：阶段规划
   - [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)：常见问题排查
   - [TOY-TUN-END2END.md](docs/TOY-TUN-END2END.md)：Toy 通道说明（仅开发）
+  - [VULTR_AUTOMATION.md](docs/VULTR_AUTOMATION.md)：Vultr API 自动化创建节点
 
 更多设计细节请参考 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 与 [docs/IOS-PACKET-TUNNEL.md](docs/IOS-PACKET-TUNNEL.md)。
 
