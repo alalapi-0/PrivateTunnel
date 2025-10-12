@@ -158,7 +158,17 @@ class WireGuardGeneratorUI:
 
 
 def main() -> None:
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:  # pragma: no cover - requires GUI environment
+        print(
+            "无法启动图形界面：未检测到可用的显示环境 (DISPLAY)。\n"
+            "请在桌面环境中运行，或者使用命令行工具：\n"
+            "  python3 core/tools/generate_wg_conf.py --schema <schema> --in <input> --out <output> [--force]",
+            flush=True,
+        )
+        raise SystemExit(1) from exc
+
     WireGuardGeneratorUI(root)
     root.mainloop()
 
