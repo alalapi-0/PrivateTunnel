@@ -1,5 +1,11 @@
 # PrivateTunnel
 
+## 🚀 One-Click Connect (GitHub Actions)
+- 配置仓库 Secrets：`VULTR_API_KEY` / `SSH_PRIVATE_KEY` / `SSH_PUBLIC_KEY` / `SNAPSHOT_ID`
+- 打开 **Actions → One-Click Connect → Run workflow**
+- 运行完成后下载二维码 PNG，手机 WireGuard 扫码即连  
+详见：`docs/ONE_CLICK.md`
+
 [![CI](https://img.shields.io/github/actions/workflow/status/your-org/PrivateTunnel/ci.yml?branch=main&label=CI)](./.github/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-iOS%2016%2B-blue)
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)

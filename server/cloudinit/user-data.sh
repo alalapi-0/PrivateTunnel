@@ -1,9 +1,8 @@
 #!/bin/bash
+# open to overrides by the workflow prelude:
+# WG_PORT, CLIENT_NAME, CLIENT_ADDR
 set -Eeuo pipefail
-
-LOG_FILE="/root/user-data.log"
-mkdir -p "$(dirname "$LOG_FILE")"
-exec > >(tee -a "$LOG_FILE") 2>&1
+export DEBIAN_FRONTEND=noninteractive
 
 WG_IFNAME="${WG_IFNAME:-wg0}"
 WG_PORT="${WG_PORT:-51820}"
@@ -13,132 +12,78 @@ CLIENT_NAME="${CLIENT_NAME:-iphone}"
 CLIENT_ADDR="${CLIENT_ADDR:-10.6.0.2/32}"
 CLIENT_DNS="${CLIENT_DNS:-1.1.1.1}"
 KEEPALIVE="${KEEPALIVE:-25}"
-AUTHORIZED_SSH_PUBKEY="${AUTHORIZED_SSH_PUBKEY:-}"
 
-log() {
-  echo "[user-data] $*"
-}
+log(){ echo "[OC] $*"; }
 
-log "Starting WireGuard bootstrap"
-
-export DEBIAN_FRONTEND=noninteractive
+log "apt update/upgrade & packages"
 apt-get update -y
-apt-get install -y --no-install-recommends \
-  wireguard wireguard-tools qrencode iptables-persistent \
-  curl git ca-certificates jq iproute2
+apt-get install -y wireguard wireguard-tools qrencode iptables-persistent curl git >/dev/null
 
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-if [ -n "$AUTHORIZED_SSH_PUBKEY" ]; then
-  if ! grep -qxF "$AUTHORIZED_SSH_PUBKEY" /root/.ssh/authorized_keys 2>/dev/null; then
-    log "Installing provided SSH public key"
-    printf '%s\n' "$AUTHORIZED_SSH_PUBKEY" >> /root/.ssh/authorized_keys
-  fi
-fi
-chmod 600 /root/.ssh/authorized_keys || true
-
+log "detect WAN_IF"
 WAN_IF="$(ip -o -4 route show to default | awk '{print $5}' | head -n1)"
-if [ -z "$WAN_IF" ]; then
-  echo "No WAN_IF" >&2
-  exit 1
+[ -n "$WAN_IF" ] || { echo "No WAN_IF"; exit 1; }
+log "WAN_IF=$WAN_IF"
+
+log "server keys"
+install -d -m 700 /etc/wireguard
+umask 077
+if [ ! -f /etc/wireguard/${WG_IFNAME}.private ]; then
+  wg genkey | tee /etc/wireguard/${WG_IFNAME}.private | wg pubkey > /etc/wireguard/${WG_IFNAME}.public
 fi
-log "Detected WAN interface: $WAN_IF"
+SVR_PRIV="$(cat /etc/wireguard/${WG_IFNAME}.private)"
+SVR_PUB="$(cat /etc/wireguard/${WG_IFNAME}.public)"
 
-mkdir -p /etc/wireguard /var/lib/wireguard/clients
-chmod 700 /etc/wireguard
-
-SERVER_PRIV_KEY_FILE="/etc/wireguard/server_private.key"
-SERVER_PUB_KEY_FILE="/etc/wireguard/server_public.key"
-if [ ! -s "$SERVER_PRIV_KEY_FILE" ]; then
-  log "Generating server key pair"
-  umask 077
-  wg genkey | tee "$SERVER_PRIV_KEY_FILE" | wg pubkey > "$SERVER_PUB_KEY_FILE"
-else
-  log "Reusing existing server key pair"
-fi
-SERVER_PRIV_KEY="$(cat "$SERVER_PRIV_KEY_FILE")"
-SERVER_PUB_KEY="$(cat "$SERVER_PUB_KEY_FILE")"
-
-WG_CONF="/etc/wireguard/${WG_IFNAME}.conf"
-cat <<CFG > "$WG_CONF.tmp"
+log "write wg conf"
+cat >/etc/wireguard/${WG_IFNAME}.conf <<EOF
 [Interface]
 Address = ${WG_SVR_ADDR}
 ListenPort = ${WG_PORT}
-PrivateKey = ${SERVER_PRIV_KEY}
+PrivateKey = ${SVR_PRIV}
 SaveConfig = true
-CFG
-mv "$WG_CONF.tmp" "$WG_CONF"
-chmod 600 "$WG_CONF"
+EOF
 
-log "Applying sysctl and firewall settings"
-echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-privatetunnel.conf
+log "sysctl & NAT"
+cat >/etc/sysctl.d/99-privatetunnel.conf <<EOF
+net.ipv4.ip_forward=1
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_mtu_probing=1
+EOF
 sysctl -p /etc/sysctl.d/99-privatetunnel.conf || true
 
-iptables -t nat -C POSTROUTING -s "${WG_SUBNET}" -o "${WAN_IF}" -j MASQUERADE 2>/dev/null || \
-  iptables -t nat -A POSTROUTING -s "${WG_SUBNET}" -o "${WAN_IF}" -j MASQUERADE
-iptables -C FORWARD -i "${WAN_IF}" -o "${WG_IFNAME}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -i "${WAN_IF}" -o "${WG_IFNAME}" -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -C FORWARD -i "${WG_IFNAME}" -o "${WAN_IF}" -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -i "${WG_IFNAME}" -o "${WAN_IF}" -j ACCEPT
+iptables -t nat -C POSTROUTING -s "${WG_SUBNET}" -o "${WAN_IF}" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "${WG_SUBNET}" -o "${WAN_IF}" -j MASQUERADE
+iptables -C FORWARD -i "${WAN_IF}" -o "${WG_IFNAME}" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${WAN_IF}" -o "${WG_IFNAME}" -m state --state RELATED,ESTABLISHED -j ACCEPT
+iptables -C FORWARD -i "${WG_IFNAME}" -o "${WAN_IF}" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${WG_IFNAME}" -o "${WAN_IF}" -j ACCEPT
 netfilter-persistent save || true
 
-systemctl enable wg-quick@"${WG_IFNAME}".service
-systemctl restart wg-quick@"${WG_IFNAME}".service || systemctl start wg-quick@"${WG_IFNAME}".service
+log "enable wg"
+systemctl enable "wg-quick@${WG_IFNAME}" >/dev/null 2>&1 || true
+systemctl restart "wg-quick@${WG_IFNAME}"
 
-CLIENT_KEY_DIR="/var/lib/wireguard/clients"
-CLIENT_PRIV_KEY_FILE="${CLIENT_KEY_DIR}/${CLIENT_NAME}.key"
-CLIENT_PUB_KEY_FILE="${CLIENT_KEY_DIR}/${CLIENT_NAME}.pub"
-if [ ! -s "$CLIENT_PRIV_KEY_FILE" ]; then
-  log "Generating client key pair for ${CLIENT_NAME}"
+log "first client: ${CLIENT_NAME}"
+install -d -m 700 "/etc/wireguard/clients/${CLIENT_NAME}"
+pushd "/etc/wireguard/clients/${CLIENT_NAME}" >/dev/null
   umask 077
-  wg genkey | tee "$CLIENT_PRIV_KEY_FILE" | wg pubkey > "$CLIENT_PUB_KEY_FILE"
-else
-  log "Reusing existing client key pair for ${CLIENT_NAME}"
-fi
-CLIENT_PRIV_KEY="$(cat "$CLIENT_PRIV_KEY_FILE")"
-CLIENT_PUB_KEY="$(cat "$CLIENT_PUB_KEY_FILE")"
-
-if ! wg show "${WG_IFNAME}" allowed-ips 2>/dev/null | grep -q "${CLIENT_ADDR}"; then
-  log "Adding client peer to WireGuard"
-  wg set "${WG_IFNAME}" peer "$CLIENT_PUB_KEY" allowed-ips "$CLIENT_ADDR" persistent-keepalive "$KEEPALIVE"
+  wg genkey | tee ${CLIENT_NAME}.private | wg pubkey > ${CLIENT_NAME}.public
+  CLI_PRIV="$(cat ${CLIENT_NAME}.private)"
+  CLI_PUB="$(cat ${CLIENT_NAME}.public)"
+  wg set "${WG_IFNAME}" peer "${CLI_PUB}" allowed-ips "${CLIENT_ADDR}"
   wg-quick save "${WG_IFNAME}"
-else
-  log "Client peer already configured"
-fi
-
-PUBLIC_IP="$(ip -o -4 addr show dev "${WAN_IF}" | awk '{print $4}' | cut -d/ -f1 | head -n1)"
-if [ -z "$PUBLIC_IP" ]; then
-  PUBLIC_IP="$(curl -fsS https://ifconfig.me || true)"
-fi
-if [ -z "$PUBLIC_IP" ]; then
-  log "Warning: unable to determine public IPv4 address automatically; please update client Endpoint manually"
-  PUBLIC_IP="0.0.0.0"
-fi
-
-CLIENT_CONF="/root/${CLIENT_NAME}.conf"
-log "Writing client config for ${CLIENT_NAME} with endpoint ${PUBLIC_IP}:${WG_PORT}"
-cat <<CLIENTCFG > "$CLIENT_CONF.tmp"
+  ENDPOINT="$(curl -4 -s ifconfig.me):${WG_PORT}"
+  cat > ${CLIENT_NAME}.conf <<EOC
 [Interface]
-PrivateKey = ${CLIENT_PRIV_KEY}
+PrivateKey = ${CLI_PRIV}
 Address = ${CLIENT_ADDR}
 DNS = ${CLIENT_DNS}
 
 [Peer]
-PublicKey = ${SERVER_PUB_KEY}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${PUBLIC_IP}:${WG_PORT}
+PublicKey = ${SVR_PUB}
+AllowedIPs = 0.0.0.0/0
+Endpoint = ${ENDPOINT}
 PersistentKeepalive = ${KEEPALIVE}
-CLIENTCFG
-mv "$CLIENT_CONF.tmp" "$CLIENT_CONF"
-chmod 600 "$CLIENT_CONF"
+EOC
+  qrencode -o /root/${CLIENT_NAME}.png -s 8 -m 2 < ${CLIENT_NAME}.conf
+  cp ${CLIENT_NAME}.conf /root/${CLIENT_NAME}.conf
+popd >/dev/null
 
-PNG_PATH="/root/${CLIENT_NAME}.png"
-qrencode -t png -o "$PNG_PATH" < "$CLIENT_CONF"
-chmod 600 "$PNG_PATH"
-
-log "Enabling BBR congestion control"
-echo "net.core.default_qdisc=fq" > /etc/sysctl.d/99-privatetunnel-bbr.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.d/99-privatetunnel-bbr.conf
-sysctl -p /etc/sysctl.d/99-privatetunnel-bbr.conf || true
-
-log "[DONE] Ready. PNG at $PNG_PATH"
+log "DONE. QR at /root/${CLIENT_NAME}.png"

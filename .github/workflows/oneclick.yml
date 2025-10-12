@@ -4,29 +4,29 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: Vultr region slug (e.g. nrt, sjc)
+        description: "Vultr region (e.g. nrt, sjc, lax, sgp)"
         required: false
-        default: nrt
+        default: "nrt"
       plan:
-        description: Vultr plan (e.g. vc2-1c-1gb)
+        description: "Vultr plan (e.g. vc2-1c-1gb)"
         required: false
-        default: vc2-1c-1gb
+        default: "vc2-1c-1gb"
       snapshot_id:
-        description: Override snapshot ID (defaults to secrets.SNAPSHOT_ID)
+        description: "Override snapshot id (optional, otherwise use secrets.SNAPSHOT_ID)"
         required: false
-        default: ''
+        default: ""
       client_name:
-        description: WireGuard client name
+        description: "First client name"
         required: false
-        default: iphone
+        default: "iphone"
       client_addr:
-        description: WireGuard client address (CIDR)
+        description: "First client address (CIDR)"
         required: false
-        default: 10.6.0.2/32
+        default: "10.6.0.2/32"
       wg_port:
-        description: WireGuard UDP port
+        description: "WireGuard UDP port"
         required: false
-        default: '51820'
+        default: "51820"
 
 jobs:
   deploy:
@@ -35,258 +35,142 @@ jobs:
       VULTR_API_KEY: ${{ secrets.VULTR_API_KEY }}
       SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
       SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      SNAPSHOT_DEF: ${{ secrets.SNAPSHOT_ID }}
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate inputs
-        id: validate
-        shell: bash
+      - name: Sanity check secrets
         run: |
-          set -euo pipefail
-          if [ -z "${VULTR_API_KEY:-}" ]; then
-            echo "❌ Missing VULTR_API_KEY secret" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          if [ -z "${SSH_PRIVATE_KEY:-}" ] || [ -z "${SSH_PUBLIC_KEY:-}" ]; then
-            echo "❌ Missing SSH key pair secrets" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          snapshot_input="${{ github.event.inputs.snapshot_id }}"
-          snapshot_secret="${{ secrets.SNAPSHOT_ID }}"
-          snapshot_id="$snapshot_input"
-          if [ -z "$snapshot_id" ]; then
-            snapshot_id="$snapshot_secret"
-          fi
-          if [ -z "$snapshot_id" ]; then
-            {
-              echo "### Snapshot ID required"
-              echo "未检测到 snapshot_id 输入或 secrets.SNAPSHOT_ID。"
-              echo "请在仓库 Secrets 中设置 SNAPSHOT_ID 或在手动触发时填写 snapshot_id。"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          region_input="${{ github.event.inputs.region }}"
-          plan_input="${{ github.event.inputs.plan }}"
-          client_name_input="${{ github.event.inputs.client_name }}"
-          client_addr_input="${{ github.event.inputs.client_addr }}"
-          wg_port_input="${{ github.event.inputs.wg_port }}"
-          if [ -z "$region_input" ]; then region_input="nrt"; fi
-          if [ -z "$plan_input" ]; then plan_input="vc2-1c-1gb"; fi
-          if [ -z "$client_name_input" ]; then client_name_input="iphone"; fi
-          if [ -z "$client_addr_input" ]; then client_addr_input="10.6.0.2/32"; fi
-          if [ -z "$wg_port_input" ]; then wg_port_input="51820"; fi
-          echo "SNAPSHOT_ID=$snapshot_id" >> "$GITHUB_ENV"
-          echo "REGION=$region_input" >> "$GITHUB_ENV"
-          echo "PLAN=$plan_input" >> "$GITHUB_ENV"
-          echo "CLIENT_NAME=$client_name_input" >> "$GITHUB_ENV"
-          echo "CLIENT_ADDR=$client_addr_input" >> "$GITHUB_ENV"
-          echo "WG_PORT=$wg_port_input" >> "$GITHUB_ENV"
-          echo "WG_IFNAME=wg0" >> "$GITHUB_ENV"
+          test -n "${VULTR_API_KEY}" || { echo "Missing VULTR_API_KEY"; exit 1; }
+          test -n "${SSH_PRIVATE_KEY}" || { echo "Missing SSH_PRIVATE_KEY"; exit 1; }
+          test -n "${SSH_PUBLIC_KEY}"  || { echo "Missing SSH_PUBLIC_KEY";  exit 1; }
+          SNAP="${{ inputs.snapshot_id }}"
+          if [ -z "$SNAP" ]; then SNAP="$SNAPSHOT_DEF"; fi
+          test -n "$SNAP" || { echo "Missing snapshot_id and secrets.SNAPSHOT_ID"; exit 1; }
+          echo "SNAPSHOT_ID resolved."
 
-      - name: Prepare SSH key material
-        shell: bash
+      - name: Prepare SSH key
         run: |
-          set -euo pipefail
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          mkdir -p ~/.ssh
+          printf "%s\n" "${SSH_PRIVATE_KEY}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.ssh/id_ed25519.pub
-          chmod 644 ~/.ssh/id_ed25519.pub
-          {
-            echo "Host *"
-            echo "  StrictHostKeyChecking no"
-            echo "  UserKnownHostsFile /dev/null"
-            echo "  IdentitiesOnly yes"
-            echo "  IdentityFile ~/.ssh/id_ed25519"
-          } > ~/.ssh/config
-          chmod 600 ~/.ssh/config
 
-      - name: Ensure Vultr SSH key
-        id: sshkey
-        shell: bash
+      - name: Compose user_data (inline from repo script)
+        id: ud
         run: |
-          set -euo pipefail
-          KEY_NAME="privatetunnel-oneclick"
-          LIST_JSON="$(mktemp)"
-          curl --silent --show-error --fail-with-body \
-            -H "Authorization: Bearer $VULTR_API_KEY" \
-            https://api.vultr.com/v2/ssh-keys > "$LIST_JSON"
-          KEY_ID=$(jq -r --arg name "$KEY_NAME" '.ssh_keys[] | select(.name==$name) | .id' "$LIST_JSON" | head -n1)
-          SSH_KEY_FILE="$(mktemp)"
-          printf '%s\n' "$SSH_PUBLIC_KEY" > "$SSH_KEY_FILE"
-          if [ -n "$KEY_ID" ] && [ "$KEY_ID" != "null" ]; then
-            jq -n --rawfile ssh_key "$SSH_KEY_FILE" '{ssh_key:$ssh_key}' > payload.json
-            curl --silent --show-error --fail-with-body \
-              -X PATCH \
-              -H "Authorization: Bearer $VULTR_API_KEY" \
-              -H "Content-Type: application/json" \
-              -d @payload.json \
-              https://api.vultr.com/v2/ssh-keys/$KEY_ID >/dev/null
-          else
-            jq -n --arg name "$KEY_NAME" --rawfile ssh_key "$SSH_KEY_FILE" '{name:$name, ssh_key:$ssh_key}' > payload.json
-            KEY_ID=$(curl --silent --show-error --fail-with-body \
-              -X POST \
-              -H "Authorization: Bearer $VULTR_API_KEY" \
-              -H "Content-Type: application/json" \
-              -d @payload.json \
-              https://api.vultr.com/v2/ssh-keys | jq -r '.ssh_key.id')
-          fi
-          if [ -z "$KEY_ID" ] || [ "$KEY_ID" = "null" ]; then
-            echo "Failed to provision SSH key" >&2
-            exit 1
-          fi
-          rm -f payload.json "$SSH_KEY_FILE" "$LIST_JSON"
-          echo "SSH_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+          # inject runtime overrides via header
+          REGION="${{ inputs.region }}"
+          PLAN="${{ inputs.plan }}"
+          CLIENT_NAME="${{ inputs.client_name }}"
+          CLIENT_ADDR="${{ inputs.client_addr }}"
+          WG_PORT="${{ inputs.wg_port }}"
+          SNAP="${{ inputs.snapshot_id }}"
+          if [ -z "$SNAP" ]; then SNAP="${SNAPSHOT_DEF}"; fi
 
-      - name: Render user data
-        id: userdata
-        shell: bash
-        run: |
-          set -euo pipefail
-          header="$(mktemp)"
-          {
-            echo "#!/bin/bash"
-            printf 'export WG_PORT=%q\n' "$WG_PORT"
-            printf 'export CLIENT_NAME=%q\n' "$CLIENT_NAME"
-            printf 'export CLIENT_ADDR=%q\n' "$CLIENT_ADDR"
-            printf 'export AUTHORIZED_SSH_PUBKEY=%q\n' "$SSH_PUBLIC_KEY"
-          } > "$header"
-          tail -n +2 server/cloudinit/user-data.sh >> "$header"
-          mv "$header" user-data.rendered.sh
+          # read user-data.sh and prepend runtime vars block
+          printf '#!/bin/bash\nWG_PORT="%s"\nCLIENT_NAME="%s"\nCLIENT_ADDR="%s"\n' \
+            "$WG_PORT" "$CLIENT_NAME" "$CLIENT_ADDR" > ud.sh
+          cat server/cloudinit/user-data.sh >> ud.sh
 
-      - name: Generate payload
-        shell: bash
-        run: |
-          set -euo pipefail
-          LABEL="oneclick-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          jq -n \
-            --arg region "$REGION" \
-            --arg plan "$PLAN" \
-            --arg snapshot_id "$SNAPSHOT_ID" \
-            --arg label "$LABEL" \
-            --arg sshkey "$SSH_KEY_ID" \
-            --rawfile user_data user-data.rendered.sh \
-            '{region:$region, plan:$plan, snapshot_id:$snapshot_id, label:$label, enable_ipv6:false, backups:"disabled", user_data:$user_data, sshkey_id:[$sshkey]}' > payload.json
+          # store to GITHUB_OUTPUT as a single-line string (no secrets inside)
+          # use jq @json to escape correctly for JSON body later
+          esc=$(jq -Rs . < ud.sh)
+          echo "body=${esc}" >> "$GITHUB_OUTPUT"
 
-      - name: Create instance
+      - name: Create instance on Vultr from snapshot
         id: create
-        shell: bash
+        env:
+          SNAPSHOT_DEF: ${{ secrets.SNAPSHOT_ID }}
         run: |
-          set -euo pipefail
-          RESPONSE="$(mktemp)"
-          curl --silent --show-error --fail-with-body \
-            -X POST \
-            -H "Authorization: Bearer $VULTR_API_KEY" \
+          REGION="${{ inputs.region }}"
+          PLAN="${{ inputs.plan }}"
+          SNAP="${{ inputs.snapshot_id }}"
+          if [ -z "$SNAP" ]; then SNAP="${SNAPSHOT_DEF}"; fi
+
+          # build payload
+          cat > payload.json <<EOF
+          {
+            "region": "$REGION",
+            "plan": "$PLAN",
+            "snapshot_id": "$SNAP",
+            "label": "privatetunnel-oc",
+            "user_data": $(echo '${{ steps.ud.outputs.body }}'),
+            "backups": "disabled",
+            "enable_ipv6": true
+          }
+          EOF
+
+          # create instance
+          set -e
+          RES=$(curl --fail-with-body -sS -X POST https://api.vultr.com/v2/instances \
+            -H "Authorization: Bearer ${VULTR_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d @payload.json \
-            https://api.vultr.com/v2/instances > "$RESPONSE"
-          INSTANCE_ID=$(jq -r '.instance.id' "$RESPONSE")
-          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "null" ]; then
-            echo "Failed to create instance" >&2
-            cat "$RESPONSE" >&2
-            exit 1
-          fi
-          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+            --data-binary @payload.json)
+          echo "$RES" | jq .
+          ID=$(echo "$RES" | jq -r '.instance.id')
+          test -n "$ID" || { echo "No instance id returned"; exit 1; }
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for instance activation
-        id: wait-instance
-        shell: bash
+      - name: Wait instance active & fetch IPv4
+        id: ip
         run: |
-          set -euo pipefail
-          for attempt in $(seq 1 30); do
-            INFO="$(mktemp)"
-            curl --silent --show-error --fail-with-body \
-              -H "Authorization: Bearer $VULTR_API_KEY" \
-              https://api.vultr.com/v2/instances/$INSTANCE_ID > "$INFO"
-            STATUS=$(jq -r '.instance.status' "$INFO")
-            IP=$(jq -r '.instance.main_ip' "$INFO")
-            if [ "$STATUS" = "active" ] && [ -n "$IP" ] && [ "$IP" != "null" ]; then
-              INSTANCE_IP="$IP"
-              echo "INSTANCE_IP=$IP" >> "$GITHUB_ENV"
-              break
-            fi
-            sleep 10
-          done
-          if [ -z "${INSTANCE_IP:-}" ]; then
-            echo "Instance did not become active in time" >&2
-            exit 1
-          fi
-
-      - name: Wait for SSH availability
-        shell: bash
-        run: |
-          set -euo pipefail
-          scripts/wait_for_ssh.sh "root@${INSTANCE_IP}" 600
-
-      - name: Wait for WireGuard artifacts
-        shell: bash
-        run: |
-          set -euo pipefail
-          for attempt in $(seq 1 30); do
-            if ssh -o BatchMode=yes root@"$INSTANCE_IP" "test -s /root/${CLIENT_NAME}.png && test -s /root/${CLIENT_NAME}.conf"; then
+          ID="${{ steps.create.outputs.id }}"
+          for i in $(seq 1 60); do
+            RES=$(curl -sS -H "Authorization: Bearer ${VULTR_API_KEY}" https://api.vultr.com/v2/instances/${ID})
+            STATUS=$(echo "$RES" | jq -r '.instance.status')
+            IP=$(echo "$RES" | jq -r '.instance.main_ip')
+            echo "status=$STATUS ip=$IP"
+            if [ "$STATUS" = "active" ] && [ "$IP" != "null" ] && [ -n "$IP" ]; then
+              echo "ip=$IP" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             sleep 10
           done
-          echo "Timed out waiting for WireGuard client artifacts" >&2
-          exit 1
+          echo "Instance not ready in time"; exit 1
+
+      - name: Wait SSH ready
+        run: |
+          bash scripts/wait_for_ssh.sh ${{ steps.ip.outputs.ip }} 600
+
+      - name: Push SSH public key to authorized_keys (fallback)
+        run: |
+          IP=${{ steps.ip.outputs.ip }}
+          ssh -o StrictHostKeyChecking=no root@$IP "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '${SSH_PUBLIC_KEY}' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" || true
+
+      - name: Poll for artifacts on server
+        run: |
+          IP=${{ steps.ip.outputs.ip }}
+          NAME="${{ inputs.client_name }}"
+          for i in $(seq 1 60); do
+            ssh -o StrictHostKeyChecking=no root@$IP "test -s /root/${NAME}.png -a -s /root/${NAME}.conf" && break
+            echo "waiting artifacts... ($i)"
+            sleep 10
+          done
+          ssh -o StrictHostKeyChecking=no root@$IP "ls -l /root/${NAME}.png /root/${NAME}.conf"
 
       - name: Download artifacts
-        shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          scp root@"$INSTANCE_IP":/root/${CLIENT_NAME}.png artifacts/
-          scp root@"$INSTANCE_IP":/root/${CLIENT_NAME}.conf artifacts/
-
-      - name: Collect diagnostics
-        id: diagnostics
-        shell: bash
-        run: |
-          set -euo pipefail
-          WG_DUMP=$(ssh root@"$INSTANCE_IP" "wg show ${WG_IFNAME}" || true)
-          if [ -z "$WG_DUMP" ]; then
-            WG_DUMP="(wg show returned empty)"
-          fi
-          PORT_CHECK=$(ssh root@"$INSTANCE_IP" "ss -lun | grep :$WG_PORT" || true)
-          if [ -z "$PORT_CHECK" ]; then
-            PORT_CHECK="(ss -lun did not report :$WG_PORT)"
-          fi
-          echo "WG_PEERS<<'EOF'" >> "$GITHUB_OUTPUT"
-          echo "$WG_DUMP" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-          echo "PORT_LISTEN<<'EOF'" >> "$GITHUB_OUTPUT"
-          echo "$PORT_CHECK" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          IP=${{ steps.ip.outputs.ip }}
+          NAME="${{ inputs.client_name }}"
+          scp -o StrictHostKeyChecking=no root@$IP:/root/${NAME}.png .
+          scp -o StrictHostKeyChecking=no root@$IP:/root/${NAME}.conf .
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: oneclick-${{ env.INSTANCE_IP }}-${{ github.run_id }}
-          path: artifacts
-          if-no-files-found: error
+          name: wg-client-${{ steps.ip.outputs.ip }}-${{ inputs.client_name }}
+          path: |
+            ./${{ inputs.client_name }}.png
+            ./${{ inputs.client_name }}.conf
 
-      - name: Publish summary
-        shell: bash
+      - name: Summary
         run: |
-          set -euo pipefail
-          ARTIFACT_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          {
-            echo "## One-Click Connect Result"
-            echo "- Instance ID: ${INSTANCE_ID}"
-            echo "- Public IPv4: ${INSTANCE_IP}"
-            echo "- WireGuard Port: ${WG_PORT}/udp"
-            echo "- Client files: ${CLIENT_NAME}.png / ${CLIENT_NAME}.conf (artifact, generated at /root/${CLIENT_NAME}.png)"
-            echo "- Artifact download: [Actions run](${ARTIFACT_URL})"
-            echo ""
-            echo "### wg show peers"
-            echo '```'
-            echo "${{ steps.diagnostics.outputs.WG_PEERS }}"
-            echo '```'
-            echo ""
-            echo "### ss -lun | grep :${WG_PORT}"
-            echo '```'
-            echo "${{ steps.diagnostics.outputs.PORT_LISTEN }}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          IP=${{ steps.ip.outputs.ip }}
+          cat <<MD >> $GITHUB_STEP_SUMMARY
+          ## One-Click Connect
+          - **Instance IP:** \`${IP}\`
+          - **WG Port:** \`${{ inputs.wg_port }}\`
+          - **Artifacts:** QR PNG + client conf 已上传  
+          - **Next:** 在 iPhone 的 WireGuard App 扫描下载的 PNG 即可连接
+          MD
