@@ -60,7 +60,7 @@ def ensure_output_path(path: Path, force: bool) -> None:
     """Abort if *path* exists and overwriting is not allowed."""
 
     if path.exists() and not force:
-        raise SystemExit(
+        raise FileExistsError(
             f"Refusing to overwrite existing file {path}. Use --force to replace it."
         )
     if path.parent and not path.parent.exists():
@@ -129,17 +129,26 @@ def render_configuration(document: JSON) -> str:
     return "\n\n".join(sections) + "\n"
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def render_configuration_from_files(schema_path: Path, input_path: Path) -> str:
+    """Load and validate JSON files before rendering a WireGuard configuration."""
 
-    schema = load_json_file(args.schema)
-    document = load_json_file(args.input_path)
+    schema = load_json_file(schema_path)
+    document = load_json_file(input_path)
 
     validate_json(document, schema)
 
-    ensure_output_path(args.output_path, args.force)
+    return render_configuration(document)
 
-    config_text = render_configuration(document)
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    try:
+        ensure_output_path(args.output_path, args.force)
+    except FileExistsError as exc:  # pragma: no cover - trivial branch
+        raise SystemExit(str(exc)) from exc
+
+    config_text = render_configuration_from_files(args.schema, args.input_path)
     args.output_path.write_text(config_text, encoding="utf-8")
 
     print(f"WireGuard configuration written to {args.output_path}.")
