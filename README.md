@@ -1,5 +1,14 @@
 # PrivateTunnel
 
+## 🖥️ GUI 快速生成 WireGuard 配置
+
+1. 在终端执行 `python3 core/tools/generate_wg_conf_gui.py` 启动界面工具。
+2. 依次点击 **Schema 文件**、**配置 JSON**、**输出文件** 三个“浏览”按钮完成路径选择（默认 Schema 会自动指向 `core/config-schema.json`）。
+3. 如需覆盖既有配置文件，可勾选“允许覆盖已存在的文件”。
+4. 点击 **生成 WireGuard 配置**，界面下方的日志区会展示执行结果，并在成功后提示输出文件的位置。
+
+该界面封装了命令行脚本 `core/tools/generate_wg_conf.py` 的校验与渲染流程，无需手动记忆参数即可生成 `.conf` 文件。
+
 ## 🚀 One-Click Connect (GitHub Actions)
 - 配置仓库 Secrets：`VULTR_API_KEY` / `SSH_PRIVATE_KEY` / `SSH_PUBLIC_KEY` / `SNAPSHOT_ID`
 - 打开 **Actions → One-Click Connect → Run workflow**
