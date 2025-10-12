@@ -28,6 +28,7 @@ PrivateTunnel 是一个面向个人/小团队自建的私有 VPN/隧道解决方
 
 ## 三步快速开始
 
+- **One-Click Connect（GitHub Actions）**：若需快速拉起新的 WireGuard 节点，可直接使用 [docs/ONE_CLICK.md](docs/ONE_CLICK.md) 中的工作流，一键创建 Vultr 实例并生成客户端二维码。
 1. **部署服务器（Round 2/3）**：按照 [docs/SERVER-OPERATIONS.md](docs/SERVER-OPERATIONS.md) 与 [docs/CONFIG.md](docs/CONFIG.md) 准备 VPS，运行 `server/provision/wg-install.sh`，生成客户端配置。
 2. **构建 iOS 客户端（Round 4/5/6）**：阅读 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) 与 [docs/BUILD_IOS.md](docs/BUILD_IOS.md)，在本地使用 Xcode 构建容器 App 与 PacketTunnel 扩展。
 3. **启用健康检查与分流（Round 7/8）**：根据 [docs/HEALTH-AUTO-RECONNECT.md](docs/HEALTH-AUTO-RECONNECT.md) 与 [docs/SPLIT-IPSET.md](docs/SPLIT-IPSET.md) 配置心跳、自动重连及域名白名单。
