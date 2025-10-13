@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
 import textwrap
 import time
@@ -18,6 +19,7 @@ from core.ssh_utils import (
     SmartSSHError,
     ask_key_path,
     pick_default_key,
+    smart_push_script,
     smart_ssh,
     wait_port_open,
 )
@@ -29,9 +31,6 @@ from core.tools.vultr_manager import (
     reinstall_with_ssh_keys,
     wait_instance_active,
 )
-from core.tools.wireguard_installer import WireGuardProvisionError, provision
-
-
 DEFAULT_REGION = "nrt"
 DEFAULT_PLAN = "vc2-1c-1gb"
 DEFAULT_LABEL = "privatetunnel-oc"
@@ -347,13 +346,134 @@ def deploy_wireguard(ip: str, private_key_path: Path) -> None:
         )
     print("✅ 远端连通性正常，开始执行 WireGuard 安装脚本 ...")
 
+    wg_install_script = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt update -y
+apt install -y wireguard wireguard-tools qrencode iptables-persistent
+
+mkdir -p /etc/wireguard
+umask 077
+
+# 生成服务端密钥
+wg genkey | tee /etc/wireguard/server.private | wg pubkey > /etc/wireguard/server.public
+SERVER_PRIV=$(cat /etc/wireguard/server.private)
+
+# 写配置
+cat >/etc/wireguard/wg0.conf <<'EOF'
+[Interface]
+Address = 10.6.0.1/24
+ListenPort = 51820
+PrivateKey = __SERVER_PRIV__
+SaveConfig = true
+EOF
+sed -i "s|__SERVER_PRIV__|${SERVER_PRIV}|" /etc/wireguard/wg0.conf
+
+# 开启转发 & NAT
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+WAN_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
+iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
+# 持久化（容错）
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save || true
+elif [ -d /etc/iptables ]; then
+  iptables-save > /etc/iptables/rules.v4 || true
+fi
+
+systemctl enable wg-quick@wg0
+systemctl restart wg-quick@wg0
+
+echo "=== wg0 status ==="
+wg show || true
+"""
+
+    rc = smart_push_script(ip, str(private_key_path), wg_install_script)
+    if rc != 0:
+        raise RuntimeError(f"远端执行部署脚本失败，退出码：{rc}")
+
+    print("→ WireGuard 服务已部署，继续添加客户端 ...")
+
+    add_peer_script = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+apt install -y qrencode
+
+CLIENT_NAME="iphone"
+CLIENT_DIR="/etc/wireguard/clients/${CLIENT_NAME}"
+mkdir -p "${CLIENT_DIR}"
+umask 077
+
+wg genkey | tee "${CLIENT_DIR}/${CLIENT_NAME}.private" | wg pubkey > "${CLIENT_DIR}/${CLIENT_NAME}.public"
+CLIENT_PRIV=$(cat "${CLIENT_DIR}/${CLIENT_NAME}.private")
+CLIENT_PUB=$(cat "${CLIENT_DIR}/${CLIENT_NAME}.public")
+
+# 取服务端公钥与对外地址
+SERVER_PUB=$(cat /etc/wireguard/server.public)
+ENDPOINT="$(curl -4 -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'):51820"
+
+# 将客户端作为 peer 加到服务器
+wg set wg0 peer "${CLIENT_PUB}" allowed-ips 10.6.0.2/32
+wg-quick save wg0 || true
+
+# 生成客户端配置
+cat > "${CLIENT_DIR}/${CLIENT_NAME}.conf" <<EOF
+[Interface]
+PrivateKey = ${CLIENT_PRIV}
+Address = 10.6.0.2/32
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = ${SERVER_PUB}
+AllowedIPs = 0.0.0.0/0
+Endpoint = ${ENDPOINT}
+PersistentKeepalive = 25
+EOF
+
+echo "=== QR below ==="
+qrencode -t ANSIUTF8 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || true
+"""
+
+    rc2 = smart_push_script(ip, str(private_key_path), add_peer_script)
+    if rc2 != 0:
+        raise RuntimeError(f"添加客户端/生成二维码失败，退出码：{rc2}")
+
+    print("→ 尝试读取服务端公钥 ...")
+    server_pub = ""
     try:
-        # 继续在此处扩展 WireGuard 远端执行逻辑，例如部署脚本或配置同步。
-        result = provision(ip, username="root", pkey_path=str(private_key_path))
-    except WireGuardProvisionError as exc:
-        raise RuntimeError(f"部署 WireGuard 失败：{exc}") from exc
-    _record_server_info(ip, result)
-    print("✅ WireGuard 已部署完成。")
+        pub_result = smart_ssh(ip, "root", private_key_path, "cat /etc/wireguard/server.public")
+    except SmartSSHError as exc:  # pragma: no cover - network dependent
+        print(f"⚠️ 读取服务端公钥失败：{exc}")
+    else:
+        if pub_result.returncode == 0:
+            server_pub = (pub_result.stdout or "").strip()
+        else:
+            output = (pub_result.stderr or pub_result.stdout or "").strip()
+            print(f"⚠️ 读取服务端公钥失败：{output}")
+
+    if server_pub:
+        _record_server_info(ip, {"server_pub": server_pub, "port": 51820})
+
+    try:
+        artifacts_dir = Path("artifacts")
+        artifacts_dir.mkdir(exist_ok=True)
+        subprocess.run(
+            [
+                "scp",
+                "-i",
+                str(private_key_path),
+                f"root@{ip}:/etc/wireguard/clients/iphone/iphone.conf",
+                str(artifacts_dir / "iphone.conf"),
+            ],
+            check=False,
+        )
+        print("ℹ️ 已尝试下载到 artifacts/iphone.conf")
+    except FileNotFoundError:
+        print("⚠️ 未找到 scp，可手动复制 /etc/wireguard/clients/iphone/iphone.conf")
+
+    print("✅ WireGuard 部署完成，并已生成 iPhone 客户端二维码（见上方输出）。")
 
 
 def main() -> None:

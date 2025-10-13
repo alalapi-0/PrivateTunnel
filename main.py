@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import sys
-from getpass import getpass
 from pathlib import Path
 
 
@@ -71,14 +70,17 @@ def run_prune() -> None:
         print("\n🧹 精简完成。请查看 PROJECT_PRUNE_REPORT.md")
     else:
         print("\n⚠️ 精简脚本返回异常，请查看输出。")
+from core.ssh_utils import (
+    SmartSSHError,
+    ask_key_path,
+    pick_default_key,
+    smart_push_script,
+    smart_ssh,
+    wait_port_open,
+)
 
 
 def deploy_wireguard() -> None:
-    from core.tools.wireguard_installer import (  # pylint: disable=import-outside-toplevel
-        WireGuardProvisionError,
-        provision,
-    )
-
     inst_path = Path("artifacts/instance.json")
     if not inst_path.exists():
         print("❌ 未找到 artifacts/instance.json，请先创建 VPS。")
@@ -96,68 +98,180 @@ def deploy_wireguard() -> None:
         return
 
     print(f"发现实例 {ip}")
-    method = input("选择认证方式: [Enter=私钥] / p=密码: ").strip().lower()
+    mode = input("选择认证方式: [Enter=私钥] / p=密码: ").strip().lower()
+    if mode == "p":
+        print("⚠️ 建议使用私钥方式进行自动化部署。")
+        return
+
+    default_key = pick_default_key()
+    key_path = Path(ask_key_path(default_key)).expanduser()
+    print(f"✓ 使用私钥：{key_path}")
+
+    print("→ 等待 SSH 端口 22 就绪 ...")
+    if not wait_port_open(ip, 22, timeout=120):
+        print("❌ SSH 端口未就绪（实例可能还在初始化或防火墙未放行 22）。")
+        return
+
+    print("→ 校验远端连通性 ...")
+    try:
+        check_result = smart_ssh(ip, "root", key_path, "uname -a")
+    except SmartSSHError as exc:
+        details = []
+        for attempt in exc.attempts:
+            detail = " ".join(filter(None, [attempt.error, attempt.stderr, attempt.stdout])).strip()
+            details.append(f"{attempt.backend}: {detail}")
+        hint = "\n".join(filter(None, details))
+        message = "无法通过 SSH 测试远端通性。请确认私钥有效且放行了 22 端口。"
+        if hint:
+            message = f"{message}\n排查信息：\n{hint}"
+        print(f"❌ {message}")
+        return
+
+    if check_result.returncode != 0:
+        output = (check_result.stderr or check_result.stdout or "").strip()
+        print(
+            f"❌ 远端命令执行失败，退出码：{check_result.returncode}。输出：{output}"
+        )
+        return
+
+    print("✅ 远端连通性正常，开始执行 WireGuard 安装脚本 ...")
+
+    wg_install_script = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt update -y
+apt install -y wireguard wireguard-tools qrencode iptables-persistent
+
+mkdir -p /etc/wireguard
+umask 077
+
+# 生成服务端密钥
+wg genkey | tee /etc/wireguard/server.private | wg pubkey > /etc/wireguard/server.public
+SERVER_PRIV=$(cat /etc/wireguard/server.private)
+
+# 写配置
+cat >/etc/wireguard/wg0.conf <<'EOF'
+[Interface]
+Address = 10.6.0.1/24
+ListenPort = 51820
+PrivateKey = __SERVER_PRIV__
+SaveConfig = true
+EOF
+sed -i "s|__SERVER_PRIV__|${SERVER_PRIV}|" /etc/wireguard/wg0.conf
+
+# 开启转发 & NAT
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+WAN_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
+iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
+# 持久化（容错）
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save || true
+elif [ -d /etc/iptables ]; then
+  iptables-save > /etc/iptables/rules.v4 || true
+fi
+
+systemctl enable wg-quick@wg0
+systemctl restart wg-quick@wg0
+
+echo "=== wg0 status ==="
+wg show || true
+"""
+
+    rc = smart_push_script(ip, str(key_path), wg_install_script)
+    if rc != 0:
+        print(f"❌ 远端执行部署脚本失败，退出码：{rc}")
+        return
+
+    print("→ WireGuard 服务已部署，继续添加客户端 ...")
+
+    add_peer_script = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+apt install -y qrencode
+
+CLIENT_NAME="iphone"
+CLIENT_DIR="/etc/wireguard/clients/${CLIENT_NAME}"
+mkdir -p "${CLIENT_DIR}"
+umask 077
+
+wg genkey | tee "${CLIENT_DIR}/${CLIENT_NAME}.private" | wg pubkey > "${CLIENT_DIR}/${CLIENT_NAME}.public"
+CLIENT_PRIV=$(cat "${CLIENT_DIR}/${CLIENT_NAME}.private")
+CLIENT_PUB=$(cat "${CLIENT_DIR}/${CLIENT_NAME}.public")
+
+# 取服务端公钥与对外地址
+SERVER_PUB=$(cat /etc/wireguard/server.public)
+ENDPOINT="$(curl -4 -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'):51820"
+
+# 将客户端作为 peer 加到服务器
+wg set wg0 peer "${CLIENT_PUB}" allowed-ips 10.6.0.2/32
+wg-quick save wg0 || true
+
+# 生成客户端配置
+cat > "${CLIENT_DIR}/${CLIENT_NAME}.conf" <<EOF
+[Interface]
+PrivateKey = ${CLIENT_PRIV}
+Address = 10.6.0.2/32
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = ${SERVER_PUB}
+AllowedIPs = 0.0.0.0/0
+Endpoint = ${ENDPOINT}
+PersistentKeepalive = 25
+EOF
+
+echo "=== QR below ==="
+qrencode -t ANSIUTF8 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || true
+"""
+
+    rc2 = smart_push_script(ip, str(key_path), add_peer_script)
+    if rc2 != 0:
+        print(f"❌ 添加客户端/生成二维码失败，退出码：{rc2}")
+        return
 
     artifacts_dir = Path("artifacts")
     artifacts_dir.mkdir(exist_ok=True)
 
-    provision_result: dict | None = None
-    fallback_to_password = False
-
-    if method != "p":
-        default_key = Path.home() / ".ssh" / "id_rsa"
-        key_input = input(f"私钥路径 [{default_key}]: ").strip()
-        key_path = Path(key_input or str(default_key)).expanduser()
-        if not key_path.exists():
-            print(f"⚠️ 私钥文件不存在：{key_path}")
-            fallback_to_password = True
+    server_pub = ""
+    try:
+        pub_result = smart_ssh(ip, "root", key_path, "cat /etc/wireguard/server.public")
+    except SmartSSHError as exc:  # pragma: no cover - network dependent
+        print(f"⚠️ 读取服务端公钥失败：{exc}")
+    else:
+        if pub_result.returncode == 0:
+            server_pub = (pub_result.stdout or "").strip()
         else:
-            try:
-                provision_result = provision(ip, username="root", pkey_path=str(key_path))
-            except WireGuardProvisionError as exc:
-                print(f"❌ 使用私钥部署失败：{exc}")
-                fallback_to_password = True
-            except Exception as exc:  # pragma: no cover - defensive
-                print(f"❌ 未预期错误：{exc}")
-                return
+            output = (pub_result.stderr or pub_result.stdout or "").strip()
+            print(f"⚠️ 读取服务端公钥失败：{output}")
 
-    if provision_result is None and (method == "p" or fallback_to_password):
-        password = getpass("root 密码: ")
-        if not password:
-            print("❌ 未输入密码，已取消部署。")
-            return
-        try:
-            provision_result = provision(
-                ip,
-                username="root",
-                password=password,
-            )
-        except WireGuardProvisionError as exc:
-            print(f"❌ 使用密码部署失败：{exc}")
-            print("排查建议：\n- 检查密码是否正确\n- 确认实例防火墙放行 22 端口\n- 尝试使用私钥重新部署")
-            return
-        except Exception as exc:  # pragma: no cover - defensive
-            print(f"❌ 未预期错误：{exc}")
-            return
+    if server_pub:
+        server_path = artifacts_dir / "server.json"
+        server_payload = {"server_pub": server_pub, "port": 51820, "ip": ip}
+        server_path.write_text(
+            json.dumps(server_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"🗂  已写入 {server_path}")
 
-    if provision_result is None:
-        print("❌ 部署已取消。")
-        return
+    try:
+        subprocess.run(
+            [
+                "scp",
+                "-i",
+                str(key_path),
+                f"root@{ip}:/etc/wireguard/clients/iphone/iphone.conf",
+                str(artifacts_dir / "iphone.conf"),
+            ],
+            check=False,
+        )
+        print("ℹ️ 已尝试下载到 artifacts/iphone.conf")
+    except FileNotFoundError:
+        print("⚠️ 未找到 scp，可手动复制 /etc/wireguard/clients/iphone/iphone.conf")
 
-    server_path = artifacts_dir / "server.json"
-    result_payload = {
-        "server_pub": provision_result.get("server_pub", ""),
-        "port": provision_result.get("port", 51820),
-        "ip": ip,
-    }
-    server_path.write_text(
-        json.dumps(result_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    print("✅ WireGuard 已启动，端口 51820")
-    print(f"server_pub: {result_payload['server_pub']}")
-    print(f"已写入 {server_path}")
+    print("✅ WireGuard 部署完成，并已生成 iPhone 客户端二维码（见上方输出）。")
 
 
 def main() -> None:

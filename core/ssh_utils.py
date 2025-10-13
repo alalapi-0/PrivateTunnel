@@ -6,6 +6,7 @@ import os
 import platform
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,14 +54,19 @@ class SSHResult:
     stderr: str
 
 
+def _default_home() -> Path:
+    expanded = os.path.expandvars(r"%USERPROFILE%")
+    return Path(expanded) if expanded and "%" not in expanded else Path.home()
+
+
+def _default_ssh_executable() -> str:
+    return "ssh.exe" if platform.system().lower().startswith("win") else "ssh"
+
+
 def pick_default_key() -> str:
     """Return the preferred default private key path for Windows prompts."""
 
-    # Windows installers commonly rely on ``USERPROFILE`` rather than
-    # ``HOME``.  ``expandvars`` gracefully returns the original string if the
-    # variable is undefined, in which case we fall back to ``Path.home()``.
-    expanded = os.path.expandvars(r"%USERPROFILE%")
-    home = Path(expanded) if expanded and "%" not in expanded else Path.home()
+    home = _default_home()
     ed25519 = home / ".ssh" / "id_ed25519"
     rsa = home / ".ssh" / "id_rsa"
     if ed25519.is_file() and ed25519.stat().st_size > 0:
@@ -146,6 +152,104 @@ def load_private_key(path: str | os.PathLike[str]) -> paramiko.PKey:
     raise SSHKeyLoadError(f"无法解析私钥文件 {key_path}: {joined}")
 
 
+def run_ssh_script_via_stdin(
+    host: str,
+    key_path: str,
+    script_text: str,
+    *,
+    strict_new: bool = True,
+    timeout: int = 1200,
+) -> int:
+    """Send a multi-line shell script to the remote host via ``ssh`` stdin."""
+
+    opts = ["-i", key_path]
+    if strict_new:
+        opts += ["-o", "StrictHostKeyChecking=accept-new"]
+    ssh_cmd = [_default_ssh_executable(), *opts, f"root@{host}", "bash", "-s", "--"]
+    print(f"ℹ️ 使用 ssh.exe+STDIN 传输脚本：{' '.join(ssh_cmd)}")
+    proc = subprocess.Popen(  # noqa: PLW1510 - communicate handles cleanup
+        ssh_cmd,
+        stdin=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        proc.communicate(script_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return 124
+    return int(proc.returncode or 0)
+
+
+def run_ssh_paramiko_script_via_stdin(
+    host: str,
+    key_path: str,
+    script_text: str,
+    *,
+    timeout: int = 1200,
+) -> Optional[int]:
+    """Send ``script_text`` via Paramiko, returning ``None`` if fallback is needed."""
+
+    if paramiko is None:  # pragma: no cover - runtime guard
+        if _PARAMIKO_IMPORT_ERROR is not None:
+            print(f"⚠️ Paramiko 不可用：{_PARAMIKO_IMPORT_ERROR}，将回退到 ssh.exe")
+        else:
+            print("⚠️ Paramiko 不可用，将回退到 ssh.exe")
+        return None
+
+    try:
+        pkey = load_private_key(key_path)
+    except SSHKeyLoadError as exc:
+        print(f"⚠️ Paramiko 无法加载私钥，将回退到 ssh.exe：{exc}")
+        return None
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        client.connect(
+            host,
+            username="root",
+            pkey=pkey,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=30,
+            banner_timeout=30,
+            auth_timeout=30,
+        )
+        print("ℹ️ 使用 Paramiko 通过 stdin 下发脚本")
+        stdin, stdout, stderr = client.exec_command("bash -s --", timeout=timeout)
+        stdin.write(script_text)
+        stdin.channel.shutdown_write()
+
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        if out:
+            sys.stdout.write(out)
+            if not out.endswith("\n"):
+                sys.stdout.write("\n")
+        if err:
+            sys.stderr.write(err)
+            if not err.endswith("\n"):
+                sys.stderr.write("\n")
+
+        exit_status = stdout.channel.recv_exit_status()
+        return int(exit_status)
+    except Exception as exc:  # noqa: BLE001 - allow fallback to ssh.exe
+        print(f"⚠️ Paramiko 失败：{exc}，将回退到 ssh.exe")
+        return None
+    finally:
+        client.close()
+
+
+def smart_push_script(host: str, key_path: str, script_text: str) -> int:
+    """Push ``script_text`` via Paramiko first and fall back to ``ssh`` stdin."""
+
+    code = run_ssh_paramiko_script_via_stdin(host, key_path, script_text)
+    if code is None:
+        code = run_ssh_script_via_stdin(host, key_path, script_text)
+    return code
+
+
 def run_ssh_paramiko(
     host: str,
     username: str,
@@ -210,7 +314,7 @@ def run_ssh_exe(
     """Execute ``command`` using the system ``ssh`` binary."""
 
     if ssh_executable is None:
-        ssh_executable = "ssh.exe" if platform.system().lower().startswith("win") else "ssh"
+        ssh_executable = _default_ssh_executable()
 
     ssh_cmd = [
         ssh_executable,
@@ -302,6 +406,9 @@ def smart_ssh(
 __all__ = [
     "ask_key_path",
     "pick_default_key",
+    "run_ssh_paramiko_script_via_stdin",
+    "run_ssh_script_via_stdin",
+    "smart_push_script",
     "SSHAttempt",
     "SSHKeyLoadError",
     "SSHResult",
