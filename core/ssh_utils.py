@@ -159,12 +159,15 @@ def run_ssh_script_via_stdin(
     *,
     strict_new: bool = True,
     timeout: int = 1200,
+    known_hosts_file: str | None = None,
 ) -> int:
     """Send a multi-line shell script to the remote host via ``ssh`` stdin."""
 
     opts = ["-i", key_path]
     if strict_new:
         opts += ["-o", "StrictHostKeyChecking=accept-new"]
+    if known_hosts_file:
+        opts += ["-o", f"UserKnownHostsFile={known_hosts_file}"]
     ssh_cmd = [_default_ssh_executable(), *opts, f"root@{host}", "bash", "-s", "--"]
     print(f"ℹ️ 使用 ssh.exe+STDIN 传输脚本：{' '.join(ssh_cmd)}")
     proc = subprocess.Popen(  # noqa: PLW1510 - communicate handles cleanup
@@ -241,12 +244,23 @@ def run_ssh_paramiko_script_via_stdin(
         client.close()
 
 
-def smart_push_script(host: str, key_path: str, script_text: str) -> int:
+def smart_push_script(
+    host: str,
+    key_path: str,
+    script_text: str,
+    *,
+    known_hosts_file: str | None = None,
+) -> int:
     """Push ``script_text`` via Paramiko first and fall back to ``ssh`` stdin."""
 
     code = run_ssh_paramiko_script_via_stdin(host, key_path, script_text)
     if code is None:
-        code = run_ssh_script_via_stdin(host, key_path, script_text)
+        code = run_ssh_script_via_stdin(
+            host,
+            key_path,
+            script_text,
+            known_hosts_file=known_hosts_file,
+        )
     return code
 
 
@@ -310,6 +324,7 @@ def run_ssh_exe(
     timeout: int = 20,
     ssh_executable: Optional[str] = None,
     strict_host_key: str = "accept-new",
+    known_hosts_file: str | None = None,
 ) -> SSHResult:
     """Execute ``command`` using the system ``ssh`` binary."""
 
@@ -329,6 +344,9 @@ def run_ssh_exe(
         f"{username}@{host}",
         command,
     ]
+
+    if known_hosts_file:
+        ssh_cmd += ["-o", f"UserKnownHostsFile={known_hosts_file}"]
 
     print(f"ℹ️ 使用 ssh.exe：{' '.join(ssh_cmd[:-1])} <remote-cmd>")
     proc = subprocess.run(
@@ -350,6 +368,7 @@ def smart_ssh(
     port: int = 22,
     timeout: int = 20,
     ssh_executable: Optional[str] = None,
+    known_hosts_file: str | None = None,
 ) -> SSHResult:
     """Execute ``command`` on ``host`` using either Paramiko or ``ssh.exe``.
 
@@ -392,6 +411,7 @@ def smart_ssh(
             port=port,
             timeout=timeout,
             ssh_executable=ssh_executable,
+            known_hosts_file=known_hosts_file,
         )
     except FileNotFoundError as exc:
         attempts.append(SSHAttempt("ssh.exe", f"找不到 ssh 客户端：{exc}"))
