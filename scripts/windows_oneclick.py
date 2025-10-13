@@ -3,16 +3,13 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import subprocess
 import sys
 import textwrap
-import time
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 from core.ssh_utils import (
     SSHAttempt,
@@ -23,13 +20,12 @@ from core.ssh_utils import (
     smart_ssh,
     wait_port_open,
 )
-from core.tools.vultr_manager import (
-    VultrError,
-    create_instance,
-    create_ssh_key,
-    list_ssh_keys,
-    reinstall_with_ssh_keys,
-    wait_instance_active,
+from core.vultr_api import (
+    VultrAPIError,
+    create_instance as api_create_instance,
+    ensure_ssh_key,
+    pick_snapshot,
+    wait_instance_ready,
 )
 DEFAULT_REGION = "nrt"
 DEFAULT_PLAN = "vc2-1c-1gb"
@@ -66,7 +62,17 @@ def _default_pubkey_path() -> Path:
     env = os.environ.get("PUBKEY_PATH")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".ssh" / "id_ed25519.pub"
+    home = Path(os.path.expandvars(r"%USERPROFILE%"))
+    if "%" in str(home):
+        home = Path.home()
+    candidates = [
+        home / ".ssh" / "id_ed25519.pub",
+        home / ".ssh" / "id_rsa.pub",
+    ]
+    for candidate in candidates:
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return candidates[0]
 
 
 def _prompt_private_key() -> Path:
@@ -80,91 +86,102 @@ def _prompt_private_key() -> Path:
     return Path(selected).expanduser()
 
 
-def _build_user_data(pubkey_line: str) -> tuple[str, str]:
-    safe_single = pubkey_line.replace("'", "''")
-    escaped_pub = pubkey_line.replace("'", "'\"'\"'")
-    shell_cmd = (
-        "set -euo pipefail; "
-        "mkdir -p /root/.ssh && chmod 700 /root/.ssh; "
-        "AUTH=/root/.ssh/authorized_keys; "
-        f"PUB='{escaped_pub}'; "
-        "if [ ! -f \"$AUTH\" ]; then touch \"$AUTH\"; fi; "
-        "grep -qxF \"$PUB\" \"$AUTH\" 2>/dev/null || echo \"$PUB\" >> \"$AUTH\"; "
-        "chmod 600 \"$AUTH\""
-    )
-    shell_cmd = shell_cmd.replace('"', '\\"')
-    cloud_config = textwrap.dedent(
-        f"""
-        #cloud-config
-        ssh_authorized_keys:
-          - '{safe_single}'
-        runcmd:
-          - ["/bin/bash", "-lc", "{shell_cmd}"]
-        """
-    ).strip()
-    encoded = base64.b64encode(cloud_config.encode("utf-8")).decode("ascii")
-    return encoded, cloud_config
+def _artifacts_dir() -> Path:
+    path = Path("artifacts")
+    path.mkdir(exist_ok=True)
+    return path
 
 
-def _choose_ssh_key(api_key: str, pubkey_line: str) -> tuple[list[str], str]:
-    keys = list_ssh_keys(api_key)
-    print("\n可用的 Vultr SSH Keys：")
-    for idx, item in enumerate(keys, start=1):
-        preview = item.get("ssh_key", "")[:60]
-        print(f"  {idx}. {item.get('name', '未命名')} ({item.get('id')}) - {preview}...")
-    print("  0. 自动创建新的 SSH Key（读取本地公钥）")
+def _known_hosts_path() -> Path:
+    known_hosts = _artifacts_dir() / "known_hosts"
+    if not known_hosts.exists():
+        known_hosts.touch()
+    return known_hosts
 
-    while True:
-        choice = _prompt("选择要注入的 SSH Key 编号", "0")
-        if not choice.isdigit():
-            print("❌ 请输入数字编号。")
+
+def _reset_host_key(ip: str) -> Path:
+    known_hosts = _known_hosts_path()
+    commands = [
+        ["ssh-keygen", "-R", ip],
+        ["ssh-keygen", "-R", ip, "-f", str(known_hosts)],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
             continue
-        index = int(choice)
-        if index == 0:
-            name = f"PrivateTunnel-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
-            print(f"→ 创建 SSH Key: {name} ...")
-            created = create_ssh_key(api_key, name, pubkey_line)
-            key_id = created.get("id")
-            if not key_id:
-                raise VultrError("创建 SSH Key 返回异常，未包含 id。")
-            print(f"✅ 已创建 SSH Key: {key_id}")
-            return [key_id], key_id
-        if 1 <= index <= len(keys):
-            key_id = keys[index - 1].get("id")
-            if not key_id:
-                print("❌ 该 SSH Key 缺少 id 字段，请重新选择。")
-                continue
-            return [key_id], key_id
-        print("❌ 编号超出范围，请重新输入。")
+    return known_hosts
 
 
-def _write_instance_artifact(payload: Dict[str, str]) -> None:
-    artifacts_dir = Path("artifacts")
-    artifacts_dir.mkdir(exist_ok=True)
-    path = artifacts_dir / "instance.json"
+def _scp_download(
+    ip: str,
+    private_key_path: Path,
+    remote_path: str,
+    local_path: Path,
+    known_hosts_file: Path,
+) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "scp",
+                "-i",
+                str(private_key_path),
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                f"UserKnownHostsFile={known_hosts_file}",
+                f"root@{ip}:{remote_path}",
+                str(local_path),
+            ],
+            check=False,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("未找到 scp 客户端，请确认已安装 OpenSSH 工具。") from None
+    if result.returncode != 0:
+        print(f"⚠️ 下载 {remote_path} 失败，scp 返回码：{result.returncode}")
+        return False
+    print(f"✓ 已下载 {remote_path} → {local_path}")
+    return True
+
+
+def _ensure_local_qrcode(conf_path: Path, png_path: Path) -> None:
+    if png_path.exists():
+        return
+    try:
+        import qrcode  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency at runtime
+        raise RuntimeError("服务器二维码生成失败，本地也无法导入 qrcode 模块。") from exc
+
+    data = conf_path.read_text(encoding="utf-8")
+    img = qrcode.make(data)
+    img.save(png_path)
+    print(f"✓ 已使用本地 qrcode 生成二维码：{png_path}")
+
+
+def _write_instance_artifact(payload: Dict[str, object]) -> None:
+    path = _artifacts_dir() / "instance.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"🗂  已写入 {path}")
 
 
 def _record_server_info(ip: str, provision_result: dict) -> None:
-    artifacts_dir = Path("artifacts")
-    artifacts_dir.mkdir(exist_ok=True)
     payload = {
         "ip": ip,
         "server_pub": provision_result.get("server_pub", ""),
         "port": provision_result.get("port", 51820),
     }
-    path = artifacts_dir / "server.json"
+    path = _artifacts_dir() / "server.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"🗂  已写入 {path}")
 
 
-def create_vps_flow(api_key: str) -> Dict[str, str]:
+def create_vps_flow(api_key: str) -> Dict[str, object]:
     print("=== 1/3 创建 Vultr 实例 ===")
     region = _prompt("Region", DEFAULT_REGION)
     plan = _prompt("Plan", DEFAULT_PLAN)
-    snapshot_input = _prompt("Snapshot ID (留空则使用官方镜像)", "")
-    snapshot_id = snapshot_input or None
+
+    snapshot_env = os.environ.get("VULTR_SNAPSHOT_ID", "").strip() or None
+    ssh_key_name = os.environ.get("VULTR_SSHKEY_NAME", "PrivateTunnelKey").strip() or "PrivateTunnelKey"
 
     pubkey_path = _default_pubkey_path()
     try:
@@ -174,49 +191,42 @@ def create_vps_flow(api_key: str) -> Dict[str, str]:
         sys.exit(1)
 
     print(f"使用公钥文件：{pubkey_path}")
-    sshkey_ids, selected_key = _choose_ssh_key(api_key, pubkey_line)
+    sshkey_id = ensure_ssh_key(api_key, pubkey_line, ssh_key_name)
+    snapshot_id = pick_snapshot(api_key, snapshot_env)
 
-    user_data_b64, user_data_plain = _build_user_data(pubkey_line)
     print("→ 发送创建实例请求 ...")
-    instance = create_instance(
+    instance = api_create_instance(
         api_key,
         region=region,
         plan=plan,
+        sshkey_ids=[sshkey_id],
         snapshot_id=snapshot_id,
         label=DEFAULT_LABEL,
-        sshkey_ids=sshkey_ids,
-        user_data=user_data_b64,
     )
     instance_id = instance.get("id")
     if not instance_id:
-        raise VultrError("创建实例返回缺少 id。")
-    print(f"实例 {instance_id} 已创建，等待 Running ...")
+        raise VultrAPIError("创建实例返回缺少 id。")
 
-    ready = wait_instance_active(api_key, instance_id, timeout=900, interval=10)
-    ip = ready.get("ip") or ready.get("main_ip")
+    ready = wait_instance_ready(api_key, instance_id, timeout=900)
+    ip = ready.get("main_ip") or ready.get("ip")
     if not ip:
-        raise VultrError("等待实例运行时未获得 IP 地址。")
+        raise VultrAPIError("等待实例运行时未获得 IP 地址。")
     print(f"✅ 实例就绪：{ip}")
 
-    artifact_payload = {
+    artifact_payload: Dict[str, object] = {
         "id": instance_id,
         "ip": ip,
         "region": region,
         "plan": plan,
         "snapshot_id": snapshot_id or "",
-        "sshkey_id": selected_key,
-        "sshkey_ids": sshkey_ids,
+        "sshkey_id": sshkey_id,
+        "sshkey_ids": [sshkey_id],
+        "sshkey_name": ssh_key_name,
         "pubkey_path": str(pubkey_path),
-        "user_data_used": "cloud-config",
-        "user_data_base64": user_data_b64,
-        "user_data_preview": user_data_plain,
+        "created_at": ready.get("date_created"),
     }
     _write_instance_artifact(artifact_payload)
-    artifact_payload.update(
-        {
-            "pubkey_line": pubkey_line,
-        }
-    )
+    artifact_payload["pubkey_line"] = pubkey_line
     return artifact_payload
 
 
@@ -225,7 +235,7 @@ def _contains_permission_denied(text: str) -> bool:
     return "permission denied" in lowered and "publickey" in lowered
 
 
-def _diagnose_attempts(attempts: List[SSHAttempt]) -> bool:
+def _diagnose_attempts(attempts: list[SSHAttempt]) -> bool:
     for att in attempts:
         joined = " ".join(filter(None, [att.error, att.stderr, att.stdout]))
         if joined and _contains_permission_denied(joined):
@@ -246,19 +256,22 @@ def _manual_console_instructions(pubkey_line: str) -> str:
 
 
 def post_boot_verify_ssh(
-    api_key: str,
-    instance_id: str,
     ip: str,
     private_key_path: Path,
     pubkey_line: str,
-    sshkey_ids: List[str],
-    user_data_b64: str,
+    known_hosts_file: Path,
 ) -> None:
     print("\n=== 2/3 校验 SSH 免密 ===")
     while True:
         print("→ 测试免密登录 ...")
         try:
-            result = smart_ssh(ip, "root", private_key_path, "true")
+            result = smart_ssh(
+                ip,
+                "root",
+                private_key_path,
+                "true",
+                known_hosts_file=str(known_hosts_file),
+            )
         except SmartSSHError as exc:
             permission_issue = _diagnose_attempts(exc.attempts)
             if permission_issue:
@@ -266,14 +279,9 @@ def post_boot_verify_ssh(
                 commands = _manual_console_instructions(pubkey_line)
                 print("\n请打开 Vultr 控制台（View Console）粘贴以下 3 行命令：\n")
                 print(commands)
-                print("\n完成后按回车继续重试。输入 R 仅重试、输入 B 执行 Reinstall SSH Keys、输入 Q 终止流程。")
-                choice = input("选择 [Enter=继续] / R=重试 / B=Reinstall / Q=退出: ").strip().lower()
+                choice = input("执行完毕后按回车继续，或输入 Q 退出: ").strip().lower()
                 if choice == "q":
                     raise RuntimeError("用户取消：SSH 验证失败。")
-                if choice == "b":
-                    _confirm_reinstall(api_key, instance_id, sshkey_ids, user_data_b64)
-                    continue
-                # Enter 或 R 均直接重试
                 continue
             raise
         else:
@@ -286,49 +294,27 @@ def post_boot_verify_ssh(
                 commands = _manual_console_instructions(pubkey_line)
                 print("\n请在控制台执行以下命令后回车重试：\n")
                 print(commands)
-                cont = input("执行完毕后按回车继续，或输入 B 触发 Reinstall: ").strip().lower()
-                if cont == "b":
-                    _confirm_reinstall(api_key, instance_id, sshkey_ids, user_data_b64)
                 continue
             raise RuntimeError(f"SSH 返回码 {result.returncode}，输出：{output}")
 
 
-def _confirm_reinstall(
-    api_key: str,
-    instance_id: str,
-    sshkey_ids: List[str],
-    user_data_b64: str,
-) -> None:
-    print(
-        textwrap.dedent(
-            """
-            ⚠️ 将执行 Reinstall SSH Keys，这会 WIPE ALL DATA。
-            如果实例中已有重要数据，请立即取消并手动处理！
-            """
-        ).strip()
-    )
-    confirm = input("请输入 REINSTALL 继续，或直接回车取消: ").strip().lower()
-    if confirm != "reinstall":
-        print("已取消重装。")
-        return
-
-    print("→ 调用 Reinstall SSH Keys ...")
-    reinstall_with_ssh_keys(api_key, instance_id, sshkey_ids=sshkey_ids, user_data=user_data_b64)
-    print("等待实例重新 Running ...")
-    time.sleep(5)
-    wait_instance_active(api_key, instance_id, timeout=900, interval=10)
-    print("✅ 重装完成，继续尝试 SSH ...")
-
-
 def deploy_wireguard(ip: str, private_key_path: Path) -> None:
     print("\n=== 3/3 部署 WireGuard ===")
+    known_hosts_file = _reset_host_key(ip)
+    print(f"→ 已刷新 {known_hosts_file} 中的 host key 缓存。")
     print("→ 等待 SSH 端口 22 就绪 ...")
     if not wait_port_open(ip, 22, timeout=120):
         raise RuntimeError("SSH 端口未就绪（实例可能还在初始化或防火墙未放行 22）。")
 
     print("→ 校验远端连通性 ...")
     try:
-        check_result = smart_ssh(ip, "root", private_key_path, "uname -a")
+        check_result = smart_ssh(
+            ip,
+            "root",
+            private_key_path,
+            "uname -a",
+            known_hosts_file=str(known_hosts_file),
+        )
     except SmartSSHError as exc:
         joined_attempts = []
         for att in exc.attempts:
@@ -390,7 +376,12 @@ echo "=== wg0 status ==="
 wg show || true
 """
 
-    rc = smart_push_script(ip, str(private_key_path), wg_install_script)
+    rc = smart_push_script(
+        ip,
+        str(private_key_path),
+        wg_install_script,
+        known_hosts_file=str(known_hosts_file),
+    )
     if rc != 0:
         raise RuntimeError(f"远端执行部署脚本失败，退出码：{rc}")
 
@@ -434,16 +425,28 @@ EOF
 
 echo "=== QR below ==="
 qrencode -t ANSIUTF8 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || true
+qrencode -o /root/iphone.png -s 8 -m 2 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || true
 """
 
-    rc2 = smart_push_script(ip, str(private_key_path), add_peer_script)
+    rc2 = smart_push_script(
+        ip,
+        str(private_key_path),
+        add_peer_script,
+        known_hosts_file=str(known_hosts_file),
+    )
     if rc2 != 0:
         raise RuntimeError(f"添加客户端/生成二维码失败，退出码：{rc2}")
 
     print("→ 尝试读取服务端公钥 ...")
     server_pub = ""
     try:
-        pub_result = smart_ssh(ip, "root", private_key_path, "cat /etc/wireguard/server.public")
+        pub_result = smart_ssh(
+            ip,
+            "root",
+            private_key_path,
+            "cat /etc/wireguard/server.public",
+            known_hosts_file=str(known_hosts_file),
+        )
     except SmartSSHError as exc:  # pragma: no cover - network dependent
         print(f"⚠️ 读取服务端公钥失败：{exc}")
     else:
@@ -456,52 +459,54 @@ qrencode -t ANSIUTF8 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || true
     if server_pub:
         _record_server_info(ip, {"server_pub": server_pub, "port": 51820})
 
-    try:
-        artifacts_dir = Path("artifacts")
-        artifacts_dir.mkdir(exist_ok=True)
-        subprocess.run(
-            [
-                "scp",
-                "-i",
-                str(private_key_path),
-                f"root@{ip}:/etc/wireguard/clients/iphone/iphone.conf",
-                str(artifacts_dir / "iphone.conf"),
-            ],
-            check=False,
-        )
-        print("ℹ️ 已尝试下载到 artifacts/iphone.conf")
-    except FileNotFoundError:
-        print("⚠️ 未找到 scp，可手动复制 /etc/wireguard/clients/iphone/iphone.conf")
+    artifacts_dir = _artifacts_dir()
+    conf_local = artifacts_dir / "iphone.conf"
+    png_local = artifacts_dir / "iphone.png"
 
-    print("✅ WireGuard 部署完成，并已生成 iPhone 客户端二维码（见上方输出）。")
+    conf_ok = _scp_download(
+        ip,
+        private_key_path,
+        "/etc/wireguard/clients/iphone/iphone.conf",
+        conf_local,
+        known_hosts_file,
+    )
+    if not conf_ok or not conf_local.exists():
+        raise RuntimeError("下载客户端配置失败，请手动检查 /etc/wireguard/clients/iphone/iphone.conf。")
+
+    png_ok = _scp_download(ip, private_key_path, "/root/iphone.png", png_local, known_hosts_file)
+    if not png_ok:
+        print("⚠️ 远端二维码 PNG 下载失败，尝试本地生成 ...")
+        _ensure_local_qrcode(conf_local, png_local)
+
+    if not png_local.exists():
+        _ensure_local_qrcode(conf_local, png_local)
+
+    print("✅ WireGuard 部署完成，并已生成 iPhone 客户端二维码（终端输出 & artifacts/iphone.png）。")
 
 
 def main() -> None:
     api_key = os.environ.get("VULTR_API_KEY", "").strip()
     if not api_key:
-        api_key = _prompt("请输入 VULTR_API_KEY", "").strip()
-    if not api_key:
-        print("❌ 未提供 VULTR_API_KEY，流程终止。")
+        print("❌ 未设置环境变量 VULTR_API_KEY，流程终止。")
         sys.exit(1)
 
     try:
         instance = create_vps_flow(api_key)
-    except VultrError as exc:
+    except VultrAPIError as exc:
         print(f"❌ 创建实例失败：{exc}")
         sys.exit(1)
 
     private_key_path = _prompt_private_key()
     print(f"✓ 使用私钥：{private_key_path}")
 
+    known_hosts_file = _reset_host_key(instance["ip"])
+
     try:
         post_boot_verify_ssh(
-            api_key,
-            instance["id"],
             instance["ip"],
             private_key_path,
             instance["pubkey_line"],
-            instance["sshkey_ids"],
-            instance["user_data_base64"],
+            known_hosts_file,
         )
     except Exception as exc:  # noqa: BLE001 - interactive flow
         print(f"❌ SSH 验证失败：{exc}")
