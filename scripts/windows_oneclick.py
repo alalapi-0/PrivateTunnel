@@ -13,7 +13,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
-from core.ssh_utils import SmartSSHError, SSHAttempt, smart_ssh
+from core.ssh_utils import (
+    SSHAttempt,
+    SmartSSHError,
+    ask_key_path,
+    pick_default_key,
+    smart_ssh,
+    wait_port_open,
+)
 from core.tools.vultr_manager import (
     VultrError,
     create_instance,
@@ -63,32 +70,15 @@ def _default_pubkey_path() -> Path:
     return Path.home() / ".ssh" / "id_ed25519.pub"
 
 
-def _default_private_key_candidates() -> List[Path]:
-    home = Path.home()
-    candidates = [home / ".ssh" / "id_ed25519", home / ".ssh" / "id_rsa"]
-    custom = os.environ.get("PRIVATE_KEY_PATH")
-    if custom:
-        custom_path = Path(custom).expanduser()
-        if custom_path not in candidates:
-            candidates.insert(0, custom_path)
-    return candidates
-
-
 def _prompt_private_key() -> Path:
-    candidates = _default_private_key_candidates()
-    default = next((p for p in candidates if p.is_file()), candidates[0])
+    env_override = os.environ.get("PRIVATE_KEY_PATH")
+    if env_override:
+        default = str(Path(env_override).expanduser())
+    else:
+        default = pick_default_key()
 
-    while True:
-        prompt_default = str(default) if default else None
-        raw = _prompt("私钥路径", prompt_default)
-        path = Path(raw).expanduser()
-        if path.is_dir():
-            print("❌ 输入的是目录，请指定私钥文件路径。")
-            continue
-        if not path.exists():
-            print(f"❌ 找不到私钥文件：{path}")
-            continue
-        return path
+    selected = ask_key_path(default)
+    return Path(selected).expanduser()
 
 
 def _build_user_data(pubkey_line: str) -> tuple[str, str]:
@@ -333,7 +323,32 @@ def _confirm_reinstall(
 
 def deploy_wireguard(ip: str, private_key_path: Path) -> None:
     print("\n=== 3/3 部署 WireGuard ===")
+    print("→ 等待 SSH 端口 22 就绪 ...")
+    if not wait_port_open(ip, 22, timeout=120):
+        raise RuntimeError("SSH 端口未就绪（实例可能还在初始化或防火墙未放行 22）。")
+
+    print("→ 校验远端连通性 ...")
     try:
+        check_result = smart_ssh(ip, "root", private_key_path, "uname -a")
+    except SmartSSHError as exc:
+        joined_attempts = []
+        for att in exc.attempts:
+            detail = " ".join(filter(None, [att.error, att.stderr, att.stdout])).strip()
+            joined_attempts.append(f"{att.backend}: {detail}")
+        hint = "\n".join(filter(None, joined_attempts))
+        message = "无法通过 SSH 测试远端连通性。请确认私钥有效且放行了 22 端口。"
+        if hint:
+            message = f"{message}\n排查信息：\n{hint}"
+        raise RuntimeError(message) from exc
+    if check_result.returncode != 0:
+        output = (check_result.stderr or check_result.stdout or "").strip()
+        raise RuntimeError(
+            f"远端命令执行失败，退出码：{check_result.returncode}。输出：{output}"
+        )
+    print("✅ 远端连通性正常，开始执行 WireGuard 安装脚本 ...")
+
+    try:
+        # 继续在此处扩展 WireGuard 远端执行逻辑，例如部署脚本或配置同步。
         result = provision(ip, username="root", pkey_path=str(private_key_path))
     except WireGuardProvisionError as exc:
         raise RuntimeError(f"部署 WireGuard 失败：{exc}") from exc
@@ -356,6 +371,7 @@ def main() -> None:
         sys.exit(1)
 
     private_key_path = _prompt_private_key()
+    print(f"✓ 使用私钥：{private_key_path}")
 
     try:
         post_boot_verify_ssh(
