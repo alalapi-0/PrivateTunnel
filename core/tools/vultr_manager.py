@@ -4,7 +4,7 @@ import json
 import os
 import socket
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -55,12 +55,55 @@ def _session(api_key: str, force_ipv4: bool = False) -> requests.Session:
     return s
 
 
+def list_ssh_keys(api_key: str) -> list[Dict[str, Any]]:
+    """Return all SSH keys associated with the account."""
+
+    session = _session(api_key)
+    keys: list[Dict[str, Any]] = []
+    cursor: str | None = None
+
+    while True:
+        params = {"per_page": 100}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            response = session.get(f"{API}/ssh-keys", params=params, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as exc:  # pragma: no cover - network
+            message = getattr(exc.response, "text", str(exc))
+            raise VultrError(f"List SSH keys failed: {message}") from exc
+
+        payload = response.json()
+        keys.extend(payload.get("ssh_keys", []))
+        cursor = payload.get("meta", {}).get("links", {}).get("next")
+        if not cursor:
+            break
+    return keys
+
+
+def create_ssh_key(api_key: str, name: str, key_text: str) -> Dict[str, Any]:
+    """Create a new SSH key in Vultr."""
+
+    session = _session(api_key)
+    body = {"name": name, "ssh_key": key_text}
+    try:
+        response = session.post(f"{API}/ssh-keys", json=body, timeout=30)
+        response.raise_for_status()
+    except requests.RequestException as exc:  # pragma: no cover - network
+        message = getattr(exc.response, "text", str(exc))
+        raise VultrError(f"Create SSH key failed: {message}") from exc
+    return response.json().get("ssh_key", {})
+
+
 def create_instance(
     api_key: str,
     region: str = "nrt",
     plan: str = "vc2-1c-1gb",
     snapshot_id: str | None = None,
     label: str = "privatetunnel-oc",
+    *,
+    sshkey_ids: Optional[list[str]] = None,
+    user_data: str | None = None,
 ) -> Dict[str, Any]:
     """Create a Vultr instance and return the raw instance payload."""
 
@@ -75,6 +118,10 @@ def create_instance(
         body["snapshot_id"] = snapshot_id
     else:
         body["os_id"] = UBUNTU_22_04_OSID
+    if sshkey_ids:
+        body["sshkey_ids"] = list(dict.fromkeys(sshkey_ids))
+    if user_data:
+        body["user_data"] = user_data
 
     session = _session(api_key)
 
@@ -147,3 +194,34 @@ def destroy_instance(api_key: str, instance_id: str) -> None:
     except requests.RequestException as exc:
         message = getattr(exc.response, "text", str(exc))
         raise VultrError(f"Destroy failed: {message}") from exc
+
+
+def reinstall_with_ssh_keys(
+    api_key: str,
+    instance_id: str,
+    sshkey_ids: Optional[list[str]] = None,
+    user_data: str | None = None,
+) -> None:
+    """Trigger ``Reinstall SSH Keys`` for an instance.
+
+    The operation wipes the instance disk.  ``sshkey_ids`` must contain at least
+    one SSH key id to inject during reinstall.
+    """
+
+    body: Dict[str, Any] = {}
+    if sshkey_ids:
+        body["sshkey_ids"] = list(dict.fromkeys(sshkey_ids))
+    if user_data:
+        body["user_data"] = user_data
+
+    session = _session(api_key)
+    try:
+        response = session.post(
+            f"{API}/instances/{instance_id}/reinstall",
+            json=body,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:  # pragma: no cover - network
+        message = getattr(exc.response, "text", str(exc))
+        raise VultrError(f"Reinstall failed: {message}") from exc

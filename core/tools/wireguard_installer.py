@@ -10,6 +10,8 @@ from typing import Optional
 
 import paramiko
 
+from core.ssh_utils import SSHKeyLoadError, load_private_key
+
 
 @dataclass
 class _CommandResult:
@@ -23,25 +25,10 @@ class WireGuardProvisionError(RuntimeError):
 
 
 def _load_private_key(path: str) -> paramiko.PKey:
-    errors: list[str] = []
-    for key_cls in (
-        paramiko.RSAKey,
-        paramiko.ECDSAKey,
-        paramiko.Ed25519Key,
-        paramiko.DSSKey,
-    ):
-        try:
-            return key_cls.from_private_key_file(path)
-        except FileNotFoundError as exc:  # pragma: no cover - file missing
-            raise WireGuardProvisionError(f"私钥文件不存在: {path}") from exc
-        except paramiko.PasswordRequiredException as exc:
-            raise WireGuardProvisionError(
-                "私钥受口令保护，请先解锁或改用密码登录。"
-            ) from exc
-        except paramiko.SSHException as exc:
-            errors.append(str(exc))
-    joined = "; ".join(errors) or "未知错误"
-    raise WireGuardProvisionError(f"无法解析私钥文件 {path}: {joined}")
+    try:
+        return load_private_key(path)
+    except SSHKeyLoadError as exc:
+        raise WireGuardProvisionError(str(exc)) from exc
 
 
 def _run(client: paramiko.SSHClient, command: str) -> _CommandResult:
