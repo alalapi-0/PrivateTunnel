@@ -19,6 +19,15 @@
 - 运行完成后下载二维码 PNG，手机 WireGuard 扫码即连  
 详见：`docs/ONE_CLICK.md`
 
+## 📸 快照使用注意事项
+
+- **不要** 在制作快照前把私钥、`authorized_keys` 等敏感文件打包进镜像，避免泄露或后续冲突；
+- 首次从快照启动后请重新生成 SSH host keys（可启用仓库内的 firstboot/初始化脚本）；
+- 使用 `scripts/windows_oneclick.py` 创建实例时，务必选择或创建 Vultr SSH Key，脚本会在云端注入 `/root/.ssh/authorized_keys` 并在启动后再做免密校验；
+- 如遇 `Permission denied (publickey)`，脚本会提示 **控制台执行 3 行命令**，按指引粘贴后即可重新验证；
+- 若仍失败，可选择 **Reinstall SSH Keys**（会擦除磁盘数据），脚本会进行二次确认并等待实例重装完成；
+- 所有创建信息会写入 `artifacts/instance.json`（含 `sshkey_ids`、`user_data_used` 等字段），方便排查和追踪。
+
 [![CI](https://img.shields.io/github/actions/workflow/status/your-org/PrivateTunnel/ci.yml?branch=main&label=CI)](./.github/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-iOS%2016%2B-blue)
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
