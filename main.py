@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from getpass import getpass
 from pathlib import Path
 
 
@@ -72,12 +73,100 @@ def run_prune() -> None:
         print("\n⚠️ 精简脚本返回异常，请查看输出。")
 
 
+def deploy_wireguard() -> None:
+    from core.tools.wireguard_installer import (  # pylint: disable=import-outside-toplevel
+        WireGuardProvisionError,
+        provision,
+    )
+
+    inst_path = Path("artifacts/instance.json")
+    if not inst_path.exists():
+        print("❌ 未找到 artifacts/instance.json，请先创建 VPS。")
+        return
+
+    try:
+        instance = json.loads(inst_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"❌ 解析实例信息失败：{exc}")
+        return
+
+    ip = instance.get("ip")
+    if not ip:
+        print("❌ 实例信息缺少 IP 字段，请重新创建或检查 artifacts/instance.json。")
+        return
+
+    print(f"发现实例 {ip}")
+    method = input("选择认证方式: [Enter=私钥] / p=密码: ").strip().lower()
+
+    artifacts_dir = Path("artifacts")
+    artifacts_dir.mkdir(exist_ok=True)
+
+    provision_result: dict | None = None
+    fallback_to_password = False
+
+    if method != "p":
+        default_key = Path.home() / ".ssh" / "id_rsa"
+        key_input = input(f"私钥路径 [{default_key}]: ").strip()
+        key_path = Path(key_input or str(default_key)).expanduser()
+        if not key_path.exists():
+            print(f"⚠️ 私钥文件不存在：{key_path}")
+            fallback_to_password = True
+        else:
+            try:
+                provision_result = provision(ip, username="root", pkey_path=str(key_path))
+            except WireGuardProvisionError as exc:
+                print(f"❌ 使用私钥部署失败：{exc}")
+                fallback_to_password = True
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"❌ 未预期错误：{exc}")
+                return
+
+    if provision_result is None and (method == "p" or fallback_to_password):
+        password = getpass("root 密码: ")
+        if not password:
+            print("❌ 未输入密码，已取消部署。")
+            return
+        try:
+            provision_result = provision(
+                ip,
+                username="root",
+                password=password,
+            )
+        except WireGuardProvisionError as exc:
+            print(f"❌ 使用密码部署失败：{exc}")
+            print("排查建议：\n- 检查密码是否正确\n- 确认实例防火墙放行 22 端口\n- 尝试使用私钥重新部署")
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"❌ 未预期错误：{exc}")
+            return
+
+    if provision_result is None:
+        print("❌ 部署已取消。")
+        return
+
+    server_path = artifacts_dir / "server.json"
+    result_payload = {
+        "server_pub": provision_result.get("server_pub", ""),
+        "port": provision_result.get("port", 51820),
+        "ip": ip,
+    }
+    server_path.write_text(
+        json.dumps(result_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print("✅ WireGuard 已启动，端口 51820")
+    print(f"server_pub: {result_payload['server_pub']}")
+    print(f"已写入 {server_path}")
+
+
 def main() -> None:
     while True:
         print("\n=== PrivateTunnel (Windows Only) ===")
         print("1) 运行体检")
         print("2) 创建 VPS（Vultr）")
-        print("3) 执行项目精简（移除/归档非 Windows 代码与 CI）")
+        print("3) 部署 WireGuard（到已创建 VPS）")
+        print("4) 执行项目精简（移除/归档非 Windows 代码与 CI）")
         print("q) 退出")
         choice = input("请选择: ").strip().lower()
         if choice == "1":
@@ -85,6 +174,8 @@ def main() -> None:
         elif choice == "2":
             create_vps()
         elif choice == "3":
+            deploy_wireguard()
+        elif choice == "4":
             run_prune()
         elif choice == "q":
             break
