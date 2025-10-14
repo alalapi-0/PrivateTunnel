@@ -36,6 +36,8 @@
 
 PrivateTunnel 是一个面向个人/小团队自建的私有 VPN/隧道解决方案，聚焦“自用稳定”。仓库覆盖 WireGuard 服务器脚本、iOS 容器 App + Packet Tunnel 扩展、分流与健康检查工具，以及 CI/打包流程。项目不会在中国区 App Store 发布，也不提供公共节点，请确保合法合规使用。
 
+> ⚠️ **Python 版本要求**：本仓库的脚本全部基于 Python 3.8+。若在 VS Code 中看到 “Python 版本 2.7 不支持 f 字符串” 之类的提示，通常说明编辑器选中的解释器仍是 2.x。请通过 `Ctrl+Shift+P → Python: Select Interpreter` 选择本机的 `python3`，或直接使用 `python3 main.py`、`python3 core/...` 的方式运行脚本。
+
 ## 架构速览
 
 ```
