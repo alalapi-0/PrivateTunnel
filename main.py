@@ -282,19 +282,28 @@ def create_vps() -> None:
 
     default_key_desc = ssh_keys[default_index - 1].get("name", "")
     selection = input(
-        f"请选择 SSH 公钥编号 [默认 {default_index}:{default_key_desc}]: "
+        f"请选择 SSH 公钥（可输入编号、名称或 ID）[默认 {default_index}:{default_key_desc}]: "
     ).strip()
+    chosen_idx: int | None = None
     if not selection:
         chosen_idx = default_index
     else:
         try:
             chosen_idx = int(selection)
         except ValueError:
-            log_error("❌ 输入的编号无效。")
-            return
-        if not 1 <= chosen_idx <= len(ssh_keys):
-            log_error("❌ 输入的编号超出范围。")
-            return
+            normalized = selection.casefold()
+            for idx, item in enumerate(ssh_keys, start=1):
+                name = (item.get("name", "") or "").casefold()
+                key_id = (item.get("id", "") or "").casefold()
+                if normalized in {name, key_id}:
+                    chosen_idx = idx
+                    break
+            if chosen_idx is None:
+                log_error("❌ 找不到匹配的 SSH 公钥，请检查输入的编号、名称或 ID。")
+                return
+    if not 1 <= chosen_idx <= len(ssh_keys):
+        log_error("❌ 输入的编号超出范围。")
+        return
 
     ssh_key = ssh_keys[chosen_idx - 1]
     ssh_key_id = ssh_key.get("id", "")
