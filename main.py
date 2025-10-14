@@ -59,6 +59,60 @@ def log_section(title: str) -> None:
     log_info(title)
 
 
+def _stream_command_output(
+    stdout: paramiko.ChannelFile, stderr: paramiko.ChannelFile, show_output: bool
+) -> tuple[int, str, str]:
+    """Stream ``stdout``/``stderr`` until completion and return the exit code.
+
+    Parameters
+    ----------
+    stdout, stderr:
+        Paramiko file-like objects representing the remote command output streams.
+    show_output:
+        Whether to echo remote output to the local console in real-time.
+    """
+
+    channel = stdout.channel
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    printed_any = False
+    last_printed = ""
+
+    while True:
+        if channel.recv_ready():
+            data = channel.recv(4096)
+            if data:
+                text = data.decode("utf-8", errors="ignore")
+                stdout_chunks.append(text)
+                if show_output:
+                    print(text, end="", flush=True)
+                    printed_any = True
+                    last_printed = text
+
+        if channel.recv_stderr_ready():
+            data = channel.recv_stderr(4096)
+            if data:
+                text = data.decode("utf-8", errors="ignore")
+                stderr_chunks.append(text)
+                if show_output:
+                    print(text, end="", flush=True)
+                    printed_any = True
+                    last_printed = text
+
+        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+            break
+
+        time.sleep(0.1)
+
+    exit_code = channel.recv_exit_status()
+    if show_output and printed_any and not last_printed.endswith("\n"):
+        print()
+
+    stdout_data = "".join(stdout_chunks).strip()
+    stderr_data = "".join(stderr_chunks).strip()
+    return exit_code, stdout_data, stderr_data
+
+
 def _run_remote_script(
     client: paramiko.SSHClient,
     script: str,
@@ -73,9 +127,7 @@ def _run_remote_script(
         stdin, stdout, stderr = client.exec_command("bash -s", get_pty=True, timeout=timeout)
         stdin.write(script)
         stdin.channel.shutdown_write()
-        exit_code = stdout.channel.recv_exit_status()
-        stdout_data = stdout.read().decode("utf-8", errors="ignore").strip()
-        stderr_data = stderr.read().decode("utf-8", errors="ignore").strip()
+        exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001 - we want to surface any Paramiko errors
         log_error(f"❌ {description}失败：{exc}")
         return False
@@ -84,24 +136,23 @@ def _run_remote_script(
         details = stderr_data or stdout_data or f"退出码 {exit_code}"
         log_error(f"❌ {description}失败：{details}")
         return False
-    if show_output and stdout_data:
-        print(stdout_data)
-    if show_output and stderr_data:
-        print(stderr_data)
     return True
 
 
 def _run_remote_command(
-    client: paramiko.SSHClient, command: str, description: str, timeout: int = 600
+    client: paramiko.SSHClient,
+    command: str,
+    description: str,
+    timeout: int = 600,
+    *,
+    show_output: bool = True,
 ) -> bool:
     """Run a single command via Paramiko with unified error handling."""
 
     try:
         stdin, stdout, stderr = client.exec_command(command, get_pty=True, timeout=timeout)
         stdin.channel.shutdown_write()
-        exit_code = stdout.channel.recv_exit_status()
-        stdout_data = stdout.read().decode("utf-8", errors="ignore").strip()
-        stderr_data = stderr.read().decode("utf-8", errors="ignore").strip()
+        exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001
         log_error(f"❌ {description}失败：{exc}")
         return False
