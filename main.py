@@ -79,30 +79,40 @@ def _stream_command_output(
     last_printed = ""
 
     while True:
+        stdout_drained = True
+        stderr_drained = True
+
         if channel.recv_ready():
             data = channel.recv(4096)
             if data:
+                stdout_drained = False
                 text = data.decode("utf-8", errors="ignore")
                 stdout_chunks.append(text)
                 if show_output:
                     print(text, end="", flush=True)
                     printed_any = True
                     last_printed = text
+            else:
+                stdout_drained = True
 
         if channel.recv_stderr_ready():
             data = channel.recv_stderr(4096)
             if data:
+                stderr_drained = False
                 text = data.decode("utf-8", errors="ignore")
                 stderr_chunks.append(text)
                 if show_output:
                     print(text, end="", flush=True)
                     printed_any = True
                     last_printed = text
+            else:
+                stderr_drained = True
 
-        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+        if channel.exit_status_ready() and stdout_drained and stderr_drained:
             break
 
-        time.sleep(0.1)
+        if stdout_drained and stderr_drained:
+            time.sleep(0.1)
 
     exit_code = channel.recv_exit_status()
     if show_output and printed_any and not last_printed.endswith("\n"):
@@ -124,9 +134,13 @@ def _run_remote_script(
     """Execute ``script`` on ``client`` using ``bash`` and report errors."""
 
     try:
-        stdin, stdout, stderr = client.exec_command("bash -s", get_pty=True, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command("bash -s", get_pty=False, timeout=timeout)
+        if not script.endswith("\n"):
+            script += "\n"
         stdin.write(script)
+        stdin.flush()
         stdin.channel.shutdown_write()
+        stdin.close()
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001 - we want to surface any Paramiko errors
         log_error(f"❌ {description}失败：{exc}")
@@ -150,7 +164,7 @@ def _run_remote_command(
     """Run a single command via Paramiko with unified error handling."""
 
     try:
-        stdin, stdout, stderr = client.exec_command(command, get_pty=True, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command(command, get_pty=False, timeout=timeout)
         stdin.channel.shutdown_write()
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001
@@ -272,19 +286,28 @@ def create_vps() -> None:
 
     default_key_desc = ssh_keys[default_index - 1].get("name", "")
     selection = input(
-        f"请选择 SSH 公钥编号 [默认 {default_index}:{default_key_desc}]: "
+        f"请选择 SSH 公钥（可输入编号、名称或 ID）[默认 {default_index}:{default_key_desc}]: "
     ).strip()
+    chosen_idx: int | None = None
     if not selection:
         chosen_idx = default_index
     else:
         try:
             chosen_idx = int(selection)
         except ValueError:
-            log_error("❌ 输入的编号无效。")
-            return
-        if not 1 <= chosen_idx <= len(ssh_keys):
-            log_error("❌ 输入的编号超出范围。")
-            return
+            normalized = selection.casefold()
+            for idx, item in enumerate(ssh_keys, start=1):
+                name = (item.get("name", "") or "").casefold()
+                key_id = (item.get("id", "") or "").casefold()
+                if normalized in {name, key_id}:
+                    chosen_idx = idx
+                    break
+            if chosen_idx is None:
+                log_error("❌ 找不到匹配的 SSH 公钥，请检查输入的编号、名称或 ID。")
+                return
+    if not 1 <= chosen_idx <= len(ssh_keys):
+        log_error("❌ 输入的编号超出范围。")
+        return
 
     ssh_key = ssh_keys[chosen_idx - 1]
     ssh_key_id = ssh_key.get("id", "")
