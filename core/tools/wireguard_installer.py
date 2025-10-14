@@ -10,6 +10,7 @@ from typing import Optional
 
 import paramiko
 
+from core.port_config import get_default_wg_port
 from core.ssh_utils import SSHKeyLoadError, load_private_key
 
 
@@ -68,6 +69,11 @@ def provision(
         pkey = _load_private_key(pkey_path)
 
     try:
+        listen_port = get_default_wg_port()
+    except ValueError as exc:
+        raise WireGuardProvisionError(f"无效的 WireGuard 端口配置：{exc}") from exc
+
+    try:
         client.connect(
             ip,
             port=port,
@@ -91,7 +97,7 @@ def provision(
 
     try:
         setup_script = textwrap.dedent(
-            """
+            f"""
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
             apt update -y
@@ -103,12 +109,12 @@ def provision(
             cat >/etc/wireguard/wg0.conf <<EOF
             [Interface]
             Address = 10.6.0.1/24
-            ListenPort = 51820
+            ListenPort = {listen_port}
             PrivateKey = ${SERVER_PRIV}
             SaveConfig = true
             EOF
             sysctl -w net.ipv4.ip_forward=1
-            WAN_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
+            WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
             iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
             netfilter-persistent save || true
             systemctl enable wg-quick@wg0
@@ -133,8 +139,8 @@ def provision(
 
         _run_checked(
             client,
-            "ss -lun | grep -m1 ':51820'",
-            "验证 UDP 端口 51820 是否监听",
+            f"ss -lun | grep -m1 ':{listen_port}'",
+            f"验证 UDP 端口 {listen_port} 是否监听",
         )
 
         server_pub = _run_checked(
@@ -143,7 +149,7 @@ def provision(
             "读取服务端公钥",
         ).strip()
 
-        return {"server_pub": server_pub, "port": 51820}
+        return {"server_pub": server_pub, "port": listen_port}
     except WireGuardProvisionError as exc:
         hints = (
             "排查建议：\n"
