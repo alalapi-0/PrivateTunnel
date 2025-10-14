@@ -54,6 +54,18 @@ class SSHResult:
     stderr: str
 
 
+@dataclass
+class SSHProbeResult:
+    """Outcome for :func:`probe_publickey_auth`."""
+
+    success: bool
+    attempts: int
+    stdout: str = ""
+    stderr: str = ""
+    returncode: Optional[int] = None
+    error: str = ""
+
+
 def _default_home() -> Path:
     expanded = os.path.expandvars(r"%USERPROFILE%")
     return Path(expanded) if expanded and "%" not in expanded else Path.home()
@@ -110,6 +122,73 @@ def wait_port_open(host: str, port: int = 22, timeout: int = 120, interval: int 
         except OSError:
             time.sleep(interval)
     return False
+
+
+def probe_publickey_auth(
+    host: str,
+    key_path: str | os.PathLike[str],
+    *,
+    retries: int = 12,
+    interval: int = 10,
+    timeout: int = 15,
+    command: Iterable[str] | None = None,
+    expect_stdout: str = "ok",
+    known_hosts_file: str | os.PathLike[str] | None = None,
+) -> SSHProbeResult:
+    """Probe SSH public-key authentication until ``command`` succeeds.
+
+    The helper mirrors ``ssh -o BatchMode=yes`` semantics so that password
+    prompts are treated as failures.  ``command`` defaults to ``echo ok`` and
+    the probe is considered successful when the command exits with code 0 and
+    stdout matches ``expect_stdout``.
+    """
+
+    key_file = Path(key_path).expanduser()
+    ssh_cmd: list[str] = [
+        _default_ssh_executable(),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-i",
+        str(key_file),
+    ]
+    if known_hosts_file:
+        ssh_cmd += ["-o", f"UserKnownHostsFile={Path(known_hosts_file)}"]
+    ssh_cmd.append(f"root@{host}")
+    ssh_cmd.extend(list(command) if command is not None else ["echo", "ok"])
+
+    last_stdout = ""
+    last_stderr = ""
+    last_error = ""
+    last_rc: Optional[int] = None
+
+    for attempt in range(1, max(retries, 1) + 1):
+        try:
+            proc = subprocess.run(
+                ssh_cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.SubprocessError as exc:
+            last_error = str(exc)
+            last_stdout = ""
+            last_stderr = ""
+            last_rc = None
+        else:
+            last_stdout = (proc.stdout or "").strip()
+            last_stderr = (proc.stderr or "").strip()
+            last_rc = int(proc.returncode)
+            if last_rc == 0 and (not expect_stdout or last_stdout == expect_stdout):
+                return SSHProbeResult(True, attempt, last_stdout, last_stderr, last_rc)
+            last_error = last_stderr or last_stdout or f"rc={last_rc}"
+
+        if attempt < max(retries, 1):
+            time.sleep(interval)
+
+    return SSHProbeResult(False, max(retries, 1), last_stdout, last_stderr, last_rc, last_error)
 
 
 def _candidate_keys() -> Iterable[type[paramiko.PKey]]:

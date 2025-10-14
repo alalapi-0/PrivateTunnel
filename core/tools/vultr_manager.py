@@ -55,6 +55,21 @@ def _session(api_key: str, force_ipv4: bool = False) -> requests.Session:
     return s
 
 
+def _friendly_error_message(exc: requests.RequestException) -> str:
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status = response.status_code
+        text = (getattr(response, "text", "") or "").strip() or getattr(response, "reason", "")
+        if status == 401:
+            hint = "请检查 Vultr API Access Control 是否放行当前公网 IPv4/IPv6。"
+            base = f"HTTP 401 {text}" if text else "HTTP 401"
+            return f"{base}。{hint}"
+        if text:
+            return f"HTTP {status} {text}"
+        return f"HTTP {status}"
+    return str(exc)
+
+
 def list_ssh_keys(api_key: str) -> list[Dict[str, Any]]:
     """Return all SSH keys associated with the account."""
 
@@ -70,7 +85,7 @@ def list_ssh_keys(api_key: str) -> list[Dict[str, Any]]:
             response = session.get(f"{API}/ssh-keys", params=params, timeout=30)
             response.raise_for_status()
         except requests.RequestException as exc:  # pragma: no cover - network
-            message = getattr(exc.response, "text", str(exc))
+            message = _friendly_error_message(exc)
             raise VultrError(f"List SSH keys failed: {message}") from exc
 
         payload = response.json()
@@ -90,7 +105,7 @@ def create_ssh_key(api_key: str, name: str, key_text: str) -> Dict[str, Any]:
         response = session.post(f"{API}/ssh-keys", json=body, timeout=30)
         response.raise_for_status()
     except requests.RequestException as exc:  # pragma: no cover - network
-        message = getattr(exc.response, "text", str(exc))
+        message = _friendly_error_message(exc)
         raise VultrError(f"Create SSH key failed: {message}") from exc
     return response.json().get("ssh_key", {})
 
@@ -133,7 +148,7 @@ def create_instance(
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        message = getattr(exc.response, "text", str(exc))
+        message = _friendly_error_message(exc)
         raise VultrError(f"Create instance failed: {message}") from exc
 
     data = response.json()
@@ -164,7 +179,7 @@ def wait_instance_active(
             )
             response.raise_for_status()
         except requests.RequestException as exc:
-            last_state = {"error": getattr(exc.response, "text", str(exc))}
+            last_state = {"error": _friendly_error_message(exc)}
             time.sleep(interval)
             continue
 
@@ -192,7 +207,7 @@ def destroy_instance(api_key: str, instance_id: str) -> None:
         if response.status_code not in (200, 204):
             response.raise_for_status()
     except requests.RequestException as exc:
-        message = getattr(exc.response, "text", str(exc))
+        message = _friendly_error_message(exc)
         raise VultrError(f"Destroy failed: {message}") from exc
 
 
@@ -223,5 +238,5 @@ def reinstall_with_ssh_keys(
         )
         response.raise_for_status()
     except requests.RequestException as exc:  # pragma: no cover - network
-        message = getattr(exc.response, "text", str(exc))
+        message = _friendly_error_message(exc)
         raise VultrError(f"Reinstall failed: {message}") from exc

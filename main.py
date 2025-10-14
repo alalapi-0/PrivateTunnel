@@ -149,30 +149,46 @@ def create_vps() -> None:
         log_error("❌ 未检测到环境变量 VULTR_API_KEY。请先设置后重试。")
         return
 
-    default_region = os.getenv("VULTR_REGION", "nrt")
-    default_plan = os.getenv("VULTR_PLAN", "vc2-4c-8gb")
-    env_snapshot_id = os.getenv("VULTR_SNAPSHOT_ID", "")
-    env_sshkey_name = os.getenv("VULTR_SSHKEY_NAME", "")
+    env_region = os.getenv("VULTR_REGION", "").strip()
+    env_plan = os.getenv("VULTR_PLAN", "").strip()
+    env_snapshot_id = os.getenv("VULTR_SNAPSHOT_ID", "").strip()
+    env_sshkey_name = os.getenv("VULTR_SSHKEY_NAME", "").strip()
 
-    region = input(f"region [{default_region}]: ").strip() or default_region
-    plan = input(f"plan [{default_plan}]: ").strip() or default_plan
+    default_region = env_region or "nrt"
+    default_plan = env_plan or "vc2-4c-8gb"
 
-    default_mode = "1" if env_snapshot_id else "2"
-    mode = input(
-        "实例来源 [1=使用快照, 2=全新 Ubuntu 22.04] " f"[{default_mode}]: "
-    ).strip() or default_mode
-    use_snapshot = mode != "2"
+    if env_region:
+        region = env_region
+        log_info(f"→ 使用环境变量 VULTR_REGION={region}")
+    else:
+        region = input(f"region [{default_region}]: ").strip() or default_region
+
+    if env_plan:
+        plan = env_plan
+        log_info(f"→ 使用环境变量 VULTR_PLAN={plan}")
+    else:
+        plan = input(f"plan [{default_plan}]: ").strip() or default_plan
 
     snapshot_id = ""
-    selected_keyname = env_sshkey_name
-    if use_snapshot:
-        snapshot_prompt_default = env_snapshot_id or "VULTR_SNAPSHOT_ID"
-        snapshot_input = input(f"snapshot_id [{snapshot_prompt_default}]: ").strip()
-        snapshot_id = snapshot_input or env_snapshot_id
-        if not snapshot_id:
-            log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
-            return
+    if env_snapshot_id:
+        snapshot_id = env_snapshot_id
+        use_snapshot = True
+        log_info(f"→ 使用环境变量 VULTR_SNAPSHOT_ID={snapshot_id}")
+    else:
+        default_mode = "2"
+        mode = input(
+            f"实例来源 [1=使用快照, 2=全新 Ubuntu 22.04] [{default_mode}]: "
+        ).strip() or default_mode
+        use_snapshot = mode != "2"
+        if use_snapshot:
+            snapshot_prompt_default = env_snapshot_id or "VULTR_SNAPSHOT_ID"
+            snapshot_input = input(f"snapshot_id [{snapshot_prompt_default}]: ").strip()
+            snapshot_id = snapshot_input or env_snapshot_id
+            if not snapshot_id:
+                log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
+                return
 
+    selected_keyname = env_sshkey_name
     sshkey_prompt_default = env_sshkey_name or "VULTR_SSHKEY_NAME"
     sshkey_input = input(f"ssh_keyname [{sshkey_prompt_default}]: ").strip()
     selected_keyname = sshkey_input or env_sshkey_name
@@ -268,6 +284,9 @@ def create_vps() -> None:
         "plan": plan,
         "source": "snapshot" if use_snapshot else "os",
         "ssh_key": ssh_key_name,
+        "ssh_key_name": ssh_key_name,
+        "ssh_key_id": ssh_key_id,
+        "ssh_key_ids": [ssh_key_id],
         "created_at": int(time.time()),
     }
     Path("artifacts/instance.json").write_text(
@@ -291,7 +310,12 @@ def run_prune() -> None:
         print("\n🧹 精简完成。请查看 PROJECT_PRUNE_REPORT.md")
     else:
         print("\n⚠️ 精简脚本返回异常，请查看输出。")
-from core.ssh_utils import ask_key_path, pick_default_key, wait_port_open
+from core.ssh_utils import (
+    ask_key_path,
+    pick_default_key,
+    probe_publickey_auth,
+    wait_port_open,
+)
 
 
 def wait_instance_ping(ip: str, timeout: int = 600, interval: int = 60) -> bool:
@@ -364,6 +388,46 @@ def deploy_wireguard() -> None:
     if not wait_port_open(ip, 22, timeout=180):
         log_error("❌ SSH 端口未就绪（实例可能还在初始化或防火墙未放行 22）。")
         return
+
+    log_info("→ 校验公钥认证是否生效…")
+    probe = probe_publickey_auth(ip, str(key_path))
+    if not probe.success:
+        details = probe.error or probe.stderr or probe.stdout
+        if details:
+            log_warning(f"⚠️ 公钥认证暂未生效：{details}")
+
+        api_key = os.environ.get("VULTR_API_KEY", "").strip()
+        ssh_key_id = str(instance.get("ssh_key_id", "")).strip()
+        if not (api_key and instance_id and ssh_key_id):
+            log_error("❌ SSH 公钥认证失败，且缺少触发 Reinstall SSH Keys 所需信息。")
+            return
+
+        log_info("→ 自动触发 Vultr Reinstall SSH Keys …")
+        from core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
+            VultrError,
+            reinstall_with_ssh_keys,
+        )
+
+        try:
+            reinstall_with_ssh_keys(api_key, instance_id, sshkey_ids=[ssh_key_id])
+        except VultrError as exc:  # pragma: no cover - network dependent
+            log_error(f"❌ 自动触发 Reinstall SSH Keys 失败：{exc}")
+            return
+
+        log_warning("⚠️ 已自动触发 Reinstall SSH Keys，请等待约 1–2 分钟后继续。")
+        time.sleep(75)
+
+        probe = probe_publickey_auth(ip, str(key_path))
+        if not probe.success:
+            details = probe.error or probe.stderr or probe.stdout
+            if details:
+                log_warning(f"⚠️ 最近一次 SSH 输出：{details}")
+            log_error("❌ 公钥认证仍失败。已自动触发 Reinstall SSH Keys，请等待约 1–2 分钟后继续。")
+            return
+
+        log_success("✅ Reinstall 后公钥认证已生效。")
+    else:
+        log_success("✅ 公钥认证已生效。")
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
