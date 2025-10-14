@@ -20,6 +20,9 @@ RED = "\033[31m"
 YELLOW = "\033[33m"
 RESET = "\033[0m"
 
+ROOT = Path(__file__).resolve().parent
+ARTIFACTS_DIR = ROOT / "artifacts"
+
 
 def _colorize(message: str, color: str) -> str:
     """Return ``message`` wrapped in ANSI color codes."""
@@ -354,8 +357,8 @@ def create_vps() -> None:
                 log_warning(f"⚠️ 清理实例失败：{cleanup_exc}")
         return
 
-    artifacts_dir = Path("artifacts")
-    artifacts_dir.mkdir(exist_ok=True)
+    artifacts_dir = ARTIFACTS_DIR
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     instance_info: dict[str, Any] = {
         "id": instance_id,
         "ip": ip,
@@ -368,11 +371,12 @@ def create_vps() -> None:
         "ssh_key_ids": [ssh_key_id],
         "created_at": int(time.time()),
     }
-    Path("artifacts/instance.json").write_text(
+    instance_file = artifacts_dir / "instance.json"
+    instance_file.write_text(
         json.dumps(instance_info, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    log_success("已写入 artifacts/instance.json")
+    log_success(f"已写入 {instance_file}")
 
 
 def run_doctor() -> None:
@@ -437,10 +441,10 @@ def wait_instance_ping(ip: str, timeout: int = 600, interval: int = 60) -> bool:
 def deploy_wireguard() -> None:
     """Deploy WireGuard onto the previously created VPS."""
 
-    inst_path = Path("artifacts/instance.json")
+    inst_path = ARTIFACTS_DIR / "instance.json"
     if not inst_path.exists():
         log_section("🛡 Step 3: Deploy WireGuard")
-        log_error("❌ 未找到 artifacts/instance.json，请先创建 VPS。")
+        log_error(f"❌ 未找到 {inst_path}，请先创建 VPS。")
         return
 
     try:
@@ -454,7 +458,7 @@ def deploy_wireguard() -> None:
     instance_id = instance.get("id", "")
     if not ip:
         log_section("🛡 Step 3: Deploy WireGuard")
-        log_error("❌ 实例信息缺少 IP 字段，请重新创建或检查 artifacts/instance.json。")
+        log_error(f"❌ 实例信息缺少 IP 字段，请重新创建或检查 {inst_path}。")
         return
 
     log_section("🛡 Step 3: Deploy WireGuard")
@@ -512,7 +516,7 @@ def deploy_wireguard() -> None:
         if api_key and instance_id and ssh_key_ids:
             if ssh_key_ids != stored_ids:
                 instance["ssh_key_ids"] = ssh_key_ids
-                Path("artifacts/instance.json").write_text(
+                inst_path.write_text(
                     json.dumps(instance, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
@@ -684,10 +688,10 @@ qrencode -t PNG -o /root/iphone.png < "${{CLIENT_DIR}}/iphone.conf"
         if not _run_remote_command(client, "test -f /root/iphone.png", "校验二维码文件"):
             return
 
-        log_info("→ 下载至本地 artifacts/iphone.png")
-        artifacts_dir = Path("artifacts")
-        artifacts_dir.mkdir(exist_ok=True)
+        artifacts_dir = ARTIFACTS_DIR
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
         qr_local = artifacts_dir / "iphone.png"
+        log_info(f"→ 下载至本地 {qr_local}")
         if not _download_file(client, "/root/iphone.png", qr_local, "下载二维码图片"):
             return
 
@@ -720,7 +724,7 @@ qrencode -t PNG -o /root/iphone.png < "${{CLIENT_DIR}}/iphone.conf"
             encoding="utf-8",
         )
 
-        log_success("✅ 已生成可扫码配置文件：artifacts\\iphone.png")
+        log_success(f"✅ 已生成可扫码配置文件：{qr_local}")
     finally:
         client.close()
 
