@@ -454,8 +454,46 @@ def deploy_wireguard() -> None:
             log_warning(f"⚠️ 公钥认证暂未生效：{details}")
 
         api_key = os.environ.get("VULTR_API_KEY", "").strip()
-        ssh_key_id = str(instance.get("ssh_key_id", "")).strip()
-        if not (api_key and instance_id and ssh_key_id):
+        ssh_key_ids: list[str] = []
+
+        stored_ids = instance.get("ssh_key_ids")
+        if isinstance(stored_ids, (list, tuple)):
+            ssh_key_ids.extend(str(item).strip() for item in stored_ids if str(item).strip())
+
+        fallback_id = str(instance.get("ssh_key_id", "")).strip()
+        if fallback_id and fallback_id not in ssh_key_ids:
+            ssh_key_ids.append(fallback_id)
+
+        if api_key and instance_id and not ssh_key_ids:
+            ssh_key_name = str(
+                instance.get("ssh_key_name")
+                or instance.get("ssh_key")
+                or ""
+            ).strip()
+            if ssh_key_name:
+                log_info("→ 尝试根据记录的 SSH 公钥名称匹配 Vultr 账号中的公钥…")
+                from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
+
+                try:
+                    for item in list_ssh_keys(api_key):
+                        name = str(item.get("name", "")).strip()
+                        key_id = str(item.get("id", "")).strip()
+                        if name == ssh_key_name and key_id:
+                            ssh_key_ids.append(key_id)
+                            break
+                except Exception as exc:  # noqa: BLE001 - surface lookup errors for troubleshooting
+                    log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
+
+        ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
+
+        if api_key and instance_id and ssh_key_ids:
+            if ssh_key_ids != stored_ids:
+                instance["ssh_key_ids"] = ssh_key_ids
+                Path("artifacts/instance.json").write_text(
+                    json.dumps(instance, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        else:
             log_error("❌ SSH 公钥认证失败，且缺少触发 Reinstall SSH Keys 所需信息。")
             return
 
@@ -466,7 +504,7 @@ def deploy_wireguard() -> None:
         )
 
         try:
-            reinstall_with_ssh_keys(api_key, instance_id, sshkey_ids=[ssh_key_id])
+            reinstall_with_ssh_keys(api_key, instance_id, sshkey_ids=ssh_key_ids)
         except VultrError as exc:  # pragma: no cover - network dependent
             log_error(f"❌ 自动触发 Reinstall SSH Keys 失败：{exc}")
             return
