@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,12 @@ def log_section(title: str) -> None:
 
 
 def _run_remote_script(
-    client: paramiko.SSHClient, script: str, description: str, timeout: int = 1200
+    client: paramiko.SSHClient,
+    script: str,
+    description: str,
+    *,
+    timeout: int = 1200,
+    show_output: bool = True,
 ) -> bool:
     """Execute ``script`` on ``client`` using ``bash`` and report errors."""
 
@@ -78,6 +84,10 @@ def _run_remote_script(
         details = stderr_data or stdout_data or f"退出码 {exit_code}"
         log_error(f"❌ {description}失败：{details}")
         return False
+    if show_output and stdout_data:
+        print(stdout_data)
+    if show_output and stderr_data:
+        print(stderr_data)
     return True
 
 
@@ -146,18 +156,28 @@ def create_vps() -> None:
 
     region = input(f"region [{default_region}]: ").strip() or default_region
     plan = input(f"plan [{default_plan}]: ").strip() or default_plan
-    snapshot_prompt_default = env_snapshot_id or "VULTR_SNAPSHOT_ID"
-    snapshot_input = input(f"snapshot_id [{snapshot_prompt_default}]: ").strip()
-    snapshot_id = snapshot_input or env_snapshot_id
-    sshkey_prompt_default = env_sshkey_name or "VULTR_SSHKEY_NAME"
-    sshkey_input = input(f"snapshot_keyname [{sshkey_prompt_default}]: ").strip()
-    snapshot_keyname = sshkey_input or env_sshkey_name
 
-    if not snapshot_id or not snapshot_keyname:
-        log_error(
-            "❌ 未检测到环境变量 VULTR_SNAPSHOT_ID 或 VULTR_SSHKEY_NAME。\n"
-            "请使用 setx 命令或 .env 文件进行设置。"
-        )
+    default_mode = "1" if env_snapshot_id else "2"
+    mode = input(
+        "实例来源 [1=使用快照, 2=全新 Ubuntu 22.04] " f"[{default_mode}]: "
+    ).strip() or default_mode
+    use_snapshot = mode != "2"
+
+    snapshot_id = ""
+    selected_keyname = env_sshkey_name
+    if use_snapshot:
+        snapshot_prompt_default = env_snapshot_id or "VULTR_SNAPSHOT_ID"
+        snapshot_input = input(f"snapshot_id [{snapshot_prompt_default}]: ").strip()
+        snapshot_id = snapshot_input or env_snapshot_id
+        if not snapshot_id:
+            log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
+            return
+
+    sshkey_prompt_default = env_sshkey_name or "VULTR_SSHKEY_NAME"
+    sshkey_input = input(f"ssh_keyname [{sshkey_prompt_default}]: ").strip()
+    selected_keyname = sshkey_input or env_sshkey_name
+    if not selected_keyname:
+        log_error("❌ 未提供 SSH 公钥名称，请先在 Vultr 控制台创建 SSH 公钥。")
         return
 
     log_info("→ 查询 SSH 公钥信息…")
@@ -167,15 +187,40 @@ def create_vps() -> None:
         log_error(f"❌ 创建失败：获取 SSH 公钥列表异常：{exc}")
         return
 
-    ssh_key_id = ""
-    for item in ssh_keys:
-        if item.get("name") == snapshot_keyname:
-            ssh_key_id = item.get("id", "")
-            break
-
-    if not ssh_key_id:
-        log_error("❌ 创建失败：未找到匹配的 SSH 公钥。请检查 VULTR_SSHKEY_NAME。")
+    if not ssh_keys:
+        log_error("❌ 未在 Vultr 账号中找到任何 SSH 公钥，请先添加后重试。")
         return
+
+    default_index = 1
+    for idx, item in enumerate(ssh_keys, start=1):
+        name = item.get("name", "")
+        log_info(f"  {idx}) {name} ({item.get('id', '')})")
+        if selected_keyname and name == selected_keyname:
+            default_index = idx
+
+    default_key_desc = ssh_keys[default_index - 1].get("name", "")
+    selection = input(
+        f"请选择 SSH 公钥编号 [默认 {default_index}:{default_key_desc}]: "
+    ).strip()
+    if not selection:
+        chosen_idx = default_index
+    else:
+        try:
+            chosen_idx = int(selection)
+        except ValueError:
+            log_error("❌ 输入的编号无效。")
+            return
+        if not 1 <= chosen_idx <= len(ssh_keys):
+            log_error("❌ 输入的编号超出范围。")
+            return
+
+    ssh_key = ssh_keys[chosen_idx - 1]
+    ssh_key_id = ssh_key.get("id", "")
+    ssh_key_name = ssh_key.get("name", "")
+    if not ssh_key_id:
+        log_error("❌ 所选 SSH 公钥缺少 ID，请在 Vultr 控制台重新创建后再试。")
+        return
+    log_info(f"→ 已选择 SSH 公钥：{ssh_key_name}")
 
     log_info("→ 创建实例中…")
     instance_id = ""
@@ -184,7 +229,7 @@ def create_vps() -> None:
             api_key,
             region=region,
             plan=plan,
-            snapshot_id=snapshot_id,
+            snapshot_id=snapshot_id if use_snapshot else None,
             sshkey_ids=[ssh_key_id],
         )
         instance_id = instance.get("id", "")
@@ -196,6 +241,14 @@ def create_vps() -> None:
         if not ip:
             raise VultrError("等待实例 active 时未获取到 IP")
         log_success(f"✅ 实例就绪：id={instance_id}  ip={ip}")
+        log_info("→ 检测实例连通性（每分钟 ping 一次，最多 10 分钟）…")
+        if wait_instance_ping(ip, timeout=600, interval=60):
+            log_success("✅ 实例已可连通，可继续进行下一步部署。")
+        else:
+            log_warning(
+                "⚠️ 在预设时间内未 Ping 通实例，但 Vultr 状态已 active。\n"
+                "   可以稍后再试部署，或手动检查实例网络。"
+            )
     except VultrError as exc:
         log_error(f"❌ 创建失败：{exc}")
         if instance_id:
@@ -208,8 +261,17 @@ def create_vps() -> None:
 
     artifacts_dir = Path("artifacts")
     artifacts_dir.mkdir(exist_ok=True)
+    instance_info: dict[str, Any] = {
+        "id": instance_id,
+        "ip": ip,
+        "region": region,
+        "plan": plan,
+        "source": "snapshot" if use_snapshot else "os",
+        "ssh_key": ssh_key_name,
+        "created_at": int(time.time()),
+    }
     Path("artifacts/instance.json").write_text(
-        json.dumps({"id": instance_id, "ip": ip}, ensure_ascii=False, indent=2),
+        json.dumps(instance_info, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     log_success("已写入 artifacts/instance.json")
@@ -229,11 +291,43 @@ def run_prune() -> None:
         print("\n🧹 精简完成。请查看 PROJECT_PRUNE_REPORT.md")
     else:
         print("\n⚠️ 精简脚本返回异常，请查看输出。")
-from core.ssh_utils import (
-    ask_key_path,
-    pick_default_key,
-    wait_port_open,
-)
+from core.ssh_utils import ask_key_path, pick_default_key, wait_port_open
+
+
+def wait_instance_ping(ip: str, timeout: int = 600, interval: int = 60) -> bool:
+    """Ping ``ip`` every ``interval`` seconds until reachable or timeout."""
+
+    deadline = time.time() + timeout
+    ping_command = [
+        "ping",
+        "-n" if os.name == "nt" else "-c",
+        "1",
+        ip,
+    ]
+    attempt = 1
+    while time.time() < deadline:
+        log_info(f"  ↻ 第 {attempt} 次检测：ping {ip}")
+        try:
+            result = subprocess.run(
+                ping_command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.SubprocessError as exc:
+            log_warning(f"⚠️ 执行 ping 命令失败：{exc}")
+            time.sleep(interval)
+            attempt += 1
+            continue
+
+        if result.returncode == 0:
+            return True
+
+        log_warning("⚠️ 暂未连通，继续等待实例初始化…")
+        time.sleep(interval)
+        attempt += 1
+    return False
 
 
 def deploy_wireguard() -> None:
@@ -288,19 +382,28 @@ def deploy_wireguard() -> None:
         return
 
     try:
-        log_info("→ 自动配置网络环境…")
-        setup_script = """#!/usr/bin/env bash
+        log_info("→ SSH 已连接，开始部署 WireGuard…")
+        setup_steps = [
+            (
+                "更新软件包并安装 WireGuard 组件",
+                """#!/usr/bin/env bash
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-
-apt update -y
-apt install -y wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent
+apt-get update -y
+apt-get install -y wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent
+""",
+            ),
+            (
+                "初始化 WireGuard 配置目录",
+                """#!/usr/bin/env bash
+set -euo pipefail
 
 mkdir -p /etc/wireguard
 umask 077
 
 if [ ! -f /etc/wireguard/server.private ]; then
+  echo "→ 生成服务器私钥/公钥…"
   wg genkey | tee /etc/wireguard/server.private | wg pubkey > /etc/wireguard/server.public
 fi
 SERVER_PRIV=$(cat /etc/wireguard/server.private)
@@ -314,33 +417,48 @@ SaveConfig = true
 EOF
 
 sed -i "s|__SERVER_PRIV__|${SERVER_PRIV}|g" /etc/wireguard/wg0.conf
+""",
+            ),
+            (
+                "启用并启动 WireGuard 服务",
+                """#!/usr/bin/env bash
+set -euo pipefail
 
 systemctl enable wg-quick@wg0
 systemctl restart wg-quick@wg0
-"""
-        if not _run_remote_script(client, setup_script, "网络环境初始化"):
-            return
-
-        log_info("→ 启用 ip_forward 与 NAT 转发…")
-        nat_script = """#!/usr/bin/env bash
+""",
+            ),
+            (
+                "配置 IP 转发与 NAT",
+                """#!/usr/bin/env bash
 set -euo pipefail
 
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard-forward.conf
 sysctl -p /etc/sysctl.d/99-wireguard-forward.conf
-iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o enp1s0 -j MASQUERADE 2>/dev/null || \
-iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o enp1s0 -j MASQUERADE
+PRIMARY_IF=$(ip route show default 0.0.0.0/0 | awk 'NR==1 {print $5}')
+if [ -z "${PRIMARY_IF}" ]; then
+  PRIMARY_IF=enp1s0
+fi
+iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "${PRIMARY_IF}" -j MASQUERADE 2>/dev/null || \
+iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "${PRIMARY_IF}" -j MASQUERADE
 netfilter-persistent save
 netfilter-persistent reload
-"""
-        if not _run_remote_script(client, nat_script, "配置 NAT 转发"):
-            return
+""",
+            ),
+        ]
 
-        log_info("→ WireGuard 服务部署中…")
+        for description, script in setup_steps:
+            log_info(f"→ {description}…")
+            if not _run_remote_script(client, script, description):
+                return
+            log_success(f"   完成：{description}")
+
+        log_info("→ 检查 WireGuard 服务状态…")
         verify_command = "systemctl is-active wg-quick@wg0"
         if not _run_remote_command(client, verify_command, "检查 WireGuard 服务状态"):
             return
 
-        log_info("→ 自动生成客户端配置 /etc/wireguard/clients/iphone/iphone.conf")
+        log_info("→ 生成客户端配置 /etc/wireguard/clients/iphone/iphone.conf …")
         client_script = f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -355,6 +473,7 @@ SERVER_PUB=$(cat /etc/wireguard/server.public)
 ENDPOINT="{ip}:51820"
 
 if ! wg show wg0 peers | grep -q "${{CLIENT_PUB}}"; then
+  echo "→ 将新客户端加入服务器…"
   wg set wg0 peer "${{CLIENT_PUB}}" allowed-ips 10.6.0.2/32
   wg-quick save wg0
 fi
@@ -376,9 +495,9 @@ qrencode -t PNG -o /root/iphone.png < "${{CLIENT_DIR}}/iphone.conf"
 """
         if not _run_remote_script(client, client_script, "生成客户端配置"):
             return
+        log_success("   完成：生成客户端配置")
 
-        log_info("→ 自动生成二维码图片 /root/iphone.png")
-        # The QR image is already generated within the client script; this step verifies its existence.
+        log_info("→ 校验二维码文件 /root/iphone.png …")
         if not _run_remote_command(client, "test -f /root/iphone.png", "校验二维码文件"):
             return
 
