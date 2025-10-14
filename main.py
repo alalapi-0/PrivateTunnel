@@ -134,9 +134,13 @@ def _run_remote_script(
     """Execute ``script`` on ``client`` using ``bash`` and report errors."""
 
     try:
-        stdin, stdout, stderr = client.exec_command("bash -s", get_pty=True, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command("bash -s", get_pty=False, timeout=timeout)
+        if not script.endswith("\n"):
+            script += "\n"
         stdin.write(script)
+        stdin.flush()
         stdin.channel.shutdown_write()
+        stdin.close()
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001 - we want to surface any Paramiko errors
         log_error(f"❌ {description}失败：{exc}")
@@ -160,7 +164,7 @@ def _run_remote_command(
     """Run a single command via Paramiko with unified error handling."""
 
     try:
-        stdin, stdout, stderr = client.exec_command(command, get_pty=True, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command(command, get_pty=False, timeout=timeout)
         stdin.channel.shutdown_write()
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001
