@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Dict
 
@@ -16,6 +17,7 @@ from core.ssh_utils import (
     SmartSSHError,
     ask_key_path,
     pick_default_key,
+    probe_publickey_auth,
     smart_push_script,
     smart_ssh,
     wait_port_open,
@@ -25,6 +27,7 @@ from core.vultr_api import (
     create_instance as api_create_instance,
     ensure_ssh_key,
     pick_snapshot,
+    reinstall_instance,
     wait_instance_ready,
 )
 DEFAULT_REGION = "nrt"
@@ -177,8 +180,20 @@ def _record_server_info(ip: str, provision_result: dict) -> None:
 
 def create_vps_flow(api_key: str) -> Dict[str, object]:
     print("=== 1/3 创建 Vultr 实例 ===")
-    region = _prompt("Region", DEFAULT_REGION)
-    plan = _prompt("Plan", DEFAULT_PLAN)
+    region_env = os.environ.get("VULTR_REGION", "").strip()
+    plan_env = os.environ.get("VULTR_PLAN", "").strip()
+
+    if region_env:
+        region = region_env
+        print(f"→ 使用环境变量 VULTR_REGION={region}")
+    else:
+        region = _prompt("Region", DEFAULT_REGION)
+
+    if plan_env:
+        plan = plan_env
+        print(f"→ 使用环境变量 VULTR_PLAN={plan}")
+    else:
+        plan = _prompt("Plan", DEFAULT_PLAN)
 
     snapshot_env = os.environ.get("VULTR_SNAPSHOT_ID", "").strip() or None
     ssh_key_name = os.environ.get("VULTR_SSHKEY_NAME", "PrivateTunnelKey").strip() or "PrivateTunnelKey"
@@ -298,13 +313,61 @@ def post_boot_verify_ssh(
             raise RuntimeError(f"SSH 返回码 {result.returncode}，输出：{output}")
 
 
-def deploy_wireguard(ip: str, private_key_path: Path) -> None:
+def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> None:
     print("\n=== 3/3 部署 WireGuard ===")
+    ip = str(instance.get("ip", ""))
+    instance_id = str(instance.get("id", ""))
+    sshkey_ids: list[str] = []
+    for raw in instance.get("sshkey_ids", []):
+        value = str(raw).strip()
+        if value:
+            sshkey_ids.append(value)
+    if not ip:
+        raise RuntimeError("实例信息缺少 IP，无法继续部署。")
     known_hosts_file = _reset_host_key(ip)
     print(f"→ 已刷新 {known_hosts_file} 中的 host key 缓存。")
     print("→ 等待 SSH 端口 22 就绪 ...")
     if not wait_port_open(ip, 22, timeout=120):
         raise RuntimeError("SSH 端口未就绪（实例可能还在初始化或防火墙未放行 22）。")
+
+    print("→ 校验公钥认证是否生效 ...")
+    probe = probe_publickey_auth(
+        ip,
+        str(private_key_path),
+        known_hosts_file=str(known_hosts_file),
+    )
+    if not probe.success:
+        details = probe.error or probe.stderr or probe.stdout
+        if details:
+            print(f"⚠️ 公钥认证暂未生效：{details}")
+
+        api_key = os.environ.get("VULTR_API_KEY", "").strip()
+        if not api_key or not instance_id or not sshkey_ids:
+            raise RuntimeError("SSH 公钥认证失败，且缺少触发 Reinstall SSH Keys 所需信息。")
+
+        print("→ 自动触发 Vultr Reinstall SSH Keys ...")
+        try:
+            reinstall_instance(api_key, instance_id, sshkey_ids)
+        except VultrAPIError as exc:
+            raise RuntimeError(f"自动触发 Reinstall SSH Keys 失败：{exc}") from exc
+
+        print("⚠️ 已自动触发 Reinstall SSH Keys，请等待约 1–2 分钟后继续。")
+        time.sleep(75)
+
+        probe = probe_publickey_auth(
+            ip,
+            str(private_key_path),
+            known_hosts_file=str(known_hosts_file),
+        )
+        if not probe.success:
+            details = probe.error or probe.stderr or probe.stdout
+            if details:
+                print(f"⚠️ 最近一次 SSH 输出：{details}")
+            raise RuntimeError("已自动触发 Reinstall SSH Keys，请等待约 1–2 分钟后继续。")
+
+        print("✓ Reinstall 后公钥认证已生效。")
+    else:
+        print("✓ 公钥认证已生效。")
 
     print("→ 校验远端连通性 ...")
     try:
@@ -513,7 +576,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        deploy_wireguard(instance["ip"], private_key_path)
+        deploy_wireguard(instance, private_key_path)
     except Exception as exc:  # noqa: BLE001 - interactive flow
         print(f"❌ WireGuard 部署失败：{exc}")
         sys.exit(1)

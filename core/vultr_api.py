@@ -23,15 +23,30 @@ def _headers(api_key: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
 
+def _format_http_error(status: int, text: str, reason: str = "") -> str:
+    detail = (text or "").strip() or (reason or "")
+    if status == 401:
+        hint = "请检查 Vultr API Access Control 是否放行当前公网 IPv4/IPv6。"
+        base = f"HTTP 401 {detail}" if detail else "HTTP 401"
+        return f"{base}。{hint}"
+    if detail:
+        return f"HTTP {status} {detail}"
+    return f"HTTP {status}"
+
+
 def _request(method: str, path: str, api_key: str, **kwargs: Any) -> requests.Response:
     url = f"{BASE_URL}{path}"
     try:
         resp = requests.request(method, url, headers=_headers(api_key), timeout=30, **kwargs)
     except requests.RequestException as exc:  # pragma: no cover - network errors
+        response = getattr(exc, "response", None)
+        if response is not None:
+            message = _format_http_error(response.status_code, getattr(response, "text", ""), response.reason)
+            raise VultrAPIError(f"请求 {method} {url} 失败：{message}") from exc
         raise VultrAPIError(f"请求 {method} {url} 失败：{exc}") from exc
     if resp.status_code >= 400:
-        message = resp.text
-        raise VultrAPIError(f"请求 {method} {url} 失败：HTTP {resp.status_code} {message}")
+        message = _format_http_error(resp.status_code, resp.text, resp.reason)
+        raise VultrAPIError(f"请求 {method} {url} 失败：{message}")
     return resp
 
 
@@ -180,6 +195,23 @@ def create_instance(
     return data
 
 
+def reinstall_instance(
+    api_key: str,
+    instance_id: str,
+    sshkey_ids: Optional[List[str]] | None = None,
+    *,
+    user_data: Optional[str] = None,
+) -> None:
+    """Trigger ``Reinstall SSH Keys`` for an instance."""
+
+    payload: Dict[str, Any] = {}
+    if sshkey_ids:
+        payload["sshkey_ids"] = list(dict.fromkeys(sshkey_ids))
+    if user_data:
+        payload["user_data"] = user_data
+    _request("POST", f"/instances/{instance_id}/reinstall", api_key, json=payload)
+
+
 def wait_instance_ready(api_key: str, instance_id: str, timeout: int = 600) -> Dict[str, Any]:
     """Poll the Vultr API until the instance becomes active and running."""
 
@@ -228,6 +260,7 @@ __all__ = [
     "ensure_ssh_key",
     "pick_snapshot",
     "create_instance",
+    "reinstall_instance",
     "wait_instance_ready",
     "auto_create",
 ]
