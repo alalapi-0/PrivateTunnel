@@ -170,23 +170,28 @@ def create_vps() -> None:
         plan = input(f"plan [{default_plan}]: ").strip() or default_plan
 
     snapshot_id = ""
+    snapshot_desc = env_snapshot_id or "VULTR_SNAPSHOT_ID"
+    default_mode = "1" if env_snapshot_id else "2"
+    mode_prompt = "实例来源 [1=使用快照"
     if env_snapshot_id:
-        snapshot_id = env_snapshot_id
-        use_snapshot = True
-        log_info(f"→ 使用环境变量 VULTR_SNAPSHOT_ID={snapshot_id}")
+        mode_prompt += f"({env_snapshot_id})"
+    mode_prompt += ", 2=全新 Ubuntu 22.04]"
+    mode = input(f"{mode_prompt} [{default_mode}]: ").strip() or default_mode
+
+    use_snapshot = mode == "1"
+    if use_snapshot:
+        snapshot_input = input(f"snapshot_id [{snapshot_desc}]: ").strip()
+        snapshot_id = snapshot_input or env_snapshot_id
+        if not snapshot_id:
+            log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
+            return
+        if env_snapshot_id and snapshot_id == env_snapshot_id:
+            log_info(f"→ 使用环境变量 VULTR_SNAPSHOT_ID={snapshot_id}")
+        else:
+            log_info(f"→ 使用 snapshot_id={snapshot_id}")
     else:
-        default_mode = "2"
-        mode = input(
-            f"实例来源 [1=使用快照, 2=全新 Ubuntu 22.04] [{default_mode}]: "
-        ).strip() or default_mode
-        use_snapshot = mode != "2"
-        if use_snapshot:
-            snapshot_prompt_default = env_snapshot_id or "VULTR_SNAPSHOT_ID"
-            snapshot_input = input(f"snapshot_id [{snapshot_prompt_default}]: ").strip()
-            snapshot_id = snapshot_input or env_snapshot_id
-            if not snapshot_id:
-                log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
-                return
+        if env_snapshot_id:
+            log_info("→ 已选择全新 Ubuntu 22.04，将忽略环境变量 VULTR_SNAPSHOT_ID。")
 
     selected_keyname = env_sshkey_name
     sshkey_prompt_default = env_sshkey_name or "VULTR_SSHKEY_NAME"
@@ -312,6 +317,7 @@ def run_prune() -> None:
         print("\n⚠️ 精简脚本返回异常，请查看输出。")
 from core.ssh_utils import (
     ask_key_path,
+    nuke_known_host,
     pick_default_key,
     probe_publickey_auth,
     wait_port_open,
@@ -432,6 +438,7 @@ def deploy_wireguard() -> None:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
+    nuke_known_host(ip)
     try:
         client.connect(
             hostname=ip,
