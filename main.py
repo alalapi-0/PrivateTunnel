@@ -79,30 +79,40 @@ def _stream_command_output(
     last_printed = ""
 
     while True:
+        stdout_drained = True
+        stderr_drained = True
+
         if channel.recv_ready():
             data = channel.recv(4096)
             if data:
+                stdout_drained = False
                 text = data.decode("utf-8", errors="ignore")
                 stdout_chunks.append(text)
                 if show_output:
                     print(text, end="", flush=True)
                     printed_any = True
                     last_printed = text
+            else:
+                stdout_drained = True
 
         if channel.recv_stderr_ready():
             data = channel.recv_stderr(4096)
             if data:
+                stderr_drained = False
                 text = data.decode("utf-8", errors="ignore")
                 stderr_chunks.append(text)
                 if show_output:
                     print(text, end="", flush=True)
                     printed_any = True
                     last_printed = text
+            else:
+                stderr_drained = True
 
-        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+        if channel.exit_status_ready() and stdout_drained and stderr_drained:
             break
 
-        time.sleep(0.1)
+        if stdout_drained and stderr_drained:
+            time.sleep(0.1)
 
     exit_code = channel.recv_exit_status()
     if show_output and printed_any and not last_printed.endswith("\n"):
