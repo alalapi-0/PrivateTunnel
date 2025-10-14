@@ -20,6 +20,9 @@ RED = "\033[31m"
 YELLOW = "\033[33m"
 RESET = "\033[0m"
 
+ROOT = Path(__file__).resolve().parent
+ARTIFACTS_DIR = ROOT / "artifacts"
+
 
 def _colorize(message: str, color: str) -> str:
     """Return ``message`` wrapped in ANSI color codes."""
@@ -79,30 +82,40 @@ def _stream_command_output(
     last_printed = ""
 
     while True:
+        stdout_drained = True
+        stderr_drained = True
+
         if channel.recv_ready():
             data = channel.recv(4096)
             if data:
+                stdout_drained = False
                 text = data.decode("utf-8", errors="ignore")
                 stdout_chunks.append(text)
                 if show_output:
                     print(text, end="", flush=True)
                     printed_any = True
                     last_printed = text
+            else:
+                stdout_drained = True
 
         if channel.recv_stderr_ready():
             data = channel.recv_stderr(4096)
             if data:
+                stderr_drained = False
                 text = data.decode("utf-8", errors="ignore")
                 stderr_chunks.append(text)
                 if show_output:
                     print(text, end="", flush=True)
                     printed_any = True
                     last_printed = text
+            else:
+                stderr_drained = True
 
-        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+        if channel.exit_status_ready() and stdout_drained and stderr_drained:
             break
 
-        time.sleep(0.1)
+        if stdout_drained and stderr_drained:
+            time.sleep(0.1)
 
     exit_code = channel.recv_exit_status()
     if show_output and printed_any and not last_printed.endswith("\n"):
@@ -124,9 +137,13 @@ def _run_remote_script(
     """Execute ``script`` on ``client`` using ``bash`` and report errors."""
 
     try:
-        stdin, stdout, stderr = client.exec_command("bash -s", get_pty=True, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command("bash -s", get_pty=False, timeout=timeout)
+        if not script.endswith("\n"):
+            script += "\n"
         stdin.write(script)
+        stdin.flush()
         stdin.channel.shutdown_write()
+        stdin.close()
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001 - we want to surface any Paramiko errors
         log_error(f"❌ {description}失败：{exc}")
@@ -150,7 +167,7 @@ def _run_remote_command(
     """Run a single command via Paramiko with unified error handling."""
 
     try:
-        stdin, stdout, stderr = client.exec_command(command, get_pty=True, timeout=timeout)
+        stdin, stdout, stderr = client.exec_command(command, get_pty=False, timeout=timeout)
         stdin.channel.shutdown_write()
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001
@@ -272,19 +289,28 @@ def create_vps() -> None:
 
     default_key_desc = ssh_keys[default_index - 1].get("name", "")
     selection = input(
-        f"请选择 SSH 公钥编号 [默认 {default_index}:{default_key_desc}]: "
+        f"请选择 SSH 公钥（可输入编号、名称或 ID）[默认 {default_index}:{default_key_desc}]: "
     ).strip()
+    chosen_idx: int | None = None
     if not selection:
         chosen_idx = default_index
     else:
         try:
             chosen_idx = int(selection)
         except ValueError:
-            log_error("❌ 输入的编号无效。")
-            return
-        if not 1 <= chosen_idx <= len(ssh_keys):
-            log_error("❌ 输入的编号超出范围。")
-            return
+            normalized = selection.casefold()
+            for idx, item in enumerate(ssh_keys, start=1):
+                name = (item.get("name", "") or "").casefold()
+                key_id = (item.get("id", "") or "").casefold()
+                if normalized in {name, key_id}:
+                    chosen_idx = idx
+                    break
+            if chosen_idx is None:
+                log_error("❌ 找不到匹配的 SSH 公钥，请检查输入的编号、名称或 ID。")
+                return
+    if not 1 <= chosen_idx <= len(ssh_keys):
+        log_error("❌ 输入的编号超出范围。")
+        return
 
     ssh_key = ssh_keys[chosen_idx - 1]
     ssh_key_id = ssh_key.get("id", "")
@@ -331,8 +357,8 @@ def create_vps() -> None:
                 log_warning(f"⚠️ 清理实例失败：{cleanup_exc}")
         return
 
-    artifacts_dir = Path("artifacts")
-    artifacts_dir.mkdir(exist_ok=True)
+    artifacts_dir = ARTIFACTS_DIR
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     instance_info: dict[str, Any] = {
         "id": instance_id,
         "ip": ip,
@@ -345,11 +371,12 @@ def create_vps() -> None:
         "ssh_key_ids": [ssh_key_id],
         "created_at": int(time.time()),
     }
-    Path("artifacts/instance.json").write_text(
+    instance_file = artifacts_dir / "instance.json"
+    instance_file.write_text(
         json.dumps(instance_info, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    log_success("已写入 artifacts/instance.json")
+    log_success(f"已写入 {instance_file}")
 
 
 def run_doctor() -> None:
@@ -414,10 +441,10 @@ def wait_instance_ping(ip: str, timeout: int = 600, interval: int = 60) -> bool:
 def deploy_wireguard() -> None:
     """Deploy WireGuard onto the previously created VPS."""
 
-    inst_path = Path("artifacts/instance.json")
+    inst_path = ARTIFACTS_DIR / "instance.json"
     if not inst_path.exists():
         log_section("🛡 Step 3: Deploy WireGuard")
-        log_error("❌ 未找到 artifacts/instance.json，请先创建 VPS。")
+        log_error(f"❌ 未找到 {inst_path}，请先创建 VPS。")
         return
 
     try:
@@ -431,7 +458,7 @@ def deploy_wireguard() -> None:
     instance_id = instance.get("id", "")
     if not ip:
         log_section("🛡 Step 3: Deploy WireGuard")
-        log_error("❌ 实例信息缺少 IP 字段，请重新创建或检查 artifacts/instance.json。")
+        log_error(f"❌ 实例信息缺少 IP 字段，请重新创建或检查 {inst_path}。")
         return
 
     log_section("🛡 Step 3: Deploy WireGuard")
@@ -489,7 +516,7 @@ def deploy_wireguard() -> None:
         if api_key and instance_id and ssh_key_ids:
             if ssh_key_ids != stored_ids:
                 instance["ssh_key_ids"] = ssh_key_ids
-                Path("artifacts/instance.json").write_text(
+                inst_path.write_text(
                     json.dumps(instance, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
@@ -661,10 +688,10 @@ qrencode -t PNG -o /root/iphone.png < "${{CLIENT_DIR}}/iphone.conf"
         if not _run_remote_command(client, "test -f /root/iphone.png", "校验二维码文件"):
             return
 
-        log_info("→ 下载至本地 artifacts/iphone.png")
-        artifacts_dir = Path("artifacts")
-        artifacts_dir.mkdir(exist_ok=True)
+        artifacts_dir = ARTIFACTS_DIR
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
         qr_local = artifacts_dir / "iphone.png"
+        log_info(f"→ 下载至本地 {qr_local}")
         if not _download_file(client, "/root/iphone.png", qr_local, "下载二维码图片"):
             return
 
@@ -697,7 +724,7 @@ qrencode -t PNG -o /root/iphone.png < "${{CLIENT_DIR}}/iphone.conf"
             encoding="utf-8",
         )
 
-        log_success("✅ 已生成可扫码配置文件：artifacts\\iphone.png")
+        log_success(f"✅ 已生成可扫码配置文件：{qr_local}")
     finally:
         client.close()
 
