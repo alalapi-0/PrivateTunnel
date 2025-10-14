@@ -8,7 +8,8 @@ PrivateTunnel 包含服务器、iOS 客户端、分流脚本等多个组件。�
 | --- | --- | --- |
 | 无法建立连接，WireGuard 日志显示 `Handshake did not complete` | 服务器 UDP 端口未开放 | 确认云防火墙/安全组开放 `51820/UDP`，并检查 `wg-quick@wg0` 服务状态。|
 
-| 日志持续出现 `Sending handshake initiation` → `Handshake did not complete after 5 seconds`，客户端显示“已连接”但无流量 | 服务器端未收到握手（端口被运营商/NAT/防火墙屏蔽），或配置公钥/AllowedIPs 不匹配 | 1. 在服务器执行 `sudo journalctl -u wg-quick@wg0 -f`，观察是否有对应客户端的 `Handshake for peer ...`；2. 若日志无响应，确认出口 IP 202.182.116.76 的 `51820/UDP` 未被拦截，可尝试临时改用 `443/UDP`；3. 若服务器有日志但握手失败，重新导出服务器端配置，确保客户端公钥与 `AllowedIPs` 与服务器一致。|
+| 日志持续出现 `Sending handshake initiation` → `Handshake did not complete after 5 seconds`，客户端显示“已连接”但无流量 | 服务器端未收到握手（端口被运营商/NAT/防火墙屏蔽），或配置公钥/AllowedIPs 不匹配 | 1. 在服务器执行 `sudo journalctl -u wg-quick@wg0 -f`，观察是否有对应客户端的 `Handshake for peer ...`；2. 若日志无响应，确认出口 IP 202.182.116.76 的 `51820/UDP` 未被拦截，可改用 `PRIVATETUNNEL_WG_PORT=443`（或 `PT_WG_PORT`）后重新运行 Windows 一键/脚本流程生成监听 443/UDP 的配置；3. 若服务器有日志但握手失败，重新导出服务器端配置，确保客户端公钥与 `AllowedIPs` 与服务器一致。|
+
 | 连接后立即断开，日志出现 `Invalid keepalive` | MTU 不匹配 | 在客户端配置中将 `MTU=1380`，或参考服务器端日志调整。|
 | 长时间无流量后断线 | Keepalive 太长 | 在 `core/examples/` 中调整 `persistent_keepalive`（建议 25s）。|
 | 配置导入后仍显示“未受信任的开发者” | 未正确签名 | 按 [CODE_SIGNING.md](CODE_SIGNING.md) 重新配置团队与证书。|
