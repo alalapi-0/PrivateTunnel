@@ -75,6 +75,40 @@ def _default_ssh_executable() -> str:
     return "ssh.exe" if platform.system().lower().startswith("win") else "ssh"
 
 
+def nuke_known_host(ip: str, port: int = 22) -> None:
+    """Remove stale host-key fingerprints for ``ip`` from ``known_hosts``."""
+
+    targets = (ip, f"[{ip}]:{port}")
+    for target in targets:
+        try:
+            subprocess.run(
+                ["ssh-keygen", "-R", target],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except Exception:  # noqa: BLE001 - best-effort cleanup across environments
+            pass
+
+    known_hosts = _default_home() / ".ssh" / "known_hosts"
+    if known_hosts.exists():
+        try:
+            lines = known_hosts.read_text(encoding="utf-8", errors="ignore").splitlines()
+            keep = [
+                line
+                for line in lines
+                if ip not in line and f"[{ip}]:{port}" not in line
+            ]
+            if len(keep) != len(lines):
+                known_hosts.write_text(
+                    "\n".join(keep) + ("\n" if keep else ""),
+                    encoding="utf-8",
+                )
+        except Exception:  # noqa: BLE001 - best-effort cleanup across environments
+            pass
+
+
 def pick_default_key() -> str:
     """Return the preferred default private key path for Windows prompts."""
 
@@ -144,6 +178,7 @@ def probe_publickey_auth(
     """
 
     key_file = Path(key_path).expanduser()
+    nuke_known_host(host)
     ssh_cmd: list[str] = [
         _default_ssh_executable(),
         "-o",
