@@ -8,6 +8,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+if sys.version_info < (3, 8):
+    raise SystemExit(
+        "当前 Python 解释器版本过低。本工具至少需要 Python 3.8，请改用 python3 运行。"
+    )
+
 import paramiko
 
 from core.port_config import resolve_listen_port
