@@ -10,6 +10,8 @@ from typing import Any
 
 import paramiko
 
+from core.port_config import resolve_listen_port
+
 
 if os.name == "nt":
     os.system("")
@@ -22,6 +24,10 @@ RESET = "\033[0m"
 
 ROOT = Path(__file__).resolve().parent
 ARTIFACTS_DIR = ROOT / "artifacts"
+try:
+    LISTEN_PORT, LISTEN_PORT_SOURCE = resolve_listen_port()
+except ValueError as exc:
+    raise SystemExit(f"无效的 WireGuard 端口配置：{exc}") from exc
 
 
 def _colorize(message: str, color: str) -> str:
@@ -463,6 +469,12 @@ def deploy_wireguard() -> None:
 
     log_section("🛡 Step 3: Deploy WireGuard")
     log_info(f"→ 目标实例：{ip}")
+    if LISTEN_PORT_SOURCE:
+        log_info(f"→ WireGuard 监听端口：{LISTEN_PORT} （来自环境变量 {LISTEN_PORT_SOURCE}）")
+    else:
+        log_info(
+            f"→ WireGuard 监听端口：{LISTEN_PORT} （默认值，可通过环境变量 PRIVATETUNNEL_WG_PORT/PT_WG_PORT 覆盖）"
+        )
 
     default_key = pick_default_key()
     key_path = Path(ask_key_path(default_key)).expanduser()
@@ -598,13 +610,13 @@ SERVER_PRIV=$(cat /etc/wireguard/server.private)
 cat >/etc/wireguard/wg0.conf <<'EOF'
 [Interface]
 Address = 10.6.0.1/24
-ListenPort = 51820
+ListenPort = {LISTEN_PORT}
 PrivateKey = __SERVER_PRIV__
 SaveConfig = true
 EOF
 
 sed -i "s|__SERVER_PRIV__|${SERVER_PRIV}|g" /etc/wireguard/wg0.conf
-""",
+""".replace("{LISTEN_PORT}", str(LISTEN_PORT)),
             ),
             (
                 "启用并启动 WireGuard 服务",
@@ -646,40 +658,43 @@ netfilter-persistent reload
             return
 
         log_info("→ 生成客户端配置 /etc/wireguard/clients/iphone/iphone.conf …")
-        client_script = f"""#!/usr/bin/env bash
+        client_script = """#!/usr/bin/env bash
 set -euo pipefail
 
 CLIENT_DIR="/etc/wireguard/clients/iphone"
-mkdir -p "${{CLIENT_DIR}}"
+mkdir -p "${CLIENT_DIR}"
 umask 077
 
-wg genkey | tee "${{CLIENT_DIR}}/iphone.private" | wg pubkey > "${{CLIENT_DIR}}/iphone.public"
-CLIENT_PRIV=$(cat "${{CLIENT_DIR}}/iphone.private")
-CLIENT_PUB=$(cat "${{CLIENT_DIR}}/iphone.public")
+wg genkey | tee "${CLIENT_DIR}/iphone.private" | wg pubkey > "${CLIENT_DIR}/iphone.public"
+CLIENT_PRIV=$(cat "${CLIENT_DIR}/iphone.private")
+CLIENT_PUB=$(cat "${CLIENT_DIR}/iphone.public")
 SERVER_PUB=$(cat /etc/wireguard/server.public)
-ENDPOINT="{ip}:51820"
+ENDPOINT="{ip}:{LISTEN_PORT}"
 
-if ! wg show wg0 peers | grep -q "${{CLIENT_PUB}}"; then
+if ! wg show wg0 peers | grep -q "${CLIENT_PUB}"; then
   echo "→ 将新客户端加入服务器…"
-  wg set wg0 peer "${{CLIENT_PUB}}" allowed-ips 10.6.0.2/32
+  wg set wg0 peer "${CLIENT_PUB}" allowed-ips 10.6.0.2/32
   wg-quick save wg0
 fi
 
-cat > "${{CLIENT_DIR}}/iphone.conf" <<EOF
+cat > "${CLIENT_DIR}/iphone.conf" <<EOF
 [Interface]
-PrivateKey = ${{CLIENT_PRIV}}
+PrivateKey = ${CLIENT_PRIV}
 Address = 10.6.0.2/32
 DNS = 1.1.1.1, 8.8.8.8
 
 [Peer]
-PublicKey = ${{SERVER_PUB}}
+PublicKey = ${SERVER_PUB}
 AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${{ENDPOINT}}
+Endpoint = ${ENDPOINT}
 PersistentKeepalive = 25
 EOF
 
-qrencode -t PNG -o /root/iphone.png < "${{CLIENT_DIR}}/iphone.conf"
+qrencode -t PNG -o /root/iphone.png < "${CLIENT_DIR}/iphone.conf"
 """
+        client_script = (
+            client_script.replace("{ip}", ip).replace("{LISTEN_PORT}", str(LISTEN_PORT))
+        )
         if not _run_remote_script(client, client_script, "生成客户端配置"):
             return
         log_success("   完成：生成客户端配置")

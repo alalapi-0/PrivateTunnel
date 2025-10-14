@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Dict
 
+from core.port_config import resolve_listen_port
 from core.ssh_utils import (
     SSHAttempt,
     SmartSSHError,
@@ -168,10 +169,20 @@ def _write_instance_artifact(payload: Dict[str, object]) -> None:
 
 
 def _record_server_info(ip: str, provision_result: dict) -> None:
+    try:
+        default_port, _ = resolve_listen_port()
+    except ValueError:
+        default_port = 51820
+    try:
+        port_value = provision_result.get("port", default_port)
+        port = int(port_value)
+    except (TypeError, ValueError):
+        port = default_port
+
     payload = {
         "ip": ip,
         "server_pub": provision_result.get("server_pub", ""),
-        "port": provision_result.get("port", 51820),
+        "port": port,
     }
     path = _artifacts_dir() / "server.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -395,7 +406,24 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
         )
     print("✅ 远端连通性正常，开始执行 WireGuard 安装脚本 ...")
 
-    wg_install_script = r"""#!/usr/bin/env bash
+    try:
+        listen_port, listen_port_source = resolve_listen_port()
+    except ValueError as exc:
+        raise RuntimeError(f"无效的 WireGuard 端口配置：{exc}") from exc
+
+    if listen_port_source:
+        print(f"→ 使用环境变量 {listen_port_source} 设置 WireGuard UDP 端口：{listen_port}")
+    else:
+        port_input = _prompt("WireGuard UDP 端口 (若 51820 被屏蔽可改为 443)", str(listen_port))
+        try:
+            listen_port = int(port_input)
+        except ValueError as exc:
+            raise RuntimeError(f"WireGuard UDP 端口必须是整数，当前输入: {port_input}") from exc
+        if not 1 <= listen_port <= 65535:
+            raise RuntimeError(f"WireGuard UDP 端口 {listen_port} 超出有效范围 (1-65535)。")
+    print(f"→ WireGuard 将监听 UDP 端口：{listen_port}")
+
+    wg_install_script = f"""#!/usr/bin/env bash
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
@@ -414,17 +442,17 @@ SERVER_PRIV=$(cat /etc/wireguard/server.private)
 cat >/etc/wireguard/wg0.conf <<'EOF'
 [Interface]
 Address = 10.6.0.1/24
-ListenPort = 51820
+ListenPort = {listen_port}
 PrivateKey = __SERVER_PRIV__
 SaveConfig = true
 EOF
-sed -i "s|__SERVER_PRIV__|${SERVER_PRIV}|" /etc/wireguard/wg0.conf
+sed -i "s|__SERVER_PRIV__|${{SERVER_PRIV}}|" /etc/wireguard/wg0.conf
 
 # 开启转发 & NAT
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
-WAN_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -n1)
-iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
-iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
+WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
+iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "${{WAN_IF}}" -j MASQUERADE 2>/dev/null || \\
+iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "${{WAN_IF}}" -j MASQUERADE
 # 持久化（容错）
 if command -v netfilter-persistent >/dev/null 2>&1; then
   netfilter-persistent save || true
@@ -450,7 +478,7 @@ wg show || true
 
     print("→ WireGuard 服务已部署，继续添加客户端 ...")
 
-    add_peer_script = r"""#!/usr/bin/env bash
+    add_peer_script = f"""#!/usr/bin/env bash
 set -euo pipefail
 
 apt install -y qrencode
@@ -460,35 +488,35 @@ CLIENT_DIR="/etc/wireguard/clients/${CLIENT_NAME}"
 mkdir -p "${CLIENT_DIR}"
 umask 077
 
-wg genkey | tee "${CLIENT_DIR}/${CLIENT_NAME}.private" | wg pubkey > "${CLIENT_DIR}/${CLIENT_NAME}.public"
-CLIENT_PRIV=$(cat "${CLIENT_DIR}/${CLIENT_NAME}.private")
-CLIENT_PUB=$(cat "${CLIENT_DIR}/${CLIENT_NAME}.public")
+wg genkey | tee "${{CLIENT_DIR}}/${{CLIENT_NAME}}.private" | wg pubkey > "${{CLIENT_DIR}}/${{CLIENT_NAME}}.public"
+CLIENT_PRIV=$(cat "${{CLIENT_DIR}}/${{CLIENT_NAME}}.private")
+CLIENT_PUB=$(cat "${{CLIENT_DIR}}/${{CLIENT_NAME}}.public")
 
 # 取服务端公钥与对外地址
 SERVER_PUB=$(cat /etc/wireguard/server.public)
-ENDPOINT="$(curl -4 -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'):51820"
+ENDPOINT="$(curl -4 -s ifconfig.me 2>/dev/null || hostname -I | awk '{{print $1}}'):{listen_port}"
 
 # 将客户端作为 peer 加到服务器
-wg set wg0 peer "${CLIENT_PUB}" allowed-ips 10.6.0.2/32
+wg set wg0 peer "${{CLIENT_PUB}}" allowed-ips 10.6.0.2/32
 wg-quick save wg0 || true
 
 # 生成客户端配置
-cat > "${CLIENT_DIR}/${CLIENT_NAME}.conf" <<EOF
+cat > "${{CLIENT_DIR}}/${{CLIENT_NAME}}.conf" <<EOF
 [Interface]
-PrivateKey = ${CLIENT_PRIV}
+PrivateKey = ${{CLIENT_PRIV}}
 Address = 10.6.0.2/32
 DNS = 1.1.1.1
 
 [Peer]
-PublicKey = ${SERVER_PUB}
+PublicKey = ${{SERVER_PUB}}
 AllowedIPs = 0.0.0.0/0
-Endpoint = ${ENDPOINT}
+Endpoint = ${{ENDPOINT}}
 PersistentKeepalive = 25
 EOF
 
 echo "=== QR below ==="
-qrencode -t ANSIUTF8 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || true
-qrencode -o /root/iphone.png -s 8 -m 2 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || true
+qrencode -t ANSIUTF8 < "${{CLIENT_DIR}}/${{CLIENT_NAME}}.conf" || true
+qrencode -o /root/iphone.png -s 8 -m 2 < "${{CLIENT_DIR}}/${{CLIENT_NAME}}.conf" || true
 """
 
     rc2 = smart_push_script(
@@ -520,7 +548,7 @@ qrencode -o /root/iphone.png -s 8 -m 2 < "${CLIENT_DIR}/${CLIENT_NAME}.conf" || 
             print(f"⚠️ 读取服务端公钥失败：{output}")
 
     if server_pub:
-        _record_server_info(ip, {"server_pub": server_pub, "port": 51820})
+        _record_server_info(ip, {"server_pub": server_pub, "port": listen_port})
 
     artifacts_dir = _artifacts_dir()
     conf_local = artifacts_dir / "iphone.conf"

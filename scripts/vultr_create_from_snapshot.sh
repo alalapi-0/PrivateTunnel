@@ -13,6 +13,12 @@ CLIENT_NAME="iphone"
 CLIENT_ADDR="10.6.0.2/32"
 WG_PORT="51820"
 
+if [ -n "${PRIVATETUNNEL_WG_PORT:-}" ]; then
+  WG_PORT="${PRIVATETUNNEL_WG_PORT}"
+elif [ -n "${PT_WG_PORT:-}" ]; then
+  WG_PORT="${PT_WG_PORT}"
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --region)
@@ -34,6 +40,19 @@ while [ $# -gt 0 ]; do
       exit 1 ;;
   esac
 done
+
+case "$WG_PORT" in
+  ''|*[!0-9]*)
+    echo "WireGuard 端口必须是 1-65535 的数字，当前为: $WG_PORT" >&2
+    exit 1
+    ;;
+  *)
+    if [ "$WG_PORT" -lt 1 ] || [ "$WG_PORT" -gt 65535 ]; then
+      echo "WireGuard 端口必须位于 1-65535 之间，当前为: $WG_PORT" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 : "${VULTR_API_KEY:?Environment variable VULTR_API_KEY is required}"
 SNAPSHOT_ID="${SNAPSHOT_ID:-}"
