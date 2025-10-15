@@ -35,6 +35,13 @@ except ValueError as exc:
     raise SystemExit(f"无效的 WireGuard 端口配置：{exc}") from exc
 
 
+PLATFORM_CHOICES = {
+    "windows": "Windows",
+    "macos": "macOS",
+}
+SELECTED_PLATFORM: str | None = None
+
+
 def _colorize(message: str, color: str) -> str:
     """Return ``message`` wrapped in ANSI color codes."""
 
@@ -222,6 +229,7 @@ def create_vps() -> None:
     )
 
     log_section("🧱 Step 2: Create VPS")
+    _log_selected_platform()
 
     api_key = os.environ.get("VULTR_API_KEY", "")
     if not api_key:
@@ -390,12 +398,78 @@ def create_vps() -> None:
     log_success(f"已写入 {instance_file}")
 
 
-def run_doctor() -> None:
-    code = subprocess.call([sys.executable, "scripts/project_doctor.py"])
-    if code == 0:
-        print("\n✅ 体检通过。详见 PROJECT_HEALTH_REPORT.md")
+def _log_selected_platform() -> None:
+    if SELECTED_PLATFORM:
+        label = PLATFORM_CHOICES.get(SELECTED_PLATFORM, SELECTED_PLATFORM)
+        log_info(f"→ 当前本机系统：{label}")
     else:
-        print("\n⚠️ 体检发现问题，请按报告修复后再继续。")
+        log_warning("⚠️ 尚未选择本机系统，可通过第 1 步执行环境检查。")
+
+
+def _update_server_info(data: dict[str, Any]) -> None:
+    artifacts_dir = ARTIFACTS_DIR
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    server_file = artifacts_dir / "server.json"
+    existing: dict[str, Any] = {}
+    if server_file.exists():
+        try:
+            existing = json.loads(server_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = {}
+    existing.update(data)
+    server_file.write_text(
+        json.dumps(existing, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _desktop_usage_tip() -> None:
+    if SELECTED_PLATFORM == "windows":
+        log_info(
+            "→ 请安装 WireGuard for Windows，导入生成的 .conf 配置文件后启动隧道。"
+        )
+    elif SELECTED_PLATFORM == "macos":
+        log_info(
+            "→ 请安装 WireGuard.app（macOS），双击配置文件或在应用内导入后连接。"
+        )
+    else:
+        log_info(
+            "→ 可在任意支持 WireGuard 的桌面客户端中导入该配置以连接 VPS。"
+        )
+
+
+def run_environment_check() -> None:
+    global SELECTED_PLATFORM
+
+    log_section("🩺 Step 1: 检查本机环境")
+    options = {"1": "windows", "2": "macos"}
+    while True:
+        log_info("请选择本机系统类型：")
+        log_info("  1) Windows")
+        log_info("  2) macOS")
+        log_info("  q) 返回主菜单")
+        choice = input("系统选择: ").strip().lower()
+        if choice in {"q", "quit", "exit"}:
+            log_warning("⚠️ 已取消环境检查。")
+            return
+        if choice in options:
+            SELECTED_PLATFORM = options[choice]
+            break
+        log_error("❌ 无效选择，请重新输入。")
+
+    label = PLATFORM_CHOICES.get(SELECTED_PLATFORM, SELECTED_PLATFORM)
+    log_info(f"→ 将针对 {label} 环境执行体检…")
+    command = [
+        sys.executable,
+        "scripts/project_doctor.py",
+        "--platform",
+        SELECTED_PLATFORM,
+    ]
+    code = subprocess.call(command)
+    if code == 0:
+        log_success("✅ 体检通过。详见 PROJECT_HEALTH_REPORT.md")
+    else:
+        log_warning("⚠️ 体检发现问题，请按报告提示修复后再继续。")
 
 
 def run_prune() -> None:
@@ -449,30 +523,31 @@ def wait_instance_ping(ip: str, timeout: int = 600, interval: int = 60) -> bool:
     return False
 
 
-def deploy_wireguard() -> None:
-    """Deploy WireGuard onto the previously created VPS."""
+def prepare_wireguard_access() -> None:
+    """Configure WireGuard and download a desktop client config."""
 
     inst_path = ARTIFACTS_DIR / "instance.json"
     if not inst_path.exists():
-        log_section("🛡 Step 3: Deploy WireGuard")
+        log_section("🛡 Step 3: 准备本机接入 VPS 网络")
         log_error(f"❌ 未找到 {inst_path}，请先创建 VPS。")
         return
 
     try:
         instance = json.loads(inst_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        log_section("🛡 Step 3: Deploy WireGuard")
+        log_section("🛡 Step 3: 准备本机接入 VPS 网络")
         log_error(f"❌ 解析实例信息失败：{exc}")
         return
 
     ip = instance.get("ip")
     instance_id = instance.get("id", "")
     if not ip:
-        log_section("🛡 Step 3: Deploy WireGuard")
+        log_section("🛡 Step 3: 准备本机接入 VPS 网络")
         log_error(f"❌ 实例信息缺少 IP 字段，请重新创建或检查 {inst_path}。")
         return
 
-    log_section("🛡 Step 3: Deploy WireGuard")
+    log_section("🛡 Step 3: 准备本机接入 VPS 网络")
+    _log_selected_platform()
     log_info(f"→ 目标实例：{ip}")
     if LISTEN_PORT_SOURCE:
         log_info(f"→ WireGuard 监听端口：{LISTEN_PORT} （来自环境变量 {LISTEN_PORT_SOURCE}）")
@@ -662,27 +737,51 @@ netfilter-persistent reload
         if not _run_remote_command(client, verify_command, "检查 WireGuard 服务状态"):
             return
 
-        log_info("→ 生成客户端配置 /etc/wireguard/clients/iphone/iphone.conf …")
+        log_info("→ 检查 WireGuard UDP 监听端口…")
+        try:
+            stdin, stdout, stderr = client.exec_command(
+                f"ss -ulpn | grep ':{LISTEN_PORT}'",
+                get_pty=False,
+                timeout=10,
+            )
+            exit_code, stdout_data, stderr_data = _stream_command_output(
+                stdout, stderr, show_output=False
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_warning(f"⚠️ 检测 UDP 端口时出现异常：{exc}")
+        else:
+            if exit_code == 0:
+                log_success("   WireGuard UDP 端口正在监听。")
+                if stdout_data:
+                    log_info(f"   {stdout_data}")
+            else:
+                details = stderr_data or stdout_data or "未检测到监听进程"
+                log_warning(
+                    "⚠️ 暂未检测到 WireGuard UDP 监听进程，请确认云防火墙已放行相关端口。"
+                )
+                log_warning(f"   诊断信息：{details}")
+
+        log_info("→ 生成桌面端客户端配置 /etc/wireguard/clients/desktop/desktop.conf …")
         client_script = """#!/usr/bin/env bash
 set -euo pipefail
 
-CLIENT_DIR="/etc/wireguard/clients/iphone"
+CLIENT_DIR="/etc/wireguard/clients/desktop"
 mkdir -p "${CLIENT_DIR}"
 umask 077
 
-wg genkey | tee "${CLIENT_DIR}/iphone.private" | wg pubkey > "${CLIENT_DIR}/iphone.public"
-CLIENT_PRIV=$(cat "${CLIENT_DIR}/iphone.private")
-CLIENT_PUB=$(cat "${CLIENT_DIR}/iphone.public")
+wg genkey | tee "${CLIENT_DIR}/desktop.private" | wg pubkey > "${CLIENT_DIR}/desktop.public"
+CLIENT_PRIV=$(cat "${CLIENT_DIR}/desktop.private")
+CLIENT_PUB=$(cat "${CLIENT_DIR}/desktop.public")
 SERVER_PUB=$(cat /etc/wireguard/server.public)
 ENDPOINT="{ip}:{LISTEN_PORT}"
 
 if ! wg show wg0 peers | grep -q "${CLIENT_PUB}"; then
-  echo "→ 将新客户端加入服务器…"
+  echo "→ 将桌面客户端加入服务器…"
   wg set wg0 peer "${CLIENT_PUB}" allowed-ips 10.6.0.2/32
   wg-quick save wg0
 fi
 
-cat > "${CLIENT_DIR}/iphone.conf" <<EOF
+cat > "${CLIENT_DIR}/desktop.conf" <<EOF
 [Interface]
 PrivateKey = ${CLIENT_PRIV}
 Address = 10.6.0.2/32
@@ -694,34 +793,25 @@ AllowedIPs = 0.0.0.0/0, ::/0
 Endpoint = ${ENDPOINT}
 PersistentKeepalive = 25
 EOF
-
-qrencode -t PNG -o /root/iphone.png < "${CLIENT_DIR}/iphone.conf"
 """
         client_script = (
             client_script.replace("{ip}", ip).replace("{LISTEN_PORT}", str(LISTEN_PORT))
         )
-        if not _run_remote_script(client, client_script, "生成客户端配置"):
+        if not _run_remote_script(client, client_script, "生成桌面端客户端配置"):
             return
-        log_success("   完成：生成客户端配置")
-
-        log_info("→ 校验二维码文件 /root/iphone.png …")
-        if not _run_remote_command(client, "test -f /root/iphone.png", "校验二维码文件"):
-            return
+        log_success("   完成：生成桌面端客户端配置")
 
         artifacts_dir = ARTIFACTS_DIR
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        qr_local = artifacts_dir / "iphone.png"
-        log_info(f"→ 下载至本地 {qr_local}")
-        if not _download_file(client, "/root/iphone.png", qr_local, "下载二维码图片"):
-            return
-
-        conf_local = artifacts_dir / "iphone.conf"
-        _download_file(
+        conf_local = artifacts_dir / "desktop.conf"
+        log_info(f"→ 下载至本地 {conf_local}")
+        if not _download_file(
             client,
-            "/etc/wireguard/clients/iphone/iphone.conf",
+            "/etc/wireguard/clients/desktop/desktop.conf",
             conf_local,
             "下载客户端配置",
-        )
+        ):
+            return
 
         try:
             with client.open_sftp() as sftp:
@@ -737,34 +827,86 @@ qrencode -t PNG -o /root/iphone.png < "${CLIENT_DIR}/iphone.conf"
             "ip": ip,
             "server_pub": server_pub,
             "client_config": str(conf_local),
-            "qr_code": str(qr_local),
+            "qr_code": "",
+            "platform": SELECTED_PLATFORM or "",
         }
-        (artifacts_dir / "server.json").write_text(
-            json.dumps(server_info, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _update_server_info(server_info)
 
-        log_success(f"✅ 已生成可扫码配置文件：{qr_local}")
+        if conf_local.exists():
+            log_success(f"✅ 已生成桌面端配置文件：{conf_local}")
+            _desktop_usage_tip()
+        else:
+            log_warning("⚠️ 未在本地找到配置文件，请确认下载是否成功。")
     finally:
         client.close()
 
 
+def generate_mobile_qr() -> None:
+    """Generate a QR code for importing the desktop config on mobile devices."""
+
+    log_section("📱 Step 4: 生成移动端二维码配置")
+    _log_selected_platform()
+
+    artifacts_dir = ARTIFACTS_DIR
+    conf_local = artifacts_dir / "desktop.conf"
+    if not conf_local.exists():
+        log_error("❌ 未找到桌面端配置文件，请先执行第 3 步生成配置。")
+        return
+
+    try:
+        config_text = conf_local.read_text(encoding="utf-8").strip()
+    except OSError as exc:  # noqa: BLE001
+        log_error(f"❌ 读取配置文件失败：{exc}")
+        return
+
+    if not config_text:
+        log_error("❌ 配置文件内容为空，无法生成二维码。")
+        return
+
+    try:
+        import qrcode  # type: ignore
+    except ImportError as exc:  # noqa: BLE001
+        log_error(f"❌ 未安装 qrcode 包：{exc}")
+        log_warning("⚠️ 请执行 `pip install qrcode[pil]` 后重试。")
+        return
+
+    qr_local = artifacts_dir / "desktop.png"
+    try:
+        qr_local.parent.mkdir(parents=True, exist_ok=True)
+        img = qrcode.make(config_text)
+        img.save(qr_local)
+    except Exception as exc:  # noqa: BLE001
+        log_error(f"❌ 生成二维码失败：{exc}")
+        return
+
+    _update_server_info({
+        "client_config": str(conf_local),
+        "qr_code": str(qr_local),
+    })
+
+    log_success(f"✅ 已生成二维码：{qr_local}")
+    log_info("→ 可使用手机 WireGuard 或其他支持 WireGuard 的客户端扫码导入。")
+
+
 def main() -> None:
     while True:
-        print("\n=== PrivateTunnel (Windows Only) ===")
-        print("1) 运行体检")
+        print("\n=== PrivateTunnel 桌面助手 ===")
+        print("1) 检查本机环境（Windows/macOS）")
         print("2) 创建 VPS（Vultr）")
-        print("3) 部署 WireGuard（到已创建 VPS）")
-        print("4) 执行项目精简（移除/归档非 Windows 代码与 CI）")
+        print("3) 准备本机接入 VPS 网络")
+        print("4) 生成移动端二维码配置")
+        print("5) 执行项目精简（移除/归档非 Windows 代码与 CI）")
         print("q) 退出")
         choice = input("请选择: ").strip().lower()
         if choice == "1":
-            run_doctor()
+            run_environment_check()
         elif choice == "2":
             create_vps()
         elif choice == "3":
-            deploy_wireguard()
+            prepare_wireguard_access()
         elif choice == "4":
+            generate_mobile_qr()
+        elif choice == "5":
             run_prune()
         elif choice == "q":
             break

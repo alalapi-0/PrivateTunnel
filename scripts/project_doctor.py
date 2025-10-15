@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+import argparse
+
 MIN_PYTHON = (3, 8)
 REQUIRED_PACKAGES = [
     "requests",
@@ -16,6 +18,11 @@ REQUIRED_PACKAGES = [
     "qrcode",
     "PySimpleGUI",
 ]
+
+PLATFORM_CHOICES = {
+    "windows": "Windows",
+    "macos": "macOS",
+}
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS_DIR = ROOT / "artifacts"
 REPORT_PATH = ROOT / "PROJECT_HEALTH_REPORT.md"
@@ -97,17 +104,28 @@ def ensure_artifacts_dir() -> CheckResult:
     return CheckResult("artifacts 目录", ok, message)
 
 
-def build_report(results: list[CheckResult], generated_at: datetime) -> str:
+def build_report(
+    results: list[CheckResult], generated_at: datetime, platform: str
+) -> str:
     status_summary = [
         f"- [{'✅' if r.ok else '❌'}] {r.name}：{r.message}" for r in results
     ]
     notes: list[str] = []
+    platform_label = PLATFORM_CHOICES.get(platform, platform)
+    notes.append(f"- 当前选择的本机系统：{platform_label}")
+    actual_platform = sys.platform
+    if platform == "windows" and os.name != "nt":
+        notes.append(
+            "- ⚠️ 检测到当前并非 Windows 系统，部分检查结果可能不准确。"
+        )
+    if platform == "macos" and actual_platform != "darwin":
+        notes.append("- ⚠️ 检测到当前并非 macOS 系统，部分检查结果可能不准确。")
     if LEGACY_DIR.exists():
         notes.append("- 项目已精简，跨平台与旧脚本已归档到 legacy/。")
     else:
         notes.append("- 暂未发现 legacy/ 目录。如已执行精简脚本，将在此处提示归档信息。")
     report_lines = [
-        "# 项目体检报告（Windows 本地一键版）",
+        f"# 项目体检报告（{platform_label} 本地一键版）",
         f"_Generated at: {generated_at.isoformat().replace("+00:00", "Z")}_",
         "",
         "## 检查结果",
@@ -119,9 +137,40 @@ def build_report(results: list[CheckResult], generated_at: datetime) -> str:
     return "\n".join(report_lines) + "\n"
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="PrivateTunnel 环境体检")
+    parser.add_argument(
+        "--platform",
+        choices=sorted(PLATFORM_CHOICES),
+        default="windows",
+        help="指定本机系统类型。",
+    )
+    return parser.parse_args()
+
+
+def check_selected_platform(platform: str) -> CheckResult:
+    label = PLATFORM_CHOICES.get(platform, platform)
+    current = sys.platform
+    if platform == "windows":
+        ok = os.name == "nt"
+    elif platform == "macos":
+        ok = current == "darwin"
+    else:
+        ok = False
+    if ok:
+        message = f"检测到平台：{label}"
+    else:
+        actual = PLATFORM_CHOICES.get("macos" if current == "darwin" else "windows", current)
+        message = f"当前平台为：{actual}"
+    return CheckResult("操作系统", ok, message)
+
+
 def main() -> int:
+    args = parse_args()
+    platform = args.platform
     generated_at = datetime.now(timezone.utc)
     results = [
+        check_selected_platform(platform),
         check_python_version(),
         check_pip(),
         check_packages(REQUIRED_PACKAGES),
@@ -129,7 +178,7 @@ def main() -> int:
         ensure_artifacts_dir(),
     ]
 
-    report_content = build_report(results, generated_at)
+    report_content = build_report(results, generated_at, platform)
     REPORT_PATH.write_text(report_content, encoding="utf-8")
     print(report_content)
     print(f"[doctor] 报告已生成：{REPORT_PATH.relative_to(ROOT)}")
