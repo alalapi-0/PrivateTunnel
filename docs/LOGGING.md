@@ -51,9 +51,13 @@ Event codes follow the `EVT_*`, `ERR_*`, or `SEC_*` naming used in
 | IPv4 Addresses           | Mask first two octets `***.***.X.Y`           |
 | File Paths               | Only the filename retained                    |
 
-Rules are implemented in both Swift (`Security/Redactor.swift` and
-`Diagnostics/DiagnosticsRedactor.swift`) and Python (`server/security/redact.py`).
-Unit tests live alongside each implementation.
+Rules are implemented in Swift (`Security/Redactor.swift` and
+`Diagnostics/DiagnosticsRedactor.swift`).
+
+The legacy Python helper that previously lived under `legacy/server/security/`
+has been removed to avoid shipping an embedded interpreter copy. For CLI
+workflows, port the Swift rules to your own tooling or rely on a locally
+installed Python utility instead of a bundled script.
 
 ## Optional Upload Placeholder
 
