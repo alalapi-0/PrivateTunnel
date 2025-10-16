@@ -171,23 +171,15 @@ def create_instance(
         "label": label,
     }
     if sshkey_ids:
-        payload["sshkey_id"] = sshkey_ids
+        unique_ids = list(dict.fromkeys(sshkey_ids))
+        payload["sshkey_ids"] = unique_ids
+        payload["sshkey_id"] = unique_ids
     if snapshot_id:
         payload["snapshot_id"] = snapshot_id
     else:
         payload["os_id"] = UBUNTU_22_04_OSID
 
-    try:
-        resp = _request("POST", "/instances", api_key, json=payload)
-    except VultrAPIError as exc:
-        message = str(exc)
-        if "sshkey_id" in message and "invalid" in message.lower():
-            payload.pop("sshkey_id", None)
-            if sshkey_ids:
-                payload["sshkey_ids"] = sshkey_ids
-            resp = _request("POST", "/instances", api_key, json=payload)
-        else:
-            raise
+    resp = _request("POST", "/instances", api_key, json=payload)
     data = resp.json().get("instance", {})
     if not data.get("id"):
         raise VultrAPIError(f"创建实例响应异常：{json.dumps(resp.json(), ensure_ascii=False)}")
@@ -206,7 +198,9 @@ def reinstall_instance(
 
     payload: Dict[str, Any] = {}
     if sshkey_ids:
-        payload["sshkey_ids"] = list(dict.fromkeys(sshkey_ids))
+        unique_ids = list(dict.fromkeys(sshkey_ids))
+        payload["sshkey_ids"] = unique_ids
+        payload["sshkey_id"] = unique_ids
     if user_data:
         payload["user_data"] = user_data
     _request("POST", f"/instances/{instance_id}/reinstall", api_key, json=payload)
