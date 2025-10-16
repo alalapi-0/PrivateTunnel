@@ -9,6 +9,8 @@ import time
 import shlex
 import shutil
 import textwrap
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,34 +48,83 @@ PLATFORM_CHOICES = {
 SELECTED_PLATFORM: str | None = None
 
 
+@dataclass
+class SSHResult:
+    """Result of a remote SSH command execution."""
+
+    returncode: int
+    stdout: str
+    stderr: str
+    backend: str
+
+
+@dataclass
+class SSHContext:
+    """Connection parameters for remote SSH execution."""
+
+    hostname: str
+    key_path: Path
+
+
+class DeploymentError(RuntimeError):
+    """Raised when the automated WireGuard deployment fails."""
+
+
+LOG_FILE: Path | None = None
+SSH_CTX: SSHContext | None = None
+_PARAMIKO_CLIENT: paramiko.SSHClient | None = None
+
+
 def _colorize(message: str, color: str) -> str:
     """Return ``message`` wrapped in ANSI color codes."""
 
     return f"{color}{message}{RESET}"
 
 
+def _log_to_file(message: str) -> None:
+    """Append ``message`` to the deploy log if enabled."""
+
+    if LOG_FILE is None:
+        return
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(f"{message}\n")
+    except OSError:
+        # Logging must never block deployment.
+        pass
+
+
+def logwrite(message: str, *, color: str | None = None) -> None:
+    """Print ``message`` (optionally colorized) and persist to the log file."""
+
+    text = _colorize(message, color) if color else message
+    print(text)
+    _log_to_file(message)
+
+
 def log_info(message: str) -> None:
     """Print an informational message in blue."""
 
-    print(_colorize(message, BLUE))
+    logwrite(message, color=BLUE)
 
 
 def log_success(message: str) -> None:
     """Print a success message in green."""
 
-    print(_colorize(message, GREEN))
+    logwrite(message, color=GREEN)
 
 
 def log_warning(message: str) -> None:
     """Print a warning message in yellow."""
 
-    print(_colorize(message, YELLOW))
+    logwrite(message, color=YELLOW)
 
 
 def log_error(message: str) -> None:
     """Print an error message in red."""
 
-    print(_colorize(message, RED))
+    logwrite(message, color=RED)
 
 
 def log_section(title: str) -> None:
@@ -203,6 +254,471 @@ def _run_remote_command(
     return True
 
 
+def _init_deploy_log() -> Path:
+    """Create a timestamped deployment log inside ``artifacts``."""
+
+    global LOG_FILE
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = ARTIFACTS_DIR / f"deploy-{timestamp}.log"
+    LOG_FILE = log_path
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write(f"# PrivateTunnel Step3 log {timestamp}\n")
+    except OSError:
+        # Even if writing fails, keep the path so subsequent logs still attempt writes.
+        pass
+    return log_path
+
+
+def _set_ssh_context(hostname: str, key_path: Path) -> None:
+    """Record the SSH connection context for subsequent helper calls."""
+
+    global SSH_CTX
+    _close_paramiko_client()
+    SSH_CTX = SSHContext(hostname=hostname, key_path=key_path)
+
+
+def _require_ssh_context() -> SSHContext:
+    """Return the active SSH context or raise an internal error."""
+
+    if SSH_CTX is None:
+        raise DeploymentError("内部错误：SSH 上下文未初始化。")
+    return SSH_CTX
+
+
+def _close_paramiko_client() -> None:
+    """Close and reset the cached Paramiko client if it exists."""
+
+    global _PARAMIKO_CLIENT
+    if _PARAMIKO_CLIENT is not None:
+        try:
+            _PARAMIKO_CLIENT.close()
+        except Exception:  # noqa: BLE001 - best effort cleanup
+            pass
+        _PARAMIKO_CLIENT = None
+
+
+def _load_paramiko_pkey(path: Path) -> paramiko.PKey:
+    """Load an SSH private key compatible with Paramiko."""
+
+    errors: list[str] = []
+    try:
+        return paramiko.Ed25519Key.from_private_key_file(str(path))
+    except Exception as exc:  # noqa: BLE001 - collect and retry with other key types
+        errors.append(f"Ed25519: {exc}")
+    try:
+        return paramiko.RSAKey.from_private_key_file(str(path))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"RSA: {exc}")
+    try:
+        return paramiko.ECDSAKey.from_private_key_file(str(path))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"ECDSA: {exc}")
+    raise DeploymentError(f"无法解析私钥 {path}: {'; '.join(errors)}")
+
+
+def _ensure_paramiko_client() -> paramiko.SSHClient:
+    """Return a connected Paramiko SSH client, creating one if necessary."""
+
+    global _PARAMIKO_CLIENT
+    if _PARAMIKO_CLIENT is not None:
+        return _PARAMIKO_CLIENT
+
+    ctx = _require_ssh_context()
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    pkey = _load_paramiko_pkey(ctx.key_path)
+    try:
+        client.connect(
+            hostname=ctx.hostname,
+            username="root",
+            pkey=pkey,
+            look_for_keys=False,
+            timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise DeploymentError(f"Paramiko 连接 {ctx.hostname} 失败：{exc}") from exc
+
+    _PARAMIKO_CLIENT = client
+    return client
+
+
+def _log_remote_output(prefix: str, text: str) -> None:
+    """Log remote stdout/stderr content line-by-line."""
+
+    if not text:
+        return
+    for line in text.splitlines():
+        logwrite(f"{prefix}{line}")
+
+
+def _clean_known_host(ip: str) -> None:
+    """Remove stale host key fingerprints for ``ip`` prior to SSH attempts."""
+
+    log_info(f"→ 将清理 known_hosts 旧指纹（{ip}）…")
+    ssh_keygen = shutil.which("ssh-keygen")
+    targets = (ip, f"[{ip}]:22")
+    if ssh_keygen:
+        for target in targets:
+            try:
+                result = subprocess.run(
+                    [ssh_keygen, "-R", target],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                log_warning(f"⚠️ 清理 {target} 指纹失败：{exc}")
+                continue
+            _log_remote_output("[ssh-keygen] ", result.stdout)
+            _log_remote_output("[ssh-keygen] ", result.stderr)
+    else:
+        log_warning("⚠️ 未检测到 ssh-keygen，改用内置清理逻辑。")
+
+    try:
+        nuke_known_host(ip)
+    except Exception:  # noqa: BLE001 - best effort cleanup
+        pass
+
+
+def _ssh_run(command: str, *, timeout: int = 900, description: str | None = None) -> SSHResult:
+    """Execute ``command`` on the remote host via OpenSSH with Paramiko fallback."""
+
+    ctx = _require_ssh_context()
+    ssh_executable = shutil.which("ssh")
+    ssh_cmd = [
+        ssh_executable or "ssh",
+        "-i",
+        str(ctx.key_path),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"root@{ctx.hostname}",
+        command,
+    ]
+
+    if ssh_executable:
+        logwrite(f"$ {' '.join(ssh_cmd)}")
+        try:
+            completed = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise DeploymentError(f"远端命令超时：{description or command}") from exc
+        except OSError as exc:
+            log_warning(f"⚠️ 调用 OpenSSH 失败：{exc}，将尝试 Paramiko 回退。")
+        else:
+            _log_remote_output("[stdout] ", completed.stdout)
+            _log_remote_output("[stderr] ", completed.stderr)
+            if completed.returncode != 0:
+                details = completed.stderr.strip() or completed.stdout.strip() or f"退出码 {completed.returncode}"
+                raise DeploymentError(
+                    f"远端命令失败（{description or command}）：{details}"
+                )
+            return SSHResult(
+                returncode=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                backend="openssh",
+            )
+
+    client = _ensure_paramiko_client()
+    logwrite(f"(paramiko) $ {command}")
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        raise DeploymentError(f"Paramiko 执行命令失败：{exc}") from exc
+
+    try:
+        exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output=False)
+    finally:
+        try:
+            stdin.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    _log_remote_output("[stdout] ", stdout_data)
+    _log_remote_output("[stderr] ", stderr_data)
+    if exit_code != 0:
+        details = stderr_data.strip() or stdout_data.strip() or f"退出码 {exit_code}"
+        raise DeploymentError(f"远端命令失败（{description or command}）：{details}")
+
+    return SSHResult(returncode=exit_code, stdout=stdout_data, stderr=stderr_data, backend="paramiko")
+
+
+def _download_with_scp(remote_path: str, local_path: Path, *, timeout: int = 300) -> bool:
+    """Download ``remote_path`` via ``scp`` if available."""
+
+    ctx = _require_ssh_context()
+    scp_executable = shutil.which("scp")
+    if scp_executable is None:
+        log_warning("⚠️ 未检测到 scp，可使用 Paramiko SFTP 回退。")
+        return False
+
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    scp_cmd = [
+        scp_executable,
+        "-i",
+        str(ctx.key_path),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"root@{ctx.hostname}:{remote_path}",
+        str(local_path),
+    ]
+    logwrite(f"$ {' '.join(scp_cmd)}")
+    try:
+        result = subprocess.run(
+            scp_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log_warning(f"⚠️ scp 传输超时：{remote_path}")
+        return False
+    except OSError as exc:
+        log_warning(f"⚠️ 无法执行 scp：{exc}")
+        return False
+
+    _log_remote_output("[scp stdout] ", result.stdout)
+    _log_remote_output("[scp stderr] ", result.stderr)
+    if result.returncode != 0:
+        log_warning(f"⚠️ scp 返回码 {result.returncode}：{remote_path}")
+        return False
+    return True
+
+
+def _download_with_paramiko(remote_path: str, local_path: Path) -> None:
+    """Download ``remote_path`` using Paramiko SFTP."""
+
+    client = _ensure_paramiko_client()
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with client.open_sftp() as sftp:
+            sftp.get(remote_path, str(local_path))
+    except Exception as exc:  # noqa: BLE001
+        raise DeploymentError(f"SFTP 下载 {remote_path} 失败：{exc}") from exc
+
+
+def _download_artifact(remote_path: str, local_path: Path) -> None:
+    """Download an artifact via scp with Paramiko fallback."""
+
+    if _download_with_scp(remote_path, local_path):
+        return
+    log_warning("⚠️ scp 下载失败，改用 Paramiko SFTP。")
+    _download_with_paramiko(remote_path, local_path)
+
+
+def deploy_wireguard_remote_script(
+    listen_port: int,
+    desktop_ip: str,
+    iphone_ip: str,
+    server_ip: str,
+    dns_servers: str,
+    allowed_ips: str,
+    desktop_mtu: str,
+) -> str:
+    """Return the shell script that configures WireGuard end-to-end on the server."""
+
+    return textwrap.dedent(
+        f"""
+        cat <<'EOS' >/tmp/privatetunnel-wireguard.sh
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        log() {{
+          printf '[%s] %s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+        }}
+
+        warn() {{
+          printf '[%s] ⚠️ %s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+        }}
+
+        err() {{
+          printf '[%s] ❌ %s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
+        }}
+
+        export DEBIAN_FRONTEND=noninteractive
+
+        WG_PORT={listen_port}
+        WG_DIR=/etc/wireguard
+        SERVER_CONF="$WG_DIR/wg0.conf"
+        SERVER_PRIV="$WG_DIR/server.private"
+        SERVER_PUB="$WG_DIR/server.public"
+        CLIENT_BASE="$WG_DIR/clients"
+        DESKTOP_DIR="$CLIENT_BASE/desktop"
+        IPHONE_DIR="$CLIENT_BASE/iphone"
+        DESKTOP_IP="{desktop_ip}"
+        IPHONE_IP="{iphone_ip}"
+        DNS_SERVERS="{dns_servers}"
+        ALLOWED_IPS="{allowed_ips}"
+        DESKTOP_MTU="{desktop_mtu}"
+        SERVER_FALLBACK_IP="{server_ip}"
+
+        log "安装 WireGuard 组件"
+        apt-get update -y
+        apt-get install -y wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
+
+        log "开启 IPv4/IPv6 转发并持久化"
+        sysctl -w net.ipv4.ip_forward=1
+        sysctl -w net.ipv6.conf.all.forwarding=1
+        echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wireguard-forward.conf
+        echo 'net.ipv6.conf.all.forwarding=1' > /etc/sysctl.d/99-wireguard-forward6.conf
+        sysctl --system
+
+        WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
+        if [ -z "${{WAN_IF:-}}" ]; then
+          err "ERROR: Failed to detect WAN interface"
+          exit 1
+        fi
+        log "检测到默认路由接口: $WAN_IF"
+
+        log "刷新并写入 NAT/FORWARD 规则"
+        iptables -t nat -D POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \\
+        iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
+        iptables -D FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null || \\
+        iptables -A FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT
+        iptables -D FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \\
+        iptables -A FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+        if command -v ufw >/dev/null 2>&1; then
+          if ufw status | grep -qi "Status: active"; then
+            ufw route allow in on wg0 out on "$WAN_IF" || true
+            ufw route allow in on "$WAN_IF" out on wg0 || true
+          fi
+        fi
+
+        netfilter-persistent save || true
+        netfilter-persistent reload || true
+
+        umask 077
+        mkdir -p "$CLIENT_BASE" "$DESKTOP_DIR" "$IPHONE_DIR"
+        chmod 700 "$CLIENT_BASE" "$DESKTOP_DIR" "$IPHONE_DIR"
+
+        if [ ! -f "$SERVER_PRIV" ]; then
+          log "生成服务器密钥对"
+          wg genkey | tee "$SERVER_PRIV" | wg pubkey > "$SERVER_PUB"
+        fi
+        SERVER_PRIVATE=$(cat "$SERVER_PRIV")
+        SERVER_PUBLIC=$(cat "$SERVER_PUB")
+
+        cat >"$SERVER_CONF" <<CFG
+[Interface]
+Address = 10.6.0.1/24
+ListenPort = $WG_PORT
+PrivateKey = $SERVER_PRIVATE
+SaveConfig = true
+CFG
+        chmod 600 "$SERVER_CONF"
+
+        systemctl enable wg-quick@wg0
+        systemctl restart wg-quick@wg0
+
+        ss -lun | grep -q ":$WG_PORT" || {{
+          err "ERROR: UDP {listen_port} not listening"
+          systemctl status wg-quick@wg0 --no-pager -l || true
+          exit 1
+        }}
+
+        SERVER_PUB=$(wg show wg0 public-key)
+        SERVER_ENDPOINT_IP=$(curl -4 -s ifconfig.me || true)
+        if [ -z "$SERVER_ENDPOINT_IP" ]; then
+          SERVER_ENDPOINT_IP=$(ip -o -4 addr show dev "$WAN_IF" | awk '{{print $4}}' | cut -d/ -f1 | head -n1)
+        fi
+        ENDPOINT="${{SERVER_ENDPOINT_IP:-$SERVER_FALLBACK_IP}}:$WG_PORT"
+
+        ensure_client_keys() {{
+          local name="$1"
+          local dir="$2"
+          local priv_file="$dir/${{name}}_private.key"
+          local pub_file="$dir/${{name}}_public.key"
+          if [ ! -f "$priv_file" ]; then
+            wg genkey | tee "$priv_file" | wg pubkey > "$pub_file"
+          else
+            cat "$priv_file" | wg pubkey > "$pub_file"
+          fi
+          chmod 600 "$priv_file"
+          chmod 600 "$pub_file"
+        }}
+
+        ensure_client_keys "desktop" "$DESKTOP_DIR"
+        ensure_client_keys "iphone" "$IPHONE_DIR"
+
+        DESKTOP_PRIV=$(cat "$DESKTOP_DIR/desktop_private.key")
+        DESKTOP_PUB=$(cat "$DESKTOP_DIR/desktop_public.key")
+        cat >"$DESKTOP_DIR/desktop.conf" <<CFG
+[Interface]
+PrivateKey = $DESKTOP_PRIV
+Address = $DESKTOP_IP
+DNS = $DNS_SERVERS
+CFG
+        if [ -n "$DESKTOP_MTU" ]; then
+          printf 'MTU = %s\n' "$DESKTOP_MTU" >>"$DESKTOP_DIR/desktop.conf"
+        fi
+        cat >>"$DESKTOP_DIR/desktop.conf" <<CFG
+
+[Peer]
+PublicKey = $SERVER_PUB
+AllowedIPs = $ALLOWED_IPS
+Endpoint = $ENDPOINT
+PersistentKeepalive = 25
+CFG
+        chmod 600 "$DESKTOP_DIR/desktop.conf"
+
+        IPHONE_PRIV=$(cat "$IPHONE_DIR/iphone_private.key")
+        IPHONE_PUB=$(cat "$IPHONE_DIR/iphone_public.key")
+        cat >"$IPHONE_DIR/iphone.conf" <<CFG
+[Interface]
+PrivateKey = $IPHONE_PRIV
+Address = $IPHONE_IP
+DNS = $DNS_SERVERS
+
+[Peer]
+PublicKey = $SERVER_PUB
+AllowedIPs = $ALLOWED_IPS
+Endpoint = $ENDPOINT
+PersistentKeepalive = 25
+CFG
+        chmod 600 "$IPHONE_DIR/iphone.conf"
+
+        wg set wg0 peer "$DESKTOP_PUB" remove 2>/dev/null || true
+        wg set wg0 peer "$DESKTOP_PUB" allowed-ips "$DESKTOP_IP"
+        wg set wg0 peer "$IPHONE_PUB" remove 2>/dev/null || true
+        wg set wg0 peer "$IPHONE_PUB" allowed-ips "$IPHONE_IP"
+
+        wg-quick save wg0
+        systemctl restart wg-quick@wg0
+
+        qrencode -o "$IPHONE_DIR/iphone.png" -s 8 -m 2 <"$IPHONE_DIR/iphone.conf"
+
+        log "[OK] Server-side WireGuard fully configured."
+        cat <<SUMMARY
+SERVER_PUBLIC_KEY=$SERVER_PUB
+DESKTOP_PUBLIC_KEY=$DESKTOP_PUB
+IPHONE_PUBLIC_KEY=$IPHONE_PUB
+ENDPOINT=$ENDPOINT
+WAN_IF=$WAN_IF
+SUMMARY
+        EOS
+        chmod +x /tmp/privatetunnel-wireguard.sh
+        bash /tmp/privatetunnel-wireguard.sh
+        rm -f /tmp/privatetunnel-wireguard.sh
+        """
+    )
+
+
 def _wait_for_port_22(ip: str, *, attempts: int = 10, interval: int = 5) -> bool:
     """Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``attempts`` exhausted."""
 
@@ -277,24 +793,6 @@ def _print_manual_ssh_hint() -> None:
     log_warning("  chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys")
     log_warning("  systemctl restart ssh")
     log_warning("然后重新运行部署。")
-
-
-def _download_file(
-    client: paramiko.SSHClient,
-    remote_path: str,
-    local_path: Path,
-    description: str,
-) -> bool:
-    """Download ``remote_path`` to ``local_path`` using Paramiko SFTP."""
-
-    try:
-        with client.open_sftp() as sftp:
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            sftp.get(remote_path, str(local_path))
-    except Exception as exc:  # noqa: BLE001
-        log_error(f"❌ {description}失败：{exc}")
-        return False
-    return True
 
 
 def create_vps() -> None:
@@ -758,6 +1256,7 @@ def _default_private_key_prompt() -> str:
     return pick_default_key()
 
 
+
 def prepare_wireguard_access() -> None:
     """Configure WireGuard end-to-end, including client provisioning."""
 
@@ -783,6 +1282,10 @@ def prepare_wireguard_access() -> None:
 
     log_section("🛡 Step 3: 准备本机接入 VPS 网络")
     _log_selected_platform()
+
+    deploy_log_path = _init_deploy_log()
+    log_info(f"→ 本次部署日志：{deploy_log_path}")
+
     log_info(f"→ 目标实例：{ip}")
     if LISTEN_PORT_SOURCE:
         log_info(f"→ WireGuard 监听端口：{LISTEN_PORT} （来自环境变量 {LISTEN_PORT_SOURCE}）")
@@ -807,7 +1310,7 @@ def prepare_wireguard_access() -> None:
             "→ iPhone 客户端 IP：{value} （默认值，可通过环境变量 PT_IPHONE_IP 覆盖）".format(value=iphone_ip)
         )
 
-    dns_value, dns_source = _resolve_env_default("PT_DNS", default="1.1.1.1")
+    dns_value, dns_source = _resolve_env_default("PT_DNS", default="1.1.1.1, 8.8.8.8")
     if dns_source:
         log_info(f"→ 客户端 DNS：{dns_value} （来自环境变量 {dns_source}）")
     else:
@@ -827,364 +1330,131 @@ def prepare_wireguard_access() -> None:
 
     client_mtu_raw = os.environ.get("PT_CLIENT_MTU", "").strip()
     if client_mtu_raw:
-        log_info(f"→ 客户端 MTU：{client_mtu_raw} （来自环境变量 PT_CLIENT_MTU）")
+        desktop_mtu = client_mtu_raw
+        log_info(f"→ 客户端 MTU：{desktop_mtu} （来自环境变量 PT_CLIENT_MTU）")
     else:
-        log_info("→ 客户端 MTU：未设置（可通过环境变量 PT_CLIENT_MTU 指定）")
+        desktop_mtu = "1280"
+        log_info("→ 客户端 MTU：1280（默认值，可通过环境变量 PT_CLIENT_MTU 覆盖）")
 
     default_key_prompt = _default_private_key_prompt()
     key_path = Path(ask_key_path(default_key_prompt)).expanduser()
     log_info(f"→ 使用私钥：{key_path}")
 
-    log_info("→ 执行 ssh-keygen -R 清理旧指纹…")
-    subprocess.run(["ssh-keygen", "-R", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最多 10 次）…")
-    if not _wait_for_port_22(ip):
-        _print_manual_ssh_hint()
-        return
-
-    log_info("→ 第二阶段：校验免密 SSH 是否可用…")
-    if not _wait_for_passwordless_ssh(ip, key_path):
-        _print_manual_ssh_hint()
-        return
-
-    log_success("✅ 公钥认证已生效。")
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    nuke_known_host(ip)
     try:
-        client.connect(
-            hostname=ip,
-            username="root",
-            key_filename=str(key_path),
-            look_for_keys=False,
-            timeout=30,
+        _clean_known_host(ip)
+    except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+        log_warning(f"⚠️ 清理 known_hosts 时出现问题：{exc}")
+
+    try:
+        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最多 10 次）…")
+        if not _wait_for_port_22(ip):
+            _print_manual_ssh_hint()
+            raise DeploymentError("未检测到 VPS SSH 端口开放。")
+
+        log_info("→ 第二阶段：校验免密 SSH 是否可用…")
+        if not _wait_for_passwordless_ssh(ip, key_path):
+            _print_manual_ssh_hint()
+            raise DeploymentError("免密 SSH 校验失败，请确认公钥已写入 VPS。")
+
+        log_success("✅ 公钥认证已生效。")
+
+        _set_ssh_context(ip, key_path)
+        remote_script = deploy_wireguard_remote_script(
+            LISTEN_PORT,
+            desktop_ip,
+            iphone_ip,
+            ip,
+            dns_value,
+            allowed_ips,
+            desktop_mtu,
         )
-    except Exception as exc:  # noqa: BLE001
-        log_error("❌ 连接 VPS 失败，请检查私钥路径或网络。")
-        log_warning(f"⚠️ 详细信息：{exc}")
-        return
+        command = f"bash -lc {shlex.quote(remote_script)}"
+        result = _ssh_run(command, timeout=1800, description="部署 WireGuard 服务端")
 
-    server_endpoint = f"{ip}:{LISTEN_PORT}"
-    desktop_ip_quoted = shlex.quote(desktop_ip)
-    iphone_ip_quoted = shlex.quote(iphone_ip)
-    dns_quoted = shlex.quote(dns_value)
-    allowed_ips_quoted = shlex.quote(allowed_ips)
-    client_mtu_quoted = shlex.quote(client_mtu_raw) if client_mtu_raw else "''"
-    server_endpoint_quoted = shlex.quote(server_endpoint)
+        summary: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            prefixes = ("SERVER_", "DESKTOP_", "IPHONE_", "ENDPOINT=", "WAN_IF=")
+            if any(line.startswith(prefix) for prefix in prefixes):
+                key, _, value = line.partition("=")
+                summary[key] = value.strip()
 
-    remote_script = textwrap.dedent(
-        f"""#!/usr/bin/env bash
-set -euo pipefail
+        server_pub = summary.get("SERVER_PUBLIC_KEY", "")
+        desktop_pub = summary.get("DESKTOP_PUBLIC_KEY", "")
+        iphone_pub = summary.get("IPHONE_PUBLIC_KEY", "")
+        endpoint = summary.get("ENDPOINT", f"{ip}:{LISTEN_PORT}")
+        wan_if = summary.get("WAN_IF", "")
 
-log() {{
-  printf '%s %s\\n' "[$(date '+%Y-%m-%d %H:%M:%S')]" "$*"
-}}
+        log_success("✅ 远端 WireGuard 已成功部署并完成 NAT/转发配置。")
+        if wan_if:
+            log_info(f"→ 外网接口：{wan_if}")
 
-warn() {{
-  printf '%s %s\\n' "[$(date '+%Y-%m-%d %H:%M:%S')]" "⚠️ $*" >&2
-}}
-
-err() {{
-  printf '%s %s\\n' "[$(date '+%Y-%m-%d %H:%M:%S')]" "❌ $*" >&2
-}}
-
-log "=== PrivateTunnel: 开始自动化部署 WireGuard 服务端 ==="
-
-WG_PORT={LISTEN_PORT}
-DESKTOP_IP={desktop_ip_quoted}
-IPHONE_IP={iphone_ip_quoted}
-CLIENT_DNS={dns_quoted}
-ALLOWED_IPS={allowed_ips_quoted}
-CLIENT_MTU={client_mtu_quoted}
-SERVER_ENDPOINT={server_endpoint_quoted}
-WG_DIR=/etc/wireguard
-SERVER_CONF="$WG_DIR/wg0.conf"
-SERVER_PRIV="$WG_DIR/server.private"
-SERVER_PUB="$WG_DIR/server.public"
-CLIENT_BASE="$WG_DIR/clients"
-DESKTOP_DIR="$CLIENT_BASE/desktop"
-IPHONE_DIR="$CLIENT_BASE/iphone"
-
-log "→ 准备环境并安装 WireGuard 组件"
-export DEBIAN_FRONTEND=noninteractive
-apt update -y
-apt install -y wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
-
-log "→ 启用时间同步 (timedatectl set-ntp true)"
-if ! timedatectl set-ntp true; then
-  warn "timedatectl set-ntp true 失败，但仍继续执行。"
-fi
-
-WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
-if [ -z "$WAN_IF" ]; then
-  WAN_IF=enp1s0
-fi
-
-log "→ 开启内核转发"
-echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard-forward.conf
-sysctl -p /etc/sysctl.d/99-wireguard-forward.conf
-if [ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]; then
-  err "未成功开启 IPv4 转发。"
-  exit 1
-fi
-
-log "→ 配置 NAT 出口规则 (接口: $WAN_IF)"
-iptables -t nat -D POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE || true
-iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
-if ! iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null; then
-  err "未检测到 MASQUERADE 规则，请检查 iptables 配置。"
-  exit 1
-fi
-netfilter-persistent save || true
-netfilter-persistent reload || true
-
-if command -v ufw >/dev/null 2>&1; then
-  log "→ 通过 UFW 放行 ${{WG_PORT}}/udp"
-  ufw allow {LISTEN_PORT}/udp || true
-fi
-
-log "→ 创建 WireGuard 配置及密钥"
-umask 077
-mkdir -p "$WG_DIR" "$CLIENT_BASE" "$DESKTOP_DIR" "$IPHONE_DIR"
-chmod 700 "$CLIENT_BASE" "$DESKTOP_DIR" "$IPHONE_DIR"
-
-if [ ! -f "$SERVER_PRIV" ]; then
-  log "   生成服务器密钥对"
-  wg genkey | tee "$SERVER_PRIV" | wg pubkey > "$SERVER_PUB"
-fi
-SERVER_PRIVATE=$(cat "$SERVER_PRIV")
-SERVER_PUBLIC=$(cat "$SERVER_PUB")
-
-cat > "$SERVER_CONF" <<EOF
-[Interface]
-Address = 10.6.0.1/24
-ListenPort = $WG_PORT
-PrivateKey = $SERVER_PRIVATE
-SaveConfig = true
-EOF
-chmod 600 "$SERVER_CONF"
-
-log "→ 启用并启动 wg-quick@wg0"
-systemctl enable wg-quick@wg0
-systemctl restart wg-quick@wg0
-
-log "→ 校验 WireGuard UDP 监听端口"
-if ! ss -lun | grep -q ":$WG_PORT"; then
-  err "UDP 端口 $WG_PORT 未监听，请检查防火墙或服务状态。"
-  exit 1
-fi
-
-log "→ 当前 wg show 状态"
-wg show
-
-generate_client() {{
-  local name="$1"
-  local addr="$2"
-  local dir="$3"
-  local __pub_var="$4"
-  log "→ 生成客户端 ${{name}} (IP: ${{addr}})"
-  if [ -f "$dir/${{name}}.public" ]; then
-    local old_pub
-    old_pub=$(cat "$dir/${{name}}.public")
-    if [ -n "$old_pub" ]; then
-      wg set wg0 peer "$old_pub" remove || true
-    fi
-  fi
-  wg genkey | tee "$dir/${{name}}.private" | wg pubkey > "$dir/${{name}}.public"
-  local priv
-  priv=$(cat "$dir/${{name}}.private")
-  local pub
-  pub=$(cat "$dir/${{name}}.public")
-  chmod 600 "$dir/${{name}}.private"
-  wg set wg0 peer "$pub" remove || true
-  wg set wg0 peer "$pub" allowed-ips "$addr"
-  {{
-    printf '%s\\n' '[Interface]'
-    printf 'PrivateKey = %s\\n' "$priv"
-    printf 'Address = %s\\n' "$addr"
-    printf 'DNS = %s\\n' "$CLIENT_DNS"
-    if [ -n "$CLIENT_MTU" ]; then
-      printf 'MTU = %s\\n' "$CLIENT_MTU"
-    fi
-    printf '\n[Peer]\\n'
-    printf 'PublicKey = %s\\n' "$SERVER_PUBLIC"
-    printf 'AllowedIPs = %s\\n' "$ALLOWED_IPS"
-    printf 'Endpoint = %s\\n' "$SERVER_ENDPOINT"
-    printf 'PersistentKeepalive = 25\\n'
-  }} > "$dir/${{name}}.conf"
-  chmod 600 "$dir/${{name}}.conf"
-  printf -v "$__pub_var" '%s' "$pub"
-}}
-
-DESKTOP_PUBLIC=""
-IPHONE_PUBLIC=""
-generate_client "desktop" "$DESKTOP_IP" "$DESKTOP_DIR" DESKTOP_PUBLIC
-generate_client "iphone" "$IPHONE_IP" "$IPHONE_DIR" IPHONE_PUBLIC
-
-log "→ 保存配置并重启 WireGuard"
-wg-quick save wg0
-systemctl restart wg-quick@wg0
-
-log "→ 再次检查 wg show peers"
-WG_OUTPUT=$(wg show)
-if ! grep -q "$DESKTOP_PUBLIC" <<<"$WG_OUTPUT"; then
-  err "未检测到 desktop peer 已加载。"
-  printf '%s\n' "$WG_OUTPUT"
-  exit 1
-fi
-if ! grep -q "$IPHONE_PUBLIC" <<<"$WG_OUTPUT"; then
-  err "未检测到 iphone peer 已加载。"
-  printf '%s\n' "$WG_OUTPUT"
-  exit 1
-fi
-printf '%s\n' "$WG_OUTPUT"
-
-SERVER_EXTERNAL_IP=$(curl -4 -s ifconfig.me || true)
-if [ -z "$SERVER_EXTERNAL_IP" ]; then
-  SERVER_EXTERNAL_IP={shlex.quote(ip)}
-fi
-
-log "→ WireGuard 服务端部署完成"
-echo "SERVER_ENDPOINT=$SERVER_ENDPOINT"
-echo "SERVER_EXTERNAL_IP=$SERVER_EXTERNAL_IP"
-echo "SERVER_PUBLIC_KEY=$SERVER_PUBLIC"
-echo "DESKTOP_IP=$DESKTOP_IP"
-echo "DESKTOP_PUBLIC_KEY=$DESKTOP_PUBLIC"
-echo "IPHONE_IP=$IPHONE_IP"
-echo "IPHONE_PUBLIC_KEY=$IPHONE_PUBLIC"
-"""
-    )
-
-    try:
-        log_info("→ SSH 已连接，开始执行一键部署脚本…")
-        if not _run_remote_script(client, remote_script, "部署 WireGuard 服务端"):
-            return
-        log_success("✅ 远端 WireGuard 已部署并登记 desktop / iphone 客户端。")
-    finally:
-        client.close()
-
-    log_info("→ 再次执行 ssh-keygen -R 清理指纹…")
-    subprocess.run(["ssh-keygen", "-R", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # 重新建立连接以下载文件
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    nuke_known_host(ip)
-    try:
-        client.connect(
-            hostname=ip,
-            username="root",
-            key_filename=str(key_path),
-            look_for_keys=False,
-            timeout=30,
-        )
-    except Exception as exc:  # noqa: BLE001
-        log_error("❌ 重新连接 VPS 以下载配置失败。")
-        log_warning(f"⚠️ 详细信息：{exc}")
-        return
-
-    try:
         artifacts_dir = ARTIFACTS_DIR
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         desktop_conf_local = artifacts_dir / "desktop.conf"
         iphone_conf_local = artifacts_dir / "iphone.conf"
+        iphone_png_local = artifacts_dir / "iphone.png"
+
         log_info(f"→ 下载桌面端配置到 {desktop_conf_local}")
-        if not _download_file(
-            client,
-            "/etc/wireguard/clients/desktop/desktop.conf",
-            desktop_conf_local,
-            "下载桌面端配置",
-        ):
-            return
+        _download_artifact("/etc/wireguard/clients/desktop/desktop.conf", desktop_conf_local)
+
         log_info(f"→ 下载 iPhone 配置到 {iphone_conf_local}")
-        if not _download_file(
-            client,
-            "/etc/wireguard/clients/iphone/iphone.conf",
-            iphone_conf_local,
-            "下载 iPhone 配置",
-        ):
-            return
+        _download_artifact("/etc/wireguard/clients/iphone/iphone.conf", iphone_conf_local)
 
-        server_pub = ""
-        desktop_pub = ""
-        iphone_pub = ""
-        try:
-            with client.open_sftp() as sftp:
-                server_pub = (
-                    sftp.open("/etc/wireguard/server.public").read().decode("utf-8", errors="ignore").strip()
-                )
-                desktop_pub = (
-                    sftp.open("/etc/wireguard/clients/desktop/desktop.public")
-                    .read()
-                    .decode("utf-8", errors="ignore")
-                    .strip()
-                )
-                iphone_pub = (
-                    sftp.open("/etc/wireguard/clients/iphone/iphone.public")
-                    .read()
-                    .decode("utf-8", errors="ignore")
-                    .strip()
-                )
-        except Exception as exc:  # noqa: BLE001
-            log_warning(f"⚠️ 读取远端公钥信息失败：{exc}")
-            server_pub = ""
-            desktop_pub = ""
-            iphone_pub = ""
+        log_info(f"→ 下载 iPhone 二维码到 {iphone_png_local}")
+        _download_artifact("/etc/wireguard/clients/iphone/iphone.png", iphone_png_local)
 
+        for path in (desktop_conf_local, iphone_conf_local, iphone_png_local):
+            if not path.exists():
+                raise DeploymentError(f"本地文件缺失：{path}")
+
+        def _rel(path: Path) -> str:
+            try:
+                return str(path.relative_to(ROOT))
+            except ValueError:
+                return str(path)
+
+        log_success(f"✅ Windows 客户端配置：{_rel(desktop_conf_local)}")
+        log_success(f"✅ iPhone 配置：{_rel(iphone_conf_local)}")
+        log_success(f"✅ iPhone 二维码：{_rel(iphone_png_local)}")
+
+        server_info: dict[str, Any] = {
+            "id": instance_id,
+            "ip": ip,
+            "server_pub": server_pub,
+            "platform": SELECTED_PLATFORM or "",
+            "endpoint": endpoint,
+            "desktop_ip": desktop_ip,
+            "iphone_ip": iphone_ip,
+            "desktop_public_key": desktop_pub,
+            "iphone_public_key": iphone_pub,
+            "desktop_config": str(desktop_conf_local),
+            "iphone_config": str(iphone_conf_local),
+            "iphone_qr": str(iphone_png_local),
+            "allowed_ips": allowed_ips,
+            "dns": dns_value,
+            "deploy_log": str(deploy_log_path),
+        }
+        if wan_if:
+            server_info["wan_interface"] = wan_if
+        _update_server_info(server_info)
+
+        log_info("验证指南：")
+        log_info(f"  1. Windows 打开 WireGuard 导入 {_rel(desktop_conf_local)} 并连接。")
+        log_info("  2. 连接后运行：curl -4 ifconfig.me / curl -6 ifconfig.me，应显示 VPS 公网地址。")
+        log_info("  3. 若能获取公网 IP 但无法上网，请检查代理/安全软件；如丢包，可继续使用默认 MTU=1280。")
+
+        _desktop_usage_tip()
+        log_info(f"→ 部署日志已保存至 {deploy_log_path}")
+    except DeploymentError as exc:
+        log_error(f"❌ 部署失败：{exc}")
+        log_info(f"→ 详细日志：{deploy_log_path}")
     finally:
-        client.close()
-
-    try:
-        import qrcode  # type: ignore
-    except ImportError as exc:  # noqa: BLE001
-        log_error(f"❌ 未安装 qrcode 包，无法生成二维码：{exc}")
-        log_warning("⚠️ 请执行 `pip install qrcode[pil]` 后重试。")
-        return
-
-    try:
-        iphone_conf_text = iphone_conf_local.read_text(encoding="utf-8").strip()
-    except OSError as exc:  # noqa: BLE001
-        log_error(f"❌ 读取 {iphone_conf_local} 失败：{exc}")
-        return
-
-    iphone_png = ARTIFACTS_DIR / "iphone.png"
-    try:
-        img = qrcode.make(iphone_conf_text)
-        img.save(iphone_png)
-    except Exception as exc:  # noqa: BLE001
-        log_error(f"❌ 生成二维码失败：{exc}")
-        return
-
-    server_info: dict[str, Any] = {
-        "id": instance_id,
-        "ip": ip,
-        "server_pub": server_pub,
-        "platform": SELECTED_PLATFORM or "",
-        "endpoint": server_endpoint,
-        "desktop_ip": desktop_ip,
-        "iphone_ip": iphone_ip,
-        "desktop_public_key": desktop_pub,
-        "iphone_public_key": iphone_pub,
-        "desktop_config": str(desktop_conf_local),
-        "iphone_config": str(iphone_conf_local),
-        "iphone_qr": str(iphone_png),
-        "allowed_ips": allowed_ips,
-        "dns": dns_value,
-    }
-    _update_server_info(server_info)
-
-    if desktop_conf_local.exists() and iphone_conf_local.exists() and iphone_png.exists():
-        log_success(
-            f"✅ 已生成 {desktop_conf_local}, {iphone_conf_local}, {iphone_png}"
-        )
-    else:
-        log_warning("⚠️ 部分本地文件缺失，请检查 artifacts 目录。")
-
-    _desktop_usage_tip()
-    log_info(f"请导入 {desktop_conf_local} 并启动隧道。")
+        _close_paramiko_client()
+        global SSH_CTX
+        SSH_CTX = None
 
 
 def generate_mobile_qr() -> None:
