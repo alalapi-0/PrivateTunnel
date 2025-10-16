@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+import shlex
 import shutil
 import textwrap
 from pathlib import Path
@@ -732,8 +733,33 @@ def wait_instance_ping(ip: str, timeout: int = 600, interval: int = 60) -> bool:
     return False
 
 
+def _resolve_env_default(
+    *env_keys: str,
+    default: str,
+) -> tuple[str, str | None]:
+    """Return the first non-empty environment override and its key."""
+
+    for key in env_keys:
+        value = os.environ.get(key)
+        if value:
+            return value.strip(), key
+    return default, None
+
+
+def _default_private_key_prompt() -> str:
+    """Return the default SSH private key path prompt for Step 3."""
+
+    override = os.environ.get("PT_SSH_PRIVATE_KEY", "").strip()
+    if override:
+        return override
+    if os.name == "nt":
+        username = os.environ.get("USERNAME") or os.environ.get("USER") or "User"
+        return str(Path(f"C:/Users/{username}/.ssh/id_ed25519"))
+    return pick_default_key()
+
+
 def prepare_wireguard_access() -> None:
-    """Configure WireGuard and download a desktop client config."""
+    """Configure WireGuard end-to-end, including client provisioning."""
 
     inst_path = ARTIFACTS_DIR / "instance.json"
     if not inst_path.exists():
@@ -765,8 +791,48 @@ def prepare_wireguard_access() -> None:
             f"→ WireGuard 监听端口：{LISTEN_PORT} （默认值，可通过环境变量 PRIVATETUNNEL_WG_PORT/PT_WG_PORT 覆盖）"
         )
 
-    default_key = pick_default_key()
-    key_path = Path(ask_key_path(default_key)).expanduser()
+    desktop_ip, desktop_source = _resolve_env_default("PT_DESKTOP_IP", default="10.6.0.3/32")
+    if desktop_source:
+        log_info(f"→ 桌面客户端 IP：{desktop_ip} （来自环境变量 {desktop_source}）")
+    else:
+        log_info(
+            "→ 桌面客户端 IP：{value} （默认值，可通过环境变量 PT_DESKTOP_IP 覆盖）".format(value=desktop_ip)
+        )
+
+    iphone_ip, iphone_source = _resolve_env_default("PT_IPHONE_IP", default="10.6.0.2/32")
+    if iphone_source:
+        log_info(f"→ iPhone 客户端 IP：{iphone_ip} （来自环境变量 {iphone_source}）")
+    else:
+        log_info(
+            "→ iPhone 客户端 IP：{value} （默认值，可通过环境变量 PT_IPHONE_IP 覆盖）".format(value=iphone_ip)
+        )
+
+    dns_value, dns_source = _resolve_env_default("PT_DNS", default="1.1.1.1")
+    if dns_source:
+        log_info(f"→ 客户端 DNS：{dns_value} （来自环境变量 {dns_source}）")
+    else:
+        log_info(
+            "→ 客户端 DNS：{value} （默认值，可通过环境变量 PT_DNS 覆盖）".format(value=dns_value)
+        )
+
+    allowed_ips, allowed_source = _resolve_env_default("PT_ALLOWED_IPS", default="0.0.0.0/0, ::/0")
+    if allowed_source:
+        log_info(f"→ 客户端 AllowedIPs：{allowed_ips} （来自环境变量 {allowed_source}）")
+    else:
+        log_info(
+            "→ 客户端 AllowedIPs：{value} （默认值，可通过环境变量 PT_ALLOWED_IPS 覆盖）".format(
+                value=allowed_ips
+            )
+        )
+
+    client_mtu_raw = os.environ.get("PT_CLIENT_MTU", "").strip()
+    if client_mtu_raw:
+        log_info(f"→ 客户端 MTU：{client_mtu_raw} （来自环境变量 PT_CLIENT_MTU）")
+    else:
+        log_info("→ 客户端 MTU：未设置（可通过环境变量 PT_CLIENT_MTU 指定）")
+
+    default_key_prompt = _default_private_key_prompt()
+    key_path = Path(ask_key_path(default_key_prompt)).expanduser()
     log_info(f"→ 使用私钥：{key_path}")
 
     log_info("→ 执行 ssh-keygen -R 清理旧指纹…")
@@ -801,185 +867,324 @@ def prepare_wireguard_access() -> None:
         log_warning(f"⚠️ 详细信息：{exc}")
         return
 
-    try:
-        log_info("→ SSH 已连接，开始部署 WireGuard…")
-        setup_steps = [
-            (
-                "更新软件包并安装 WireGuard 组件",
-                """#!/usr/bin/env bash
+    server_endpoint = f"{ip}:{LISTEN_PORT}"
+    desktop_ip_quoted = shlex.quote(desktop_ip)
+    iphone_ip_quoted = shlex.quote(iphone_ip)
+    dns_quoted = shlex.quote(dns_value)
+    allowed_ips_quoted = shlex.quote(allowed_ips)
+    client_mtu_quoted = shlex.quote(client_mtu_raw) if client_mtu_raw else "''"
+    server_endpoint_quoted = shlex.quote(server_endpoint)
+
+    remote_script = textwrap.dedent(
+        f"""#!/usr/bin/env bash
 set -euo pipefail
 
+log() {{
+  printf '%s %s\\n' "[$(date '+%Y-%m-%d %H:%M:%S')]" "$*"
+}}
+
+warn() {{
+  printf '%s %s\\n' "[$(date '+%Y-%m-%d %H:%M:%S')]" "⚠️ $*" >&2
+}}
+
+err() {{
+  printf '%s %s\\n' "[$(date '+%Y-%m-%d %H:%M:%S')]" "❌ $*" >&2
+}}
+
+log "=== PrivateTunnel: 开始自动化部署 WireGuard 服务端 ==="
+
+WG_PORT={LISTEN_PORT}
+DESKTOP_IP={desktop_ip_quoted}
+IPHONE_IP={iphone_ip_quoted}
+CLIENT_DNS={dns_quoted}
+ALLOWED_IPS={allowed_ips_quoted}
+CLIENT_MTU={client_mtu_quoted}
+SERVER_ENDPOINT={server_endpoint_quoted}
+WG_DIR=/etc/wireguard
+SERVER_CONF="$WG_DIR/wg0.conf"
+SERVER_PRIV="$WG_DIR/server.private"
+SERVER_PUB="$WG_DIR/server.public"
+CLIENT_BASE="$WG_DIR/clients"
+DESKTOP_DIR="$CLIENT_BASE/desktop"
+IPHONE_DIR="$CLIENT_BASE/iphone"
+
+log "→ 准备环境并安装 WireGuard 组件"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent
-""",
-            ),
-            (
-                "初始化 WireGuard 配置目录",
-                """#!/usr/bin/env bash
-set -euo pipefail
+apt update -y
+apt install -y wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
 
-mkdir -p /etc/wireguard
-umask 077
-
-if [ ! -f /etc/wireguard/server.private ]; then
-  echo "→ 生成服务器私钥/公钥…"
-  wg genkey | tee /etc/wireguard/server.private | wg pubkey > /etc/wireguard/server.public
+log "→ 启用时间同步 (timedatectl set-ntp true)"
+if ! timedatectl set-ntp true; then
+  warn "timedatectl set-ntp true 失败，但仍继续执行。"
 fi
-SERVER_PRIV=$(cat /etc/wireguard/server.private)
 
-cat >/etc/wireguard/wg0.conf <<'EOF'
-[Interface]
-Address = 10.6.0.1/24
-ListenPort = {LISTEN_PORT}
-PrivateKey = __SERVER_PRIV__
-SaveConfig = true
-EOF
+WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
+if [ -z "$WAN_IF" ]; then
+  WAN_IF=enp1s0
+fi
 
-sed -i "s|__SERVER_PRIV__|${SERVER_PRIV}|g" /etc/wireguard/wg0.conf
-""".replace("{LISTEN_PORT}", str(LISTEN_PORT)),
-            ),
-            (
-                "启用并启动 WireGuard 服务",
-                """#!/usr/bin/env bash
-set -euo pipefail
-
-systemctl enable wg-quick@wg0
-systemctl restart wg-quick@wg0
-""",
-            ),
-            (
-                "配置 IP 转发与 NAT",
-                """#!/usr/bin/env bash
-set -euo pipefail
-
+log "→ 开启内核转发"
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard-forward.conf
 sysctl -p /etc/sysctl.d/99-wireguard-forward.conf
-PRIMARY_IF=$(ip route show default 0.0.0.0/0 | awk 'NR==1 {print $5}')
-if [ -z "${PRIMARY_IF}" ]; then
-  PRIMARY_IF=enp1s0
+if [ "$(sysctl -n net.ipv4.ip_forward)" != "1" ]; then
+  err "未成功开启 IPv4 转发。"
+  exit 1
 fi
-iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "${PRIMARY_IF}" -j MASQUERADE 2>/dev/null || \
-iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "${PRIMARY_IF}" -j MASQUERADE
-netfilter-persistent save
-netfilter-persistent reload
-""",
-            ),
-        ]
 
-        for description, script in setup_steps:
-            log_info(f"→ {description}…")
-            if not _run_remote_script(client, script, description):
-                return
-            log_success(f"   完成：{description}")
+log "→ 配置 NAT 出口规则 (接口: $WAN_IF)"
+iptables -t nat -D POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE || true
+iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
+if ! iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null; then
+  err "未检测到 MASQUERADE 规则，请检查 iptables 配置。"
+  exit 1
+fi
+netfilter-persistent save || true
+netfilter-persistent reload || true
 
-        log_info("→ 检查 WireGuard 服务状态…")
-        verify_command = "systemctl is-active wg-quick@wg0"
-        if not _run_remote_command(client, verify_command, "检查 WireGuard 服务状态"):
-            return
+if command -v ufw >/dev/null 2>&1; then
+  log "→ 通过 UFW 放行 ${{WG_PORT}}/udp"
+  ufw allow {LISTEN_PORT}/udp || true
+fi
 
-        log_info("→ 检查 WireGuard UDP 监听端口…")
-        try:
-            stdin, stdout, stderr = client.exec_command(
-                f"ss -ulpn | grep ':{LISTEN_PORT}'",
-                get_pty=False,
-                timeout=10,
-            )
-            exit_code, stdout_data, stderr_data = _stream_command_output(
-                stdout, stderr, show_output=False
-            )
-        except Exception as exc:  # noqa: BLE001
-            log_warning(f"⚠️ 检测 UDP 端口时出现异常：{exc}")
-        else:
-            if exit_code == 0:
-                log_success("   WireGuard UDP 端口正在监听。")
-                if stdout_data:
-                    log_info(f"   {stdout_data}")
-            else:
-                details = stderr_data or stdout_data or "未检测到监听进程"
-                log_warning(
-                    "⚠️ 暂未检测到 WireGuard UDP 监听进程，请确认云防火墙已放行相关端口。"
-                )
-                log_warning(f"   诊断信息：{details}")
-
-        log_info("→ 生成桌面端客户端配置 /etc/wireguard/clients/desktop/desktop.conf …")
-        client_script = """#!/usr/bin/env bash
-set -euo pipefail
-
-CLIENT_DIR="/etc/wireguard/clients/desktop"
-mkdir -p "${CLIENT_DIR}"
+log "→ 创建 WireGuard 配置及密钥"
 umask 077
+mkdir -p "$WG_DIR" "$CLIENT_BASE" "$DESKTOP_DIR" "$IPHONE_DIR"
+chmod 700 "$CLIENT_BASE" "$DESKTOP_DIR" "$IPHONE_DIR"
 
-wg genkey | tee "${CLIENT_DIR}/desktop.private" | wg pubkey > "${CLIENT_DIR}/desktop.public"
-CLIENT_PRIV=$(cat "${CLIENT_DIR}/desktop.private")
-CLIENT_PUB=$(cat "${CLIENT_DIR}/desktop.public")
-SERVER_PUB=$(cat /etc/wireguard/server.public)
-ENDPOINT="{ip}:{LISTEN_PORT}"
+if [ ! -f "$SERVER_PRIV" ]; then
+  log "   生成服务器密钥对"
+  wg genkey | tee "$SERVER_PRIV" | wg pubkey > "$SERVER_PUB"
+fi
+SERVER_PRIVATE=$(cat "$SERVER_PRIV")
+SERVER_PUBLIC=$(cat "$SERVER_PUB")
 
-if ! wg show wg0 peers | grep -q "${CLIENT_PUB}"; then
-  echo "→ 将桌面客户端加入服务器…"
-  wg set wg0 peer "${CLIENT_PUB}" allowed-ips 10.6.0.2/32
-  wg-quick save wg0
+cat > "$SERVER_CONF" <<EOF
+[Interface]
+Address = 10.6.0.1/24
+ListenPort = $WG_PORT
+PrivateKey = $SERVER_PRIVATE
+SaveConfig = true
+EOF
+chmod 600 "$SERVER_CONF"
+
+log "→ 启用并启动 wg-quick@wg0"
+systemctl enable wg-quick@wg0
+systemctl restart wg-quick@wg0
+
+log "→ 校验 WireGuard UDP 监听端口"
+if ! ss -lun | grep -q ":$WG_PORT"; then
+  err "UDP 端口 $WG_PORT 未监听，请检查防火墙或服务状态。"
+  exit 1
 fi
 
-cat > "${CLIENT_DIR}/desktop.conf" <<EOF
-[Interface]
-PrivateKey = ${CLIENT_PRIV}
-Address = 10.6.0.2/32
-DNS = 1.1.1.1, 8.8.8.8
+log "→ 当前 wg show 状态"
+wg show
 
-[Peer]
-PublicKey = ${SERVER_PUB}
-AllowedIPs = 0.0.0.0/0, ::/0
-Endpoint = ${ENDPOINT}
-PersistentKeepalive = 25
-EOF
+generate_client() {{
+  local name="$1"
+  local addr="$2"
+  local dir="$3"
+  local __pub_var="$4"
+  log "→ 生成客户端 ${name} (IP: ${addr})"
+  if [ -f "$dir/${{name}}.public" ]; then
+    local old_pub
+    old_pub=$(cat "$dir/${{name}}.public")
+    if [ -n "$old_pub" ]; then
+      wg set wg0 peer "$old_pub" remove || true
+    fi
+  fi
+  wg genkey | tee "$dir/${{name}}.private" | wg pubkey > "$dir/${{name}}.public"
+  local priv
+  priv=$(cat "$dir/${{name}}.private")
+  local pub
+  pub=$(cat "$dir/${{name}}.public")
+  chmod 600 "$dir/${{name}}.private"
+  wg set wg0 peer "$pub" remove || true
+  wg set wg0 peer "$pub" allowed-ips "$addr"
+  {{
+    printf '%s\\n' '[Interface]'
+    printf 'PrivateKey = %s\\n' "$priv"
+    printf 'Address = %s\\n' "$addr"
+    printf 'DNS = %s\\n' "$CLIENT_DNS"
+    if [ -n "$CLIENT_MTU" ]; then
+      printf 'MTU = %s\\n' "$CLIENT_MTU"
+    fi
+    printf '\n[Peer]\\n'
+    printf 'PublicKey = %s\\n' "$SERVER_PUBLIC"
+    printf 'AllowedIPs = %s\\n' "$ALLOWED_IPS"
+    printf 'Endpoint = %s\\n' "$SERVER_ENDPOINT"
+    printf 'PersistentKeepalive = 25\\n'
+  }} > "$dir/${{name}}.conf"
+  chmod 600 "$dir/${{name}}.conf"
+  printf -v "$__pub_var" '%s' "$pub"
+}}
+
+DESKTOP_PUBLIC=""
+IPHONE_PUBLIC=""
+generate_client "desktop" "$DESKTOP_IP" "$DESKTOP_DIR" DESKTOP_PUBLIC
+generate_client "iphone" "$IPHONE_IP" "$IPHONE_DIR" IPHONE_PUBLIC
+
+log "→ 保存配置并重启 WireGuard"
+wg-quick save wg0
+systemctl restart wg-quick@wg0
+
+log "→ 再次检查 wg show peers"
+WG_OUTPUT=$(wg show)
+if ! grep -q "$DESKTOP_PUBLIC" <<<"$WG_OUTPUT"; then
+  err "未检测到 desktop peer 已加载。"
+  printf '%s\n' "$WG_OUTPUT"
+  exit 1
+fi
+if ! grep -q "$IPHONE_PUBLIC" <<<"$WG_OUTPUT"; then
+  err "未检测到 iphone peer 已加载。"
+  printf '%s\n' "$WG_OUTPUT"
+  exit 1
+fi
+printf '%s\n' "$WG_OUTPUT"
+
+SERVER_EXTERNAL_IP=$(curl -4 -s ifconfig.me || true)
+if [ -z "$SERVER_EXTERNAL_IP" ]; then
+  SERVER_EXTERNAL_IP={shlex.quote(ip)}
+fi
+
+log "→ WireGuard 服务端部署完成"
+echo "SERVER_ENDPOINT=$SERVER_ENDPOINT"
+echo "SERVER_EXTERNAL_IP=$SERVER_EXTERNAL_IP"
+echo "SERVER_PUBLIC_KEY=$SERVER_PUBLIC"
+echo "DESKTOP_IP=$DESKTOP_IP"
+echo "DESKTOP_PUBLIC_KEY=$DESKTOP_PUBLIC"
+echo "IPHONE_IP=$IPHONE_IP"
+echo "IPHONE_PUBLIC_KEY=$IPHONE_PUBLIC"
 """
-        client_script = (
-            client_script.replace("{ip}", ip).replace("{LISTEN_PORT}", str(LISTEN_PORT))
-        )
-        if not _run_remote_script(client, client_script, "生成桌面端客户端配置"):
-            return
-        log_success("   完成：生成桌面端客户端配置")
+    )
 
+    try:
+        log_info("→ SSH 已连接，开始执行一键部署脚本…")
+        if not _run_remote_script(client, remote_script, "部署 WireGuard 服务端"):
+            return
+        log_success("✅ 远端 WireGuard 已部署并登记 desktop / iphone 客户端。")
+    finally:
+        client.close()
+
+    log_info("→ 再次执行 ssh-keygen -R 清理指纹…")
+    subprocess.run(["ssh-keygen", "-R", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # 重新建立连接以下载文件
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    nuke_known_host(ip)
+    try:
+        client.connect(
+            hostname=ip,
+            username="root",
+            key_filename=str(key_path),
+            look_for_keys=False,
+            timeout=30,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log_error("❌ 重新连接 VPS 以下载配置失败。")
+        log_warning(f"⚠️ 详细信息：{exc}")
+        return
+
+    try:
         artifacts_dir = ARTIFACTS_DIR
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        conf_local = artifacts_dir / "desktop.conf"
-        log_info(f"→ 下载至本地 {conf_local}")
+        desktop_conf_local = artifacts_dir / "desktop.conf"
+        iphone_conf_local = artifacts_dir / "iphone.conf"
+        log_info(f"→ 下载桌面端配置到 {desktop_conf_local}")
         if not _download_file(
             client,
             "/etc/wireguard/clients/desktop/desktop.conf",
-            conf_local,
-            "下载客户端配置",
+            desktop_conf_local,
+            "下载桌面端配置",
+        ):
+            return
+        log_info(f"→ 下载 iPhone 配置到 {iphone_conf_local}")
+        if not _download_file(
+            client,
+            "/etc/wireguard/clients/iphone/iphone.conf",
+            iphone_conf_local,
+            "下载 iPhone 配置",
         ):
             return
 
+        server_pub = ""
+        desktop_pub = ""
+        iphone_pub = ""
         try:
             with client.open_sftp() as sftp:
                 server_pub = (
                     sftp.open("/etc/wireguard/server.public").read().decode("utf-8", errors="ignore").strip()
                 )
+                desktop_pub = (
+                    sftp.open("/etc/wireguard/clients/desktop/desktop.public")
+                    .read()
+                    .decode("utf-8", errors="ignore")
+                    .strip()
+                )
+                iphone_pub = (
+                    sftp.open("/etc/wireguard/clients/iphone/iphone.public")
+                    .read()
+                    .decode("utf-8", errors="ignore")
+                    .strip()
+                )
         except Exception as exc:  # noqa: BLE001
-            log_warning(f"⚠️ 读取服务端公钥失败：{exc}")
+            log_warning(f"⚠️ 读取远端公钥信息失败：{exc}")
             server_pub = ""
+            desktop_pub = ""
+            iphone_pub = ""
 
-        server_info: dict[str, Any] = {
-            "id": instance_id,
-            "ip": ip,
-            "server_pub": server_pub,
-            "client_config": str(conf_local),
-            "qr_code": "",
-            "platform": SELECTED_PLATFORM or "",
-        }
-        _update_server_info(server_info)
-
-        if conf_local.exists():
-            log_success(f"✅ 已生成桌面端配置文件：{conf_local}")
-            _desktop_usage_tip()
-        else:
-            log_warning("⚠️ 未在本地找到配置文件，请确认下载是否成功。")
     finally:
         client.close()
+
+    try:
+        import qrcode  # type: ignore
+    except ImportError as exc:  # noqa: BLE001
+        log_error(f"❌ 未安装 qrcode 包，无法生成二维码：{exc}")
+        log_warning("⚠️ 请执行 `pip install qrcode[pil]` 后重试。")
+        return
+
+    try:
+        iphone_conf_text = iphone_conf_local.read_text(encoding="utf-8").strip()
+    except OSError as exc:  # noqa: BLE001
+        log_error(f"❌ 读取 {iphone_conf_local} 失败：{exc}")
+        return
+
+    iphone_png = ARTIFACTS_DIR / "iphone.png"
+    try:
+        img = qrcode.make(iphone_conf_text)
+        img.save(iphone_png)
+    except Exception as exc:  # noqa: BLE001
+        log_error(f"❌ 生成二维码失败：{exc}")
+        return
+
+    server_info: dict[str, Any] = {
+        "id": instance_id,
+        "ip": ip,
+        "server_pub": server_pub,
+        "platform": SELECTED_PLATFORM or "",
+        "endpoint": server_endpoint,
+        "desktop_ip": desktop_ip,
+        "iphone_ip": iphone_ip,
+        "desktop_public_key": desktop_pub,
+        "iphone_public_key": iphone_pub,
+        "desktop_config": str(desktop_conf_local),
+        "iphone_config": str(iphone_conf_local),
+        "iphone_qr": str(iphone_png),
+        "allowed_ips": allowed_ips,
+        "dns": dns_value,
+    }
+    _update_server_info(server_info)
+
+    if desktop_conf_local.exists() and iphone_conf_local.exists() and iphone_png.exists():
+        log_success(
+            f"✅ 已生成 {desktop_conf_local}, {iphone_conf_local}, {iphone_png}"
+        )
+    else:
+        log_warning("⚠️ 部分本地文件缺失，请检查 artifacts 目录。")
+
+    _desktop_usage_tip()
+    log_info(f"请导入 {desktop_conf_local} 并启动隧道。")
 
 
 def generate_mobile_qr() -> None:

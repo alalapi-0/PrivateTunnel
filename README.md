@@ -28,6 +28,14 @@
 - 若仍失败，可选择 **Reinstall SSH Keys**（会擦除磁盘数据），脚本会进行二次确认并等待实例重装完成；
 - 所有创建信息会写入 `artifacts/instance.json`（含 `sshkey_ids`、`user_data_used` 等字段），方便排查和追踪。
 
+## 🛡 Step 3: 准备本机接入 VPS 网络（全自动）
+
+- 在主菜单选择 **3) 准备本机接入 VPS 网络** 后，脚本会读取 `artifacts/instance.json` 获取服务器 IP，并依据环境变量或默认值提示当前 WireGuard 端口、客户端 IP、AllowedIPs、DNS、MTU 等配置；
+- 脚本会自动清理旧指纹、探测 SSH 端口、校验免密登录，然后在云端一次性执行部署脚本：安装 WireGuard 与依赖、开启 IP 转发与 NAT、放行防火墙、生成服务端密钥并启动 `wg-quick@wg0`；
+- 同步生成 `desktop`（Windows）与 `iphone`（iOS）两个客户端的密钥与配置，登记到服务器并通过 `wg-quick save` 重载，远端 `wg show` 校验将展示两个 peer；
+- 本地会自动下载 `artifacts/desktop.conf` 与 `artifacts/iphone.conf`，并基于后者生成 `artifacts/iphone.png` 二维码，便于手机扫码导入；
+- 所有默认值均可通过 `PT_DESKTOP_IP`、`PT_IPHONE_IP`、`PT_ALLOWED_IPS`、`PT_DNS`、`PT_CLIENT_MTU`、`PT_SSH_PRIVATE_KEY` 等环境变量覆盖，提示中会直接显示当前默认值，确保用户可一路回车完成部署。
+
 ## 🔐 如何确保 SSH 公钥自动注入及排错
 
 - 在创建 Vultr VPS 前于控制台配置 SSH Key，并将其名称写入环境变量 `VULTR_SSHKEY_NAME`，脚本会自动调用 `GET /v2/ssh-keys` 匹配并提取对应 ID；
