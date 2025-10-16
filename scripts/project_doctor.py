@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -66,7 +68,9 @@ def check_packages(packages: Iterable[str]) -> CheckResult:
     loaded: list[str] = []
     for pkg in packages:
         try:
-            importlib.import_module(pkg)
+            with contextlib.redirect_stdout(io.StringIO()):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    importlib.import_module(pkg)
         except Exception:  # noqa: BLE001 - 捕获所有导入错误
             missing.append(pkg)
         else:
