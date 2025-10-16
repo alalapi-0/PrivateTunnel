@@ -1189,6 +1189,159 @@ def _desktop_usage_tip() -> None:
         )
 
 
+def _load_instance_for_diagnostics() -> tuple[str, Path] | None:
+    """Return the Vultr instance IP recorded on disk, if any."""
+
+    inst_path = ARTIFACTS_DIR / "instance.json"
+    if not inst_path.exists():
+        return None
+
+    try:
+        data = json.loads(inst_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:  # noqa: BLE001 - diagnostics best-effort
+        log_warning(f"⚠️ 无法读取 {inst_path}：{exc}，跳过网络排查。")
+        return None
+
+    ip = str(data.get("ip", "")).strip()
+    if not ip:
+        log_warning(f"⚠️ {inst_path} 缺少 IP 字段，跳过网络排查。")
+        return None
+
+    return ip, inst_path
+
+
+def _diagnostic_ping(ip: str) -> bool:
+    """Run a single ping against ``ip`` and report the outcome."""
+
+    log_info(f"→ 排查步骤：ping {ip}")
+    ping_cmd = ["ping", "-n" if os.name == "nt" else "-c", "1", ip]
+    try:
+        result = subprocess.run(  # noqa: S603
+            ping_cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except subprocess.SubprocessError as exc:
+        log_error(f"❌ 无法执行 ping：{exc}")
+        log_info("→ 请确认本机允许发起 ICMP 请求或尝试改用稳定的国际出口网络。")
+        return False
+
+    if result.returncode == 0:
+        log_success("✅ ping 成功，本地可以访问该实例。")
+        return True
+
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    log_error("❌ ping 失败，可能是网络抖动或运营商屏蔽 ICMP。")
+    if stdout:
+        log_warning(f"   stdout: {stdout}")
+    if stderr:
+        log_warning(f"   stderr: {stderr}")
+    log_info("→ 建议：检查当前出口网络、关闭可能干扰的代理/防火墙，或稍后重试。")
+    return False
+
+
+def _diagnostic_port_22(ip: str) -> bool:
+    """Attempt to establish a TCP connection to ``ip:22`` once."""
+
+    log_info(f"→ 排查步骤：检测 {ip}:22 是否开放")
+    try:
+        with socket.create_connection((ip, 22), timeout=5):
+            log_success("✅ TCP/22 可达，SSH 端口开放。")
+            return True
+    except OSError as exc:
+        log_error(f"❌ 无法连通 {ip}:22：{exc}")
+        log_info(
+            "→ 建议：确认 VPS 正在运行，并检查云防火墙、本地防火墙或出口线路是否放行 TCP/22。"
+        )
+        return False
+
+
+def _resolve_diagnostic_key_path() -> Path | None:
+    """Return a reasonable private-key path for diagnostic SSH probes."""
+
+    override = os.environ.get("PT_SSH_PRIVATE_KEY", "").strip()
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override).expanduser())
+    default_prompt = _default_private_key_prompt()
+    if default_prompt:
+        candidates.append(Path(default_prompt).expanduser())
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
+def _diagnostic_passwordless_ssh(ip: str, key_path: Path) -> bool:
+    """Attempt a single passwordless SSH probe with ``key_path``."""
+
+    log_info(f"→ 排查步骤：使用 {key_path} 验证免密 SSH")
+    result = probe_publickey_auth(
+        ip,
+        key_path,
+        retries=1,
+        interval=0,
+        timeout=15,
+    )
+    if result.success:
+        log_success("✅ 免密 SSH 正常，可直接部署 WireGuard。")
+        return True
+
+    log_error("❌ 免密 SSH 验证失败。")
+    if result.error:
+        log_warning(f"   error: {result.error}")
+    if result.stderr:
+        log_warning(f"   stderr: {result.stderr}")
+    if result.stdout and result.stdout != "ok":
+        log_warning(f"   stdout: {result.stdout}")
+    log_info("→ 建议：确认 Vultr 实例已注入正确公钥，或通过控制台登录执行授权命令。")
+    _print_manual_ssh_hint()
+    return False
+
+
+def _run_network_diagnostics(ip: str) -> bool:
+    """Run connectivity diagnostics against the recorded Vultr instance."""
+
+    log_section("🌐 网络连通性排查")
+    overall_ok = True
+
+    if not _diagnostic_ping(ip):
+        overall_ok = False
+
+    port_ok = _diagnostic_port_22(ip)
+    if not port_ok:
+        overall_ok = False
+
+    key_path = _resolve_diagnostic_key_path()
+    if key_path and port_ok:
+        if not _diagnostic_passwordless_ssh(ip, key_path):
+            overall_ok = False
+    elif not key_path:
+        log_warning("⚠️ 未找到可用的私钥文件，跳过免密 SSH 验证。")
+
+    return overall_ok
+
+
+def _maybe_run_network_diagnostics() -> None:
+    """Automatically run network diagnostics when an instance is recorded."""
+
+    instance = _load_instance_for_diagnostics()
+    if not instance:
+        log_info("→ 未检测到 Vultr 实例记录，跳过网络排查。")
+        return
+
+    ip, inst_path = instance
+    log_info(f"→ 检测到实例记录：{inst_path}，即将尝试排查与 {ip} 的连通性…")
+    if _run_network_diagnostics(ip):
+        log_success("✅ 网络排查完成，当前环境可直连 VPS。")
+    else:
+        log_warning("⚠️ 网络排查发现异常，请根据上方提示处理后再继续。")
+
+
 def run_environment_check() -> None:
     global SELECTED_PLATFORM
 
@@ -1222,6 +1375,8 @@ def run_environment_check() -> None:
     else:
         log_warning("⚠️ 体检发现问题，请按报告提示修复后再继续。")
 
+    _maybe_run_network_diagnostics()
+
 
 def run_prune() -> None:
     code = subprocess.call([sys.executable, "scripts/prune_non_windows_only.py"])
@@ -1233,6 +1388,7 @@ from core.ssh_utils import (
     ask_key_path,
     nuke_known_host,
     pick_default_key,
+    probe_publickey_auth,
 )
 
 
