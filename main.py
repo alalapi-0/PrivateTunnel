@@ -518,6 +518,36 @@ def _download_artifact(remote_path: str, local_path: Path) -> None:
     _download_with_paramiko(remote_path, local_path)
 
 
+def _generate_qr_from_config(config_path: Path, output_path: Path) -> None:
+    """Generate a QR code PNG from the given WireGuard config."""
+
+    try:
+        config_text = config_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:  # noqa: BLE001
+        raise DeploymentError(f"读取配置文件失败：{exc}") from exc
+
+    if not config_text:
+        raise DeploymentError("配置文件内容为空，无法生成二维码。")
+
+    try:
+        import qrcode  # type: ignore
+        from qrcode.constants import ERROR_CORRECT_Q  # type: ignore
+    except ImportError as exc:  # noqa: BLE001
+        raise DeploymentError(
+            "未安装 qrcode[pil]，无法生成二维码，请执行 `pip install qrcode[pil]` 后重试。",
+        ) from exc
+
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        qr = qrcode.QRCode(error_correction=ERROR_CORRECT_Q, box_size=8, border=2)
+        qr.add_data(config_text)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        img.save(output_path)
+    except Exception as exc:  # noqa: BLE001
+        raise DeploymentError(f"生成二维码失败：{exc}") from exc
+
+
 def deploy_wireguard_remote_script(
     listen_port: int,
     desktop_ip: str,
@@ -1404,7 +1434,19 @@ def prepare_wireguard_access() -> None:
         _download_artifact("/etc/wireguard/clients/iphone/iphone.conf", iphone_conf_local)
 
         log_info(f"→ 下载 iPhone 二维码到 {iphone_png_local}")
-        _download_artifact("/etc/wireguard/clients/iphone/iphone.png", iphone_png_local)
+        try:
+            _download_artifact("/etc/wireguard/clients/iphone/iphone.png", iphone_png_local)
+        except DeploymentError as exc:
+            log_warning(f"⚠️ 下载远端二维码失败：{exc}")
+            log_info("→ 尝试基于本地配置重新生成二维码…")
+            try:
+                _generate_qr_from_config(iphone_conf_local, iphone_png_local)
+            except DeploymentError as qr_exc:
+                raise DeploymentError(
+                    "无法获取 iPhone 二维码：" + str(qr_exc),
+                ) from qr_exc
+            else:
+                log_success(f"✅ 已基于配置生成本地二维码：{iphone_png_local}")
 
         for path in (desktop_conf_local, iphone_conf_local, iphone_png_local):
             if not path.exists():
