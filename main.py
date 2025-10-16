@@ -509,13 +509,23 @@ def _download_with_paramiko(remote_path: str, local_path: Path) -> None:
         raise DeploymentError(f"SFTP 下载 {remote_path} 失败：{exc}") from exc
 
 
-def _download_artifact(remote_path: str, local_path: Path) -> None:
-    """Download an artifact via scp with Paramiko fallback."""
+def _download_artifact(remote_path: str, local_path: Path) -> bool:
+    """Download ``remote_path`` to ``local_path``.
+
+    Returns ``True`` on success. When both ``scp`` and Paramiko downloads fail the
+    error is logged and ``False`` is returned instead of raising, allowing callers
+    to decide whether the artifact is optional.
+    """
 
     if _download_with_scp(remote_path, local_path):
-        return
+        return True
     log_warning("⚠️ scp 下载失败，改用 Paramiko SFTP。")
-    _download_with_paramiko(remote_path, local_path)
+    try:
+        _download_with_paramiko(remote_path, local_path)
+    except DeploymentError as exc:
+        log_warning(f"⚠️ SFTP 下载失败：{exc}")
+        return False
+    return True
 
 
 def _generate_qr_from_config(config_path: Path, output_path: Path) -> None:
@@ -1428,14 +1438,17 @@ def prepare_wireguard_access() -> None:
         iphone_png_local = artifacts_dir / "iphone.png"
 
         log_info(f"→ 下载桌面端配置到 {desktop_conf_local}")
-        _download_artifact("/etc/wireguard/clients/desktop/desktop.conf", desktop_conf_local)
+        if not _download_artifact("/etc/wireguard/clients/desktop/desktop.conf", desktop_conf_local):
+            raise DeploymentError("下载桌面端配置失败，请手动检查 /etc/wireguard/clients/desktop/desktop.conf。")
 
         log_info(f"→ 下载 iPhone 配置到 {iphone_conf_local}")
-        _download_artifact("/etc/wireguard/clients/iphone/iphone.conf", iphone_conf_local)
+        if not _download_artifact("/etc/wireguard/clients/iphone/iphone.conf", iphone_conf_local):
+            raise DeploymentError("下载 iPhone 配置失败，请手动检查 /etc/wireguard/clients/iphone/iphone.conf。")
 
         log_info(f"→ 下载 iPhone 二维码到 {iphone_png_local}")
         try:
-            _download_artifact("/etc/wireguard/clients/iphone/iphone.png", iphone_png_local)
+            if not _download_artifact("/etc/wireguard/clients/iphone/iphone.png", iphone_png_local):
+                raise DeploymentError("服务器未生成 iphone.png")
         except DeploymentError as exc:
             log_warning(f"⚠️ 下载远端二维码失败：{exc}")
             log_info("→ 尝试基于本地配置重新生成二维码…")
