@@ -330,10 +330,28 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
     ip = str(instance.get("ip", ""))
     instance_id = str(instance.get("id", ""))
     sshkey_ids: list[str] = []
-    for raw in instance.get("sshkey_ids", []):
-        value = str(raw).strip()
-        if value:
+    seen_ids: set[str] = set()
+
+    def _append_ssh_id(candidate: object) -> None:
+        value = str(candidate or "").strip()
+        if value and value not in seen_ids:
+            seen_ids.add(value)
             sshkey_ids.append(value)
+
+    for raw in instance.get("sshkey_ids", []):
+        _append_ssh_id(raw)
+    for raw in instance.get("ssh_key_ids", []):
+        _append_ssh_id(raw)
+    _append_ssh_id(instance.get("sshkey_id"))
+    _append_ssh_id(instance.get("ssh_key_id"))
+
+    stored_ids = list(sshkey_ids)
+    ssh_key_name = str(
+        instance.get("sshkey_name")
+        or instance.get("ssh_key_name")
+        or instance.get("ssh_key")
+        or ""
+    ).strip()
     if not ip:
         raise RuntimeError("实例信息缺少 IP，无法继续部署。")
     known_hosts_file = _reset_host_key(ip)
@@ -355,7 +373,9 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
 
         api_key = os.environ.get("VULTR_API_KEY", "").strip()
         account_keys: list[Dict[str, object]] | None = None
-        if api_key and instance_id and not sshkey_ids:
+        available_ids: set[str] = set()
+
+        if api_key and instance_id:
             try:
                 account_keys = list_ssh_keys(api_key)
             except VultrError as exc:
@@ -363,6 +383,30 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
                 account_keys = []
 
             if account_keys:
+                for item in account_keys:
+                    key_id = str(item.get("id", "")).strip()
+                    if key_id:
+                        available_ids.add(key_id)
+
+            if sshkey_ids and available_ids:
+                missing = [item for item in sshkey_ids if item not in available_ids]
+                if missing:
+                    print(
+                        "⚠️ 在 Vultr 账号中未找到以下 SSH 公钥 ID，将在重装时忽略："
+                        + ", ".join(missing)
+                    )
+                sshkey_ids = [item for item in sshkey_ids if item in available_ids]
+                seen_ids = set(sshkey_ids)
+
+            if account_keys and not sshkey_ids and ssh_key_name:
+                for item in account_keys:
+                    key_id = str(item.get("id", "")).strip()
+                    name = str(item.get("name", "")).strip()
+                    if key_id and name and name == ssh_key_name:
+                        _append_ssh_id(key_id)
+                        break
+
+            if account_keys and not sshkey_ids:
                 filtered: list[Dict[str, str]] = []
                 for item in account_keys:
                     key_id = str(item.get("id", "")).strip()
@@ -377,11 +421,11 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
 
                 if len(filtered) == 1:
                     selected = filtered[0]
-                    sshkey_ids = [selected["id"]]
+                    _append_ssh_id(selected["id"])
                     label = selected["name"] or selected["id"]
                     print(
-                        "→ Vultr 账号中仅检测到一把 SSH 公钥，将自动用于 Reinstall："
-                        f"{label}"
+                        "→ Vultr 账号中仅检测到一把 SSH 公钥，将自动用于 Reinstall：",
+                        f"{label}",
                     )
                     if selected["name"]:
                         instance["sshkey_name"] = selected["name"]
@@ -422,7 +466,7 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
                             print("⚠️ 输入无效，请重新输入序号或 Vultr SSH Key ID。")
                             continue
 
-                        sshkey_ids = [matched["id"]]
+                        _append_ssh_id(matched["id"])
                         if matched["name"]:
                             instance["sshkey_name"] = matched["name"]
 
@@ -438,16 +482,32 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
                 existing = json.loads(artifact_path.read_text(encoding="utf-8"))
             except (FileNotFoundError, json.JSONDecodeError):
                 existing = {}
-            existing["sshkey_ids"] = sshkey_ids
-            existing["ssh_key_ids"] = sshkey_ids
+
+            updated = False
+            if (
+                existing.get("sshkey_ids") != sshkey_ids
+                or existing.get("ssh_key_ids") != sshkey_ids
+                or sshkey_ids != stored_ids
+            ):
+                existing["sshkey_ids"] = sshkey_ids
+                existing["ssh_key_ids"] = sshkey_ids
+                updated = True
+
             if instance.get("sshkey_name"):
-                existing["sshkey_name"] = instance["sshkey_name"]
-                existing["ssh_key_name"] = instance["sshkey_name"]
-            artifact_path.write_text(
-                json.dumps(existing, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            print("→ 已更新 artifacts/instance.json 中的 SSH 公钥信息。")
+                if (
+                    existing.get("sshkey_name") != instance["sshkey_name"]
+                    or existing.get("ssh_key_name") != instance["sshkey_name"]
+                ):
+                    existing["sshkey_name"] = instance["sshkey_name"]
+                    existing["ssh_key_name"] = instance["sshkey_name"]
+                    updated = True
+
+            if updated:
+                artifact_path.write_text(
+                    json.dumps(existing, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                print("→ 已更新 artifacts/instance.json 中的 SSH 公钥信息。")
 
         print("→ 自动触发 Vultr Reinstall SSH Keys ...")
         try:
