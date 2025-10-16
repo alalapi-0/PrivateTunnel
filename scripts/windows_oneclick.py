@@ -23,6 +23,7 @@ from core.ssh_utils import (
     smart_ssh,
     wait_port_open,
 )
+from core.tools.vultr_manager import VultrError, list_ssh_keys
 from core.vultr_api import (
     VultrAPIError,
     create_instance as api_create_instance,
@@ -353,8 +354,100 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
             print(f"⚠️ 公钥认证暂未生效：{details}")
 
         api_key = os.environ.get("VULTR_API_KEY", "").strip()
+        account_keys: list[Dict[str, object]] | None = None
+        if api_key and instance_id and not sshkey_ids:
+            try:
+                account_keys = list_ssh_keys(api_key)
+            except VultrError as exc:
+                print(f"⚠️ 获取 Vultr SSH 公钥列表失败：{exc}")
+                account_keys = []
+
+            if account_keys:
+                filtered: list[Dict[str, str]] = []
+                for item in account_keys:
+                    key_id = str(item.get("id", "")).strip()
+                    if not key_id:
+                        continue
+                    filtered.append(
+                        {
+                            "id": key_id,
+                            "name": str(item.get("name", "")).strip(),
+                        }
+                    )
+
+                if len(filtered) == 1:
+                    selected = filtered[0]
+                    sshkey_ids = [selected["id"]]
+                    label = selected["name"] or selected["id"]
+                    print(
+                        "→ Vultr 账号中仅检测到一把 SSH 公钥，将自动用于 Reinstall："
+                        f"{label}"
+                    )
+                    if selected["name"]:
+                        instance["sshkey_name"] = selected["name"]
+                elif filtered:
+                    print(
+                        "⚠️ 自动化无法确定需要注入哪把 SSH 公钥，请从列表中选择。"
+                    )
+                    print("→ Vultr 账号中可用的 SSH 公钥：")
+                    for idx, item in enumerate(filtered, start=1):
+                        label = item["id"]
+                        if item["name"]:
+                            label = f"{label}（{item['name']}）"
+                        print(f"   {idx}) {label}")
+
+                    while not sshkey_ids:
+                        selection = input(
+                            "请输入要注入的 SSH Key 序号，或直接粘贴 Vultr SSH Key ID: "
+                        ).strip()
+                        if not selection:
+                            print(
+                                "⚠️ 未选择任何 SSH 公钥，可稍后在 artifacts/instance.json 中补充"
+                                " ssh_key_ids 后重试。"
+                            )
+                            break
+
+                        matched = None
+                        for item in filtered:
+                            if selection == item["id"]:
+                                matched = item
+                                break
+
+                        if matched is None and selection.isdigit():
+                            index = int(selection) - 1
+                            if 0 <= index < len(filtered):
+                                matched = filtered[index]
+
+                        if matched is None:
+                            print("⚠️ 输入无效，请重新输入序号或 Vultr SSH Key ID。")
+                            continue
+
+                        sshkey_ids = [matched["id"]]
+                        if matched["name"]:
+                            instance["sshkey_name"] = matched["name"]
+
         if not api_key or not instance_id or not sshkey_ids:
             raise RuntimeError("SSH 公钥认证失败，且缺少触发 Reinstall SSH Keys 所需信息。")
+
+        if sshkey_ids:
+            instance["sshkey_ids"] = sshkey_ids
+            instance["ssh_key_ids"] = sshkey_ids
+            artifact_path = _artifacts_dir() / "instance.json"
+            existing: Dict[str, object] = {}
+            try:
+                existing = json.loads(artifact_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                existing = {}
+            existing["sshkey_ids"] = sshkey_ids
+            existing["ssh_key_ids"] = sshkey_ids
+            if instance.get("sshkey_name"):
+                existing["sshkey_name"] = instance["sshkey_name"]
+                existing["ssh_key_name"] = instance["sshkey_name"]
+            artifact_path.write_text(
+                json.dumps(existing, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print("→ 已更新 artifacts/instance.json 中的 SSH 公钥信息。")
 
         print("→ 自动触发 Vultr Reinstall SSH Keys ...")
         try:
