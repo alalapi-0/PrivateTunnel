@@ -138,10 +138,7 @@ def create_instance(
         deduped_ids = list(dict.fromkeys(deduped_ids))
         if deduped_ids:
             body["sshkey_ids"] = deduped_ids
-            if len(deduped_ids) == 1:
-                body["sshkey_id"] = deduped_ids[0]
-            else:
-                body["sshkey_id"] = deduped_ids
+            body["sshkey_id"] = deduped_ids
     if user_data:
         body["user_data"] = user_data
 
@@ -236,10 +233,7 @@ def reinstall_with_ssh_keys(
         deduped_ids = list(dict.fromkeys(deduped_ids))
         if deduped_ids:
             body["sshkey_ids"] = deduped_ids
-            if len(deduped_ids) == 1:
-                body["sshkey_id"] = deduped_ids[0]
-            else:
-                body["sshkey_id"] = deduped_ids
+            body["sshkey_id"] = deduped_ids
     if user_data:
         body["user_data"] = user_data
 

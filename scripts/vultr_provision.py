@@ -131,7 +131,9 @@ def create_instance(token: str, args: argparse.Namespace) -> Dict[str, Any]:
     if args.firewall_group_id:
         payload["firewall_group_id"] = args.firewall_group_id
     if args.ssh_key_id:
-        payload["sshkey_id"] = list(dict.fromkeys(args.ssh_key_id))
+        deduped = list(dict.fromkeys(args.ssh_key_id))
+        payload["sshkey_ids"] = deduped
+        payload["sshkey_id"] = deduped
     if args.enable_ipv6:
         payload["enable_ipv6"] = True
     if args.enable_private_network:
