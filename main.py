@@ -1602,21 +1602,13 @@ def prepare_wireguard_access() -> None:
         if not _download_artifact("/etc/wireguard/clients/iphone/iphone.conf", iphone_conf_local):
             raise DeploymentError("下载 iPhone 配置失败，请手动检查 /etc/wireguard/clients/iphone/iphone.conf。")
 
-        log_info(f"→ 下载 iPhone 二维码到 {iphone_png_local}")
+        log_info("→ 基于本地配置生成 iPhone 二维码…")
         try:
-            if not _download_artifact("/etc/wireguard/clients/iphone/iphone.png", iphone_png_local):
-                raise DeploymentError("服务器未生成 iphone.png")
+            _generate_qr_from_config(iphone_conf_local, iphone_png_local)
         except DeploymentError as exc:
-            log_warning(f"⚠️ 下载远端二维码失败：{exc}")
-            log_info("→ 尝试基于本地配置重新生成二维码…")
-            try:
-                _generate_qr_from_config(iphone_conf_local, iphone_png_local)
-            except DeploymentError as qr_exc:
-                raise DeploymentError(
-                    "无法获取 iPhone 二维码：" + str(qr_exc),
-                ) from qr_exc
-            else:
-                log_success(f"✅ 已基于配置生成本地二维码：{iphone_png_local}")
+            raise DeploymentError("无法生成 iPhone 二维码：" + str(exc)) from exc
+        else:
+            log_success(f"✅ 已生成 iPhone 二维码：{iphone_png_local}")
 
         for path in (desktop_conf_local, iphone_conf_local, iphone_png_local):
             if not path.exists():
