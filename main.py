@@ -356,25 +356,26 @@ def _log_remote_output(prefix: str, text: str) -> None:
 def _clean_known_host(ip: str) -> None:
     """Remove stale host key fingerprints for ``ip`` prior to SSH attempts."""
 
-    log_info(f"→ 将清理 known_hosts 旧指纹（{ip}）…")
-    ssh_keygen = shutil.which("ssh-keygen")
+    log_info(f"→ 使用 ssh-keygen -R 清理旧指纹（{ip}）…")
     targets = (ip, f"[{ip}]:22")
-    if ssh_keygen:
-        for target in targets:
-            try:
-                result = subprocess.run(
-                    [ssh_keygen, "-R", target],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            except (subprocess.SubprocessError, OSError) as exc:
-                log_warning(f"⚠️ 清理 {target} 指纹失败：{exc}")
-                continue
-            _log_remote_output("[ssh-keygen] ", result.stdout)
-            _log_remote_output("[ssh-keygen] ", result.stderr)
-    else:
-        log_warning("⚠️ 未检测到 ssh-keygen，改用内置清理逻辑。")
+    for target in targets:
+        command = ["ssh-keygen", "-R", target]
+        logwrite(f"$ {' '.join(command)}")
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            log_warning("⚠️ 未检测到 ssh-keygen，改用内置清理逻辑。")
+            break
+        except subprocess.SubprocessError as exc:
+            log_warning(f"⚠️ 清理 {target} 指纹失败：{exc}")
+            continue
+        _log_remote_output("[ssh-keygen] ", result.stdout)
+        _log_remote_output("[ssh-keygen] ", result.stderr)
 
     try:
         nuke_known_host(ip)
