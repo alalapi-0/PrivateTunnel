@@ -41,6 +41,21 @@ Toy UDP/TUN 模块仅供开发调试，缺乏加密与鉴权：
 - 若发现 `PONG timeout`，检查客户端与服务器的心跳间隔、网络丢包率；
 - 在云服务商安全组中仅允许来源于调试设备的 IP。
 
+## Vultr “Reinstall SSH Keys” 自动化失败
+
+触发 Vultr 的 **Reinstall SSH Keys** API 时，必须显式告知 Vultr 需要注入的 SSH Key ID。脚本会按以下顺序尝试收集 ID：
+
+1. 读取 `artifacts/instance.json` 中的 `ssh_key_ids` 或 `ssh_key_id`，这是创建实例时写入的原始数据。
+2. 若缺少 ID，则根据实例记录的 `ssh_key_name` 在账号内查询公钥列表，依赖 `VULTR_API_KEY` 重新拉取并匹配名称。
+
+只要以上两个信息都缺失，API 就无法确定要注入哪把钥匙，脚本会直接报错并停止自动化流程。
+
+排查建议：
+
+- 确认运行 `main.py` 或 `scripts/windows_oneclick.py` 时已导出 `VULTR_API_KEY`，否则无法调用 `list_ssh_keys` 读取账户内的公钥列表。脚本检测不到 `ssh_key_ids` 时会二次获取并更新 `artifacts/instance.json`，便于后续重试。【F:main.py†L594-L642】
+- 检查 `artifacts/instance.json` 是否仍在本地，且包含 `ssh_key_ids`/`ssh_key_name` 字段；若文件被删除，可在 Vultr 控制台查到原始公钥的 ID，再写回到文件后重试。【F:main.py†L594-L656】
+- 如果曾重命名或删除 Vultr 控制台里的 SSH Key，请恢复原名称或在 `artifacts/instance.json` 中手动更新 `ssh_key_ids`，否则名称匹配会失败。
+
 ## 日志与诊断
 
 - iOS 端可在 Xcode → `Devices and Simulators` 查看实时日志，或使用 `Console.app`；
