@@ -592,18 +592,83 @@ def prepare_wireguard_access() -> None:
             ).strip()
             if ssh_key_name:
                 log_info("→ 尝试根据记录的 SSH 公钥名称匹配 Vultr 账号中的公钥…")
-                from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
+            from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
 
-                try:
-                    account_keys = list_ssh_keys(api_key)
+            try:
+                account_keys = list_ssh_keys(api_key)
+            except Exception as exc:  # noqa: BLE001 - surface lookup errors for troubleshooting
+                log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
+                account_keys = []
+            else:
+                if ssh_key_name:
                     for item in account_keys:
                         name = str(item.get("name", "")).strip()
                         key_id = str(item.get("id", "")).strip()
                         if name == ssh_key_name and key_id:
                             ssh_key_ids.append(key_id)
                             break
-                except Exception as exc:  # noqa: BLE001 - surface lookup errors for troubleshooting
-                    log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
+
+            if not ssh_key_ids and account_keys:
+                filtered_keys = []
+                for item in account_keys:
+                    key_id = str(item.get("id", "")).strip()
+                    if not key_id:
+                        continue
+                    filtered_keys.append(
+                        {
+                            "id": key_id,
+                            "name": str(item.get("name", "")).strip(),
+                        }
+                    )
+
+                if len(filtered_keys) == 1:
+                    choice = filtered_keys[0]
+                    ssh_key_ids.append(choice["id"])
+                    label = choice["name"] or choice["id"]
+                    log_info(
+                        "→ Vultr 账号中仅检测到一把 SSH 公钥，将自动用于 Reinstall："
+                        f"{label}"
+                    )
+                elif filtered_keys:
+                    log_warning(
+                        "⚠️ 自动化无法确定需要注入哪把 SSH 公钥，请手动选择。"
+                    )
+                    log_info("→ Vultr 账号中可用的 SSH 公钥：")
+                    for idx, item in enumerate(filtered_keys, start=1):
+                        label = item["id"]
+                        if item["name"]:
+                            label = f"{label}（{item['name']}）"
+                        log_info(f"   {idx}) {label}")
+
+                    while not ssh_key_ids:
+                        selection = input(
+                            "请输入要注入的 SSH Key 序号，或直接粘贴 Vultr SSH Key ID："
+                        ).strip()
+                        if not selection:
+                            log_warning(
+                                "⚠️ 未选择任何 SSH 公钥。您可以稍后在 artifacts/instance.json 中补充"
+                                " ssh_key_ids 字段后重试。"
+                            )
+                            break
+
+                        matched = None
+                        for item in filtered_keys:
+                            if selection == item["id"]:
+                                matched = item
+                                break
+
+                        if matched is None and selection.isdigit():
+                            index = int(selection) - 1
+                            if 0 <= index < len(filtered_keys):
+                                matched = filtered_keys[index]
+
+                        if matched is None:
+                            log_warning("⚠️ 输入无效，请重新输入序号或 Vultr SSH Key ID。")
+                            continue
+
+                        ssh_key_ids.append(matched["id"])
+                        if matched["name"]:
+                            instance["ssh_key_name"] = matched["name"]
 
         ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
 
