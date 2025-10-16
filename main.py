@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -199,6 +200,82 @@ def _run_remote_command(
     return True
 
 
+def _wait_for_port_22(ip: str, *, attempts: int = 10, interval: int = 5) -> bool:
+    """Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``attempts`` exhausted."""
+
+    for attempt in range(1, attempts + 1):
+        log_info(f"  ↻ 第 {attempt} 次检测：连接 {ip}:22 …")
+        try:
+            with socket.create_connection((ip, 22), timeout=5):
+                log_success("   SSH 端口已开放。")
+                return True
+        except OSError as exc:
+            log_warning(f"⚠️ 连接失败：{exc}")
+        time.sleep(interval)
+    log_error("❌ 在预设次数内未检测到 SSH 端口开放。")
+    return False
+
+
+def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, attempts: int = 12, interval: int = 10) -> bool:
+    """Attempt ``ssh root@ip true`` until passwordless login succeeds."""
+
+    expanded = key_path.expanduser()
+    if not expanded.exists():
+        log_warning(f"⚠️ 找不到私钥文件：{expanded}，无法完成免密校验。")
+        return False
+
+    command = [
+        "ssh",
+        "-i",
+        str(expanded),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        f"root@{ip}",
+        "true",
+    ]
+
+    last_stdout = ""
+    last_stderr = ""
+    for attempt in range(1, attempts + 1):
+        log_info(f"  ↻ 第 {attempt} 次免密检测：ssh root@{ip} true")
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        last_stdout = (result.stdout or "").strip()
+        last_stderr = (result.stderr or "").strip()
+        if result.returncode == 0:
+            log_success("   免密 SSH 校验通过。")
+            return True
+        if last_stdout:
+            log_warning(f"   stdout: {last_stdout}")
+        if last_stderr:
+            log_warning(f"   stderr: {last_stderr}")
+        time.sleep(interval)
+
+    log_error(
+        "❌ 免密 SSH 校验失败。"
+        + (f" 最近一次 stdout: {last_stdout}" if last_stdout else "")
+        + (f" stderr: {last_stderr}" if last_stderr else "")
+    )
+    return False
+
+
+def _print_manual_ssh_hint() -> None:
+    """Display manual troubleshooting guidance for SSH key injection issues."""
+
+    log_warning("⚠️ 免密连接失败，请在 Vultr 控制台使用 View Console 登录，并执行：")
+    log_warning("  cat /root/.ssh/authorized_keys")
+    log_warning("  chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys")
+    log_warning("  systemctl restart ssh")
+    log_warning("然后重新运行部署。")
+
+
 def _download_file(
     client: paramiko.SSHClient,
     remote_path: str,
@@ -292,55 +369,62 @@ def create_vps() -> None:
     try:
         ssh_keys = list_ssh_keys(api_key)
     except VultrError as exc:
-        log_error(f"❌ 创建失败：获取 SSH 公钥列表异常：{exc}")
+        status_code = None
+        cause = exc.__cause__
+        if cause is not None:
+            status_code = getattr(getattr(cause, "response", None), "status_code", None)
+        if status_code == 401:
+            log_error(
+                "❌ 获取 SSH Key 列表失败，请检查 API Key 权限或 Access Control 白名单（IPv4/IPv6）。"
+            )
+        else:
+            log_error(f"❌ 创建失败：获取 SSH 公钥列表异常：{exc}")
         return
 
     if not ssh_keys:
-        log_error("❌ 未在 Vultr 账号中找到任何 SSH 公钥，请先添加后重试。")
+        log_error(
+            "❌ 获取 SSH Key 列表失败，请检查 API Key 权限或 Access Control 白名单（IPv4/IPv6）。"
+        )
         return
 
-    default_index = 1
-    for idx, item in enumerate(ssh_keys, start=1):
-        name = item.get("name", "")
-        log_info(f"  {idx}) {name} ({item.get('id', '')})")
-        if selected_keyname and name == selected_keyname:
-            default_index = idx
-
-    default_key_desc = ssh_keys[default_index - 1].get("name", "")
-    selection = input(
-        f"请选择 SSH 公钥（可输入编号、名称或 ID）[默认 {default_index}:{default_key_desc}]: "
-    ).strip()
-    chosen_idx: int | None = None
-    if not selection:
-        chosen_idx = default_index
-    else:
-        try:
-            chosen_idx = int(selection)
-        except ValueError:
-            normalized = selection.casefold()
-            for idx, item in enumerate(ssh_keys, start=1):
-                name = (item.get("name", "") or "").casefold()
-                key_id = (item.get("id", "") or "").casefold()
-                if normalized in {name, key_id}:
-                    chosen_idx = idx
-                    break
-            if chosen_idx is None:
-                log_error("❌ 找不到匹配的 SSH 公钥，请检查输入的编号、名称或 ID。")
-                return
-    if not 1 <= chosen_idx <= len(ssh_keys):
-        log_error("❌ 输入的编号超出范围。")
+    matched_key: dict[str, Any] | None = None
+    if selected_keyname:
+        for item in ssh_keys:
+            if item.get("name") == selected_keyname:
+                matched_key = item
+                break
+    if matched_key is None:
+        available = ", ".join(
+            item.get("name", "") or item.get("id", "") or "-" for item in ssh_keys
+        )
+        log_error(
+            "❌ 未找到名称匹配 VULTR_SSHKEY_NAME 的 SSH 公钥。请确认环境变量设置正确。\n"
+            f"   当前账号可用公钥：{available}"
+        )
         return
 
-    ssh_key = ssh_keys[chosen_idx - 1]
-    ssh_key_id = ssh_key.get("id", "")
-    ssh_key_name = ssh_key.get("name", "")
+    ssh_key_id = matched_key.get("id", "")
+    ssh_key_name = matched_key.get("name", "")
+    ssh_public_text = matched_key.get("ssh_key", "")
     if not ssh_key_id:
-        log_error("❌ 所选 SSH 公钥缺少 ID，请在 Vultr 控制台重新创建后再试。")
+        log_error("❌ 匹配到的 SSH 公钥缺少 ID，请在 Vultr 控制台重新创建后再试。")
         return
     log_info(f"→ 已选择 SSH 公钥：{ssh_key_name}")
 
     log_info("→ 创建实例中…")
     instance_id = ""
+    ip = ""
+    cloud_init: str | None = None
+    if use_snapshot and ssh_public_text:
+        cloud_init = (
+            "#cloud-config\n"
+            "users:\n"
+            "  - name: root\n"
+            "    ssh_authorized_keys:\n"
+            f"      - {ssh_public_text}\n"
+            "runcmd:\n"
+            "  - systemctl restart ssh\n"
+        )
     try:
         instance = create_instance(
             api_key,
@@ -348,6 +432,7 @@ def create_vps() -> None:
             plan=plan,
             snapshot_id=snapshot_id if use_snapshot else None,
             sshkey_ids=[ssh_key_id],
+            user_data=cloud_init,
         )
         instance_id = instance.get("id", "")
         if not instance_id:
@@ -358,14 +443,20 @@ def create_vps() -> None:
         if not ip:
             raise VultrError("等待实例 active 时未获取到 IP")
         log_success(f"✅ 实例就绪：id={instance_id}  ip={ip}")
-        log_info("→ 检测实例连通性（每分钟 ping 一次，最多 10 分钟）…")
-        if wait_instance_ping(ip, timeout=600, interval=60):
-            log_success("✅ 实例已可连通，可继续进行下一步部署。")
+        log_info("→ 执行 ssh-keygen -R 清理旧指纹…")
+        subprocess.run(["ssh-keygen", "-R", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最多 10 次）…")
+        key_path_default = Path.home() / ".ssh" / "id_ed25519"
+        port_ready = _wait_for_port_22(ip)
+        if port_ready:
+            log_info("→ 第二阶段：校验免密 SSH 是否可用…")
+            ssh_ready = _wait_for_passwordless_ssh(ip, key_path_default)
         else:
-            log_warning(
-                "⚠️ 在预设时间内未 Ping 通实例，但 Vultr 状态已 active。\n"
-                "   可以稍后再试部署，或手动检查实例网络。"
-            )
+            ssh_ready = False
+        if ssh_ready:
+            log_success("✅ 免密 SSH 已生效，可继续部署 WireGuard。")
+        else:
+            _print_manual_ssh_hint()
     except VultrError as exc:
         log_error(f"❌ 创建失败：{exc}")
         if instance_id:
@@ -389,6 +480,7 @@ def create_vps() -> None:
         "ssh_key_id": ssh_key_id,
         "ssh_key_ids": [ssh_key_id],
         "created_at": int(time.time()),
+        "cloud_init_injected": bool(cloud_init),
     }
     instance_file = artifacts_dir / "instance.json"
     instance_file.write_text(
@@ -482,8 +574,6 @@ from core.ssh_utils import (
     ask_key_path,
     nuke_known_host,
     pick_default_key,
-    probe_publickey_auth,
-    wait_port_open,
 )
 
 
@@ -560,181 +650,20 @@ def prepare_wireguard_access() -> None:
     key_path = Path(ask_key_path(default_key)).expanduser()
     log_info(f"→ 使用私钥：{key_path}")
 
-    log_info("→ 等待 SSH 端口 22 就绪…")
-    if not wait_port_open(ip, 22, timeout=180):
-        log_error("❌ SSH 端口未就绪（实例可能还在初始化或防火墙未放行 22）。")
+    log_info("→ 执行 ssh-keygen -R 清理旧指纹…")
+    subprocess.run(["ssh-keygen", "-R", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最多 10 次）…")
+    if not _wait_for_port_22(ip):
+        _print_manual_ssh_hint()
         return
 
-    log_info("→ 校验公钥认证是否生效…")
-    probe = probe_publickey_auth(ip, str(key_path))
-    if not probe.success:
-        details = probe.error or probe.stderr or probe.stdout
-        if details:
-            log_warning(f"⚠️ 公钥认证暂未生效：{details}")
+    log_info("→ 第二阶段：校验免密 SSH 是否可用…")
+    if not _wait_for_passwordless_ssh(ip, key_path):
+        _print_manual_ssh_hint()
+        return
 
-        api_key = os.environ.get("VULTR_API_KEY", "").strip()
-        ssh_key_ids: list[str] = []
-        account_keys: list[dict[str, Any]] | None = None
-
-        stored_ids = instance.get("ssh_key_ids")
-        if isinstance(stored_ids, (list, tuple)):
-            ssh_key_ids.extend(str(item).strip() for item in stored_ids if str(item).strip())
-
-        fallback_id = str(instance.get("ssh_key_id", "")).strip()
-        if fallback_id and fallback_id not in ssh_key_ids:
-            ssh_key_ids.append(fallback_id)
-
-        ssh_key_name = str(
-            instance.get("ssh_key_name")
-            or instance.get("ssh_key")
-            or ""
-        ).strip()
-
-        if api_key and instance_id:
-            from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
-
-            if ssh_key_name and not ssh_key_ids:
-                log_info("→ 尝试根据记录的 SSH 公钥名称匹配 Vultr 账号中的公钥…")
-
-            try:
-                account_keys = list_ssh_keys(api_key)
-            except Exception as exc:  # noqa: BLE001 - surface lookup errors for troubleshooting
-                log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
-                account_keys = []
-            else:
-                if ssh_key_name and not ssh_key_ids:
-                    for item in account_keys:
-                        name = str(item.get("name", "")).strip()
-                        key_id = str(item.get("id", "")).strip()
-                        if name == ssh_key_name and key_id:
-                            ssh_key_ids.append(key_id)
-                            break
-
-            filtered_keys: list[dict[str, str]] = []
-            for item in account_keys or []:
-                key_id = str(item.get("id", "")).strip()
-                if not key_id:
-                    continue
-                filtered_keys.append(
-                    {
-                        "id": key_id,
-                        "name": str(item.get("name", "")).strip(),
-                    }
-                )
-
-            ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
-
-            available_ids = {item["id"] for item in filtered_keys}
-            missing_ids = [item for item in ssh_key_ids if item not in available_ids]
-            if missing_ids:
-                log_warning(
-                    "⚠️ 在 Vultr 账号中未找到以下 SSH 公钥 ID，将在重装时忽略："
-                    + ", ".join(missing_ids)
-                )
-            ssh_key_ids = [item for item in ssh_key_ids if item in available_ids]
-
-            need_manual_choice = False
-            if not ssh_key_ids and filtered_keys:
-                need_manual_choice = True
-            elif ssh_key_ids and filtered_keys:
-                recorded = ", ".join(ssh_key_ids)
-                log_info(f"→ 将使用记录的 Vultr SSH Key ID：{recorded}")
-                if len(filtered_keys) > 1:
-                    answer = input("是否改为选择其他 Vultr SSH Key？[y/N] ").strip().lower()
-                    if answer in {"y", "yes"}:
-                        need_manual_choice = True
-                        ssh_key_ids = []
-
-            if need_manual_choice:
-                if len(filtered_keys) == 1:
-                    choice = filtered_keys[0]
-                    ssh_key_ids.append(choice["id"])
-                    label = choice["name"] or choice["id"]
-                    log_info(
-                        "→ Vultr 账号中仅检测到一把 SSH 公钥，将自动用于 Reinstall："
-                        f"{label}"
-                    )
-                else:
-                    log_warning(
-                        "⚠️ 自动化无法确定需要注入哪把 SSH 公钥，请手动选择。"
-                    )
-                    log_info("→ Vultr 账号中可用的 SSH 公钥：")
-                    for idx, item in enumerate(filtered_keys, start=1):
-                        label = item["id"]
-                        if item["name"]:
-                            label = f"{label}（{item['name']}）"
-                        log_info(f"   {idx}) {label}")
-
-                    while not ssh_key_ids:
-                        selection = input(
-                            "请输入要注入的 SSH Key 序号，或直接粘贴 Vultr SSH Key ID："
-                        ).strip()
-                        if not selection:
-                            log_warning(
-                                "⚠️ 未选择任何 SSH 公钥。您可以稍后在 artifacts/instance.json 中补充"
-                                " ssh_key_ids 字段后重试。"
-                            )
-                            break
-
-                        matched = None
-                        for item in filtered_keys:
-                            if selection == item["id"]:
-                                matched = item
-                                break
-
-                        if matched is None and selection.isdigit():
-                            index = int(selection) - 1
-                            if 0 <= index < len(filtered_keys):
-                                matched = filtered_keys[index]
-
-                        if matched is None:
-                            log_warning("⚠️ 输入无效，请重新输入序号或 Vultr SSH Key ID。")
-                            continue
-
-                        ssh_key_ids.append(matched["id"])
-                        if matched["name"]:
-                            instance["ssh_key_name"] = matched["name"]
-
-        else:
-            ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
-
-        if api_key and instance_id and ssh_key_ids:
-            if ssh_key_ids != stored_ids:
-                instance["ssh_key_ids"] = ssh_key_ids
-                inst_path.write_text(
-                    json.dumps(instance, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-        else:
-            log_error("❌ SSH 公钥认证失败，且缺少触发 Reinstall SSH Keys 所需信息。")
-            return
-
-        log_info("→ 自动触发 Vultr Reinstall SSH Keys …")
-        from core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
-            VultrError,
-            reinstall_with_ssh_keys,
-        )
-
-        try:
-            reinstall_with_ssh_keys(api_key, instance_id, sshkey_ids=ssh_key_ids)
-        except VultrError as exc:  # pragma: no cover - network dependent
-            log_error(f"❌ 自动触发 Reinstall SSH Keys 失败：{exc}")
-            return
-
-        log_warning("⚠️ 已自动触发 Reinstall SSH Keys，请等待约 1–2 分钟后继续。")
-        time.sleep(75)
-
-        probe = probe_publickey_auth(ip, str(key_path))
-        if not probe.success:
-            details = probe.error or probe.stderr or probe.stdout
-            if details:
-                log_warning(f"⚠️ 最近一次 SSH 输出：{details}")
-            log_error("❌ 公钥认证仍失败。已自动触发 Reinstall SSH Keys，请等待约 1–2 分钟后继续。")
-            return
-
-        log_success("✅ Reinstall 后公钥认证已生效。")
-    else:
-        log_success("✅ 公钥认证已生效。")
+    log_success("✅ 公钥认证已生效。")
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
