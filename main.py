@@ -6,6 +6,8 @@ import socket
 import subprocess
 import sys
 import time
+import shutil
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -515,11 +517,128 @@ def _update_server_info(data: dict[str, Any]) -> None:
     )
 
 
+def _wireguard_windows_candidate_paths() -> list[Path]:
+    """Return likely installation paths for WireGuard for Windows."""
+
+    bases: list[Path] = []
+    seen: set[Path] = set()
+    env_keys = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+    for key in env_keys:
+        value = os.environ.get(key)
+        if not value:
+            continue
+        base = Path(value) / "WireGuard"
+        if base not in seen:
+            seen.add(base)
+            bases.append(base)
+
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        base = Path(local_appdata) / "WireGuard"
+        if base not in seen:
+            seen.add(base)
+            bases.append(base)
+
+    fallback_paths = [
+        Path(r"C:\Program Files\WireGuard"),
+        Path(r"C:\Program Files (x86)\WireGuard"),
+    ]
+    for base in fallback_paths:
+        if base not in seen:
+            seen.add(base)
+            bases.append(base)
+
+    candidates: list[Path] = []
+    for base in bases:
+        candidates.append(base / "WireGuard.exe")
+        candidates.append(base / "wireguard.exe")
+    return candidates
+
+
+def _locate_wireguard_windows_executable() -> Path | None:
+    """Locate the WireGuard for Windows executable if it exists."""
+
+    for candidate in _wireguard_windows_candidate_paths():
+        if candidate.is_file():
+            return candidate
+    binary = shutil.which("wireguard")
+    if binary:
+        return Path(binary)
+    return None
+
+
+def _install_wireguard_windows_via_powershell() -> bool:
+    """Attempt to install WireGuard for Windows using PowerShell."""
+
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        log_warning("⚠️ 未找到 PowerShell，无法自动安装 WireGuard for Windows。")
+        return False
+
+    script = textwrap.dedent(
+        r"""
+        $ErrorActionPreference = "Stop"
+        $installerUrl = "https://download.wireguard.com/windows-client/wireguard-installer.exe"
+        $tempPath = Join-Path -Path $env:TEMP -ChildPath "wireguard-installer.exe"
+        Invoke-WebRequest -Uri $installerUrl -OutFile $tempPath
+        if (-Not (Test-Path $tempPath)) {
+            throw "下载 WireGuard 安装程序失败：$tempPath"
+        }
+        Start-Process -FilePath $tempPath -ArgumentList "/install /quiet" -Verb RunAs -Wait
+        """
+    ).strip()
+
+    try:
+        subprocess.run(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stderr or exc.stdout or "").strip()
+        if output:
+            log_warning(
+                f"⚠️ PowerShell 安装 WireGuard 失败（返回码 {exc.returncode}）。输出：{output}"
+            )
+        else:
+            log_warning(f"⚠️ PowerShell 安装 WireGuard 失败（返回码 {exc.returncode}）。")
+        return False
+    except FileNotFoundError:
+        log_warning("⚠️ 未找到 PowerShell，无法自动安装 WireGuard for Windows。")
+        return False
+
+    return True
+
+
+def _ensure_wireguard_for_windows() -> None:
+    """Ensure WireGuard for Windows is installed on the local machine."""
+
+    if os.name != "nt":
+        log_warning("⚠️ 当前环境非 Windows，无法自动安装 WireGuard for Windows。")
+        return
+
+    existing = _locate_wireguard_windows_executable()
+    if existing:
+        log_success(f"✅ 已检测到 WireGuard for Windows：{existing}")
+        return
+
+    log_info("→ 未检测到 WireGuard for Windows，尝试通过 PowerShell 自动安装 ...")
+    if not _install_wireguard_windows_via_powershell():
+        log_warning("⚠️ 自动安装 WireGuard for Windows 失败，请手动下载安装包。")
+        return
+
+    installed = _locate_wireguard_windows_executable()
+    if installed:
+        log_success(f"✅ WireGuard for Windows 安装完成：{installed}")
+    else:
+        log_warning("⚠️ 安装流程执行完毕，但未检测到 WireGuard for Windows，可手动确认。")
+
+
 def _desktop_usage_tip() -> None:
     if SELECTED_PLATFORM == "windows":
-        log_info(
-            "→ 请安装 WireGuard for Windows，导入生成的 .conf 配置文件后启动隧道。"
-        )
+        _ensure_wireguard_for_windows()
+        log_info("→ 请在 WireGuard for Windows 中导入生成的 .conf 配置文件后启动隧道。")
     elif SELECTED_PLATFORM == "macos":
         log_info(
             "→ 请安装 WireGuard.app（macOS），双击配置文件或在应用内导入后连接。"
