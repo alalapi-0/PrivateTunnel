@@ -584,15 +584,17 @@ def prepare_wireguard_access() -> None:
         if fallback_id and fallback_id not in ssh_key_ids:
             ssh_key_ids.append(fallback_id)
 
-        if api_key and instance_id and not ssh_key_ids:
-            ssh_key_name = str(
-                instance.get("ssh_key_name")
-                or instance.get("ssh_key")
-                or ""
-            ).strip()
-            if ssh_key_name:
-                log_info("→ 尝试根据记录的 SSH 公钥名称匹配 Vultr 账号中的公钥…")
+        ssh_key_name = str(
+            instance.get("ssh_key_name")
+            or instance.get("ssh_key")
+            or ""
+        ).strip()
+
+        if api_key and instance_id:
             from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
+
+            if ssh_key_name and not ssh_key_ids:
+                log_info("→ 尝试根据记录的 SSH 公钥名称匹配 Vultr 账号中的公钥…")
 
             try:
                 account_keys = list_ssh_keys(api_key)
@@ -600,7 +602,7 @@ def prepare_wireguard_access() -> None:
                 log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
                 account_keys = []
             else:
-                if ssh_key_name:
+                if ssh_key_name and not ssh_key_ids:
                     for item in account_keys:
                         name = str(item.get("name", "")).strip()
                         key_id = str(item.get("id", "")).strip()
@@ -608,19 +610,42 @@ def prepare_wireguard_access() -> None:
                             ssh_key_ids.append(key_id)
                             break
 
-            if not ssh_key_ids and account_keys:
-                filtered_keys = []
-                for item in account_keys:
-                    key_id = str(item.get("id", "")).strip()
-                    if not key_id:
-                        continue
-                    filtered_keys.append(
-                        {
-                            "id": key_id,
-                            "name": str(item.get("name", "")).strip(),
-                        }
-                    )
+            filtered_keys: list[dict[str, str]] = []
+            for item in account_keys or []:
+                key_id = str(item.get("id", "")).strip()
+                if not key_id:
+                    continue
+                filtered_keys.append(
+                    {
+                        "id": key_id,
+                        "name": str(item.get("name", "")).strip(),
+                    }
+                )
 
+            ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
+
+            available_ids = {item["id"] for item in filtered_keys}
+            missing_ids = [item for item in ssh_key_ids if item not in available_ids]
+            if missing_ids:
+                log_warning(
+                    "⚠️ 在 Vultr 账号中未找到以下 SSH 公钥 ID，将在重装时忽略："
+                    + ", ".join(missing_ids)
+                )
+            ssh_key_ids = [item for item in ssh_key_ids if item in available_ids]
+
+            need_manual_choice = False
+            if not ssh_key_ids and filtered_keys:
+                need_manual_choice = True
+            elif ssh_key_ids and filtered_keys:
+                recorded = ", ".join(ssh_key_ids)
+                log_info(f"→ 将使用记录的 Vultr SSH Key ID：{recorded}")
+                if len(filtered_keys) > 1:
+                    answer = input("是否改为选择其他 Vultr SSH Key？[y/N] ").strip().lower()
+                    if answer in {"y", "yes"}:
+                        need_manual_choice = True
+                        ssh_key_ids = []
+
+            if need_manual_choice:
                 if len(filtered_keys) == 1:
                     choice = filtered_keys[0]
                     ssh_key_ids.append(choice["id"])
@@ -629,7 +654,7 @@ def prepare_wireguard_access() -> None:
                         "→ Vultr 账号中仅检测到一把 SSH 公钥，将自动用于 Reinstall："
                         f"{label}"
                     )
-                elif filtered_keys:
+                else:
                     log_warning(
                         "⚠️ 自动化无法确定需要注入哪把 SSH 公钥，请手动选择。"
                     )
@@ -670,30 +695,8 @@ def prepare_wireguard_access() -> None:
                         if matched["name"]:
                             instance["ssh_key_name"] = matched["name"]
 
-        ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
-
-        if api_key and instance_id:
-            if account_keys is None:
-                from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
-
-                try:
-                    account_keys = list_ssh_keys(api_key)
-                except Exception as exc:  # noqa: BLE001 - surface lookup errors for troubleshooting
-                    log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
-                    account_keys = []
-
-            available_ids = {
-                str(item.get("id", "")).strip()
-                for item in (account_keys or [])
-                if str(item.get("id", "")).strip()
-            }
-            missing_ids = [item for item in ssh_key_ids if item not in available_ids]
-            if missing_ids:
-                log_warning(
-                    "⚠️ 在 Vultr 账号中未找到以下 SSH 公钥 ID，将在重装时忽略："
-                    + ", ".join(missing_ids)
-                )
-            ssh_key_ids = [item for item in ssh_key_ids if item in available_ids]
+        else:
+            ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
 
         if api_key and instance_id and ssh_key_ids:
             if ssh_key_ids != stored_ids:
