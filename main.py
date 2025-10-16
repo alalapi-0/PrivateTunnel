@@ -574,6 +574,7 @@ def prepare_wireguard_access() -> None:
 
         api_key = os.environ.get("VULTR_API_KEY", "").strip()
         ssh_key_ids: list[str] = []
+        account_keys: list[dict[str, Any]] | None = None
 
         stored_ids = instance.get("ssh_key_ids")
         if isinstance(stored_ids, (list, tuple)):
@@ -594,7 +595,8 @@ def prepare_wireguard_access() -> None:
                 from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
 
                 try:
-                    for item in list_ssh_keys(api_key):
+                    account_keys = list_ssh_keys(api_key)
+                    for item in account_keys:
                         name = str(item.get("name", "")).strip()
                         key_id = str(item.get("id", "")).strip()
                         if name == ssh_key_name and key_id:
@@ -604,6 +606,29 @@ def prepare_wireguard_access() -> None:
                     log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
 
         ssh_key_ids = list(dict.fromkeys([item for item in ssh_key_ids if item]))
+
+        if api_key and instance_id:
+            if account_keys is None:
+                from core.tools.vultr_manager import list_ssh_keys  # pylint: disable=import-outside-toplevel
+
+                try:
+                    account_keys = list_ssh_keys(api_key)
+                except Exception as exc:  # noqa: BLE001 - surface lookup errors for troubleshooting
+                    log_warning(f"⚠️ 获取 SSH 公钥列表失败：{exc}")
+                    account_keys = []
+
+            available_ids = {
+                str(item.get("id", "")).strip()
+                for item in (account_keys or [])
+                if str(item.get("id", "")).strip()
+            }
+            missing_ids = [item for item in ssh_key_ids if item not in available_ids]
+            if missing_ids:
+                log_warning(
+                    "⚠️ 在 Vultr 账号中未找到以下 SSH 公钥 ID，将在重装时忽略："
+                    + ", ".join(missing_ids)
+                )
+            ssh_key_ids = [item for item in ssh_key_ids if item in available_ids]
 
         if api_key and instance_id and ssh_key_ids:
             if ssh_key_ids != stored_ids:
