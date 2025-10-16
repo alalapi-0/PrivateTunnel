@@ -28,6 +28,21 @@
 - 若仍失败，可选择 **Reinstall SSH Keys**（会擦除磁盘数据），脚本会进行二次确认并等待实例重装完成；
 - 所有创建信息会写入 `artifacts/instance.json`（含 `sshkey_ids`、`user_data_used` 等字段），方便排查和追踪。
 
+## 🔐 如何确保 SSH 公钥自动注入及排错
+
+- 在创建 Vultr VPS 前于控制台配置 SSH Key，并将其名称写入环境变量 `VULTR_SSHKEY_NAME`，脚本会自动调用 `GET /v2/ssh-keys` 匹配并提取对应 ID；
+- 使用快照创建实例时，会自动生成 cloud-init，将公钥写入 `/root/.ssh/authorized_keys` 并重启 SSH 服务，确保首启动即可免密登录；
+- 每次创建或部署阶段，脚本都会执行 `ssh-keygen -R <ip>` 清理旧指纹，随后分两阶段检测：先探测 22 端口，再循环运行 `ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@<ip> true` 直至免密成功；
+- 若仍无法免密连接，终端会提示：
+  ```
+  ⚠️ 免密连接失败，请在 Vultr 控制台使用 View Console 登录，并执行：
+    cat /root/.ssh/authorized_keys
+    chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys
+    systemctl restart ssh
+  然后重新运行部署。
+  ```
+- 完成上述排错后重新运行脚本，即可再次检测并继续后续 WireGuard 部署。
+
 [![CI](https://img.shields.io/github/actions/workflow/status/your-org/PrivateTunnel/ci.yml?branch=main&label=CI)](./.github/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-iOS%2016%2B-blue)
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
