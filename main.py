@@ -697,7 +697,7 @@ apt-get install -y wireguard wireguard-tools qrencode iptables-persistent netfil
             ),
             (
                 "初始化 WireGuard 配置目录",
-                f"""#!/usr/bin/env bash
+                """#!/usr/bin/env bash
 set -euo pipefail
 
 mkdir -p /etc/wireguard
