@@ -985,7 +985,7 @@ generate_client() {{
   local addr="$2"
   local dir="$3"
   local __pub_var="$4"
-  log "→ 生成客户端 ${name} (IP: ${addr})"
+  log "→ 生成客户端 ${{name}} (IP: ${{addr}})"
   if [ -f "$dir/${{name}}.public" ]; then
     local old_pub
     old_pub=$(cat "$dir/${{name}}.public")
