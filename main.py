@@ -648,11 +648,29 @@ CFG
         systemctl enable wg-quick@wg0
         systemctl restart wg-quick@wg0
 
-        ss -lun | grep -q ":$WG_PORT" || {{
-          err "ERROR: UDP $WG_PORT not listening"
+        sleep 1
+
+        CURRENT_PORT="$(wg show wg0 listen-port 2>/dev/null | tr -d '[:space:]' || true)"
+        if [ -z "$CURRENT_PORT" ] || [ "$CURRENT_PORT" = "0" ]; then
+          warn "未检测到 WireGuard 监听端口，尝试设置为 $WG_PORT…"
+          wg set wg0 listen-port "$WG_PORT" || true
+          sleep 1
+          CURRENT_PORT="$(wg show wg0 listen-port 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
+
+        if [ "$CURRENT_PORT" != "$WG_PORT" ]; then
+          err "ERROR: WireGuard 实际监听端口 ($CURRENT_PORT) 与期望值 ($WG_PORT) 不符"
+          wg show wg0 || true
+          ss -lun || true
           systemctl status wg-quick@wg0 --no-pager -l || true
           exit 1
-        }}
+        fi
+
+        if ss -lun 2>/dev/null | grep -q ":$WG_PORT"; then
+          log "确认 UDP $WG_PORT 已监听"
+        else
+          warn "ss 未检测到 UDP $WG_PORT 监听，继续后续步骤 (wg show 正常)"
+        fi
 
         SERVER_PUBLIC_KEY=$(wg show wg0 public-key)
         SERVER_ENDPOINT_IP=$(curl -4 -s ifconfig.me || true)
