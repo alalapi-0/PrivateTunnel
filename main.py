@@ -73,6 +73,7 @@ class DeploymentError(RuntimeError):
 LOG_FILE: Path | None = None
 SSH_CTX: SSHContext | None = None
 _PARAMIKO_CLIENT: paramiko.SSHClient | None = None
+_SUBPROCESS_TEXT_KWARGS = {"text": True, "encoding": "utf-8", "errors": "replace"}
 
 
 def _colorize(message: str, color: str) -> str:
@@ -365,7 +366,7 @@ def _clean_known_host(ip: str) -> None:
             result = subprocess.run(
                 command,
                 capture_output=True,
-                text=True,
+                **_SUBPROCESS_TEXT_KWARGS,
                 check=False,
             )
         except FileNotFoundError:
@@ -406,7 +407,7 @@ def _ssh_run(command: str, *, timeout: int = 900, description: str | None = None
             completed = subprocess.run(
                 ssh_cmd,
                 capture_output=True,
-                text=True,
+                **_SUBPROCESS_TEXT_KWARGS,
                 timeout=timeout,
                 check=False,
             )
@@ -479,7 +480,7 @@ def _download_with_scp(remote_path: str, local_path: Path, *, timeout: int = 300
         result = subprocess.run(
             scp_cmd,
             capture_output=True,
-            text=True,
+            **_SUBPROCESS_TEXT_KWARGS,
             timeout=timeout,
             check=False,
         )
@@ -794,7 +795,7 @@ def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, attempts: int = 12, i
             command,
             check=False,
             capture_output=True,
-            text=True,
+            **_SUBPROCESS_TEXT_KWARGS,
             timeout=45,
         )
         last_stdout = (result.stdout or "").strip()
@@ -1123,7 +1124,7 @@ def _install_wireguard_windows_via_powershell() -> bool:
             [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
             check=True,
             capture_output=True,
-            text=True,
+            **_SUBPROCESS_TEXT_KWARGS,
         )
     except subprocess.CalledProcessError as exc:
         output = (exc.stderr or exc.stdout or "").strip()
@@ -1210,7 +1211,7 @@ def _diagnostic_ping(ip: str) -> bool:
             ping_cmd,
             check=False,
             capture_output=True,
-            text=True,
+            **_SUBPROCESS_TEXT_KWARGS,
             timeout=20,
         )
     except subprocess.SubprocessError as exc:
@@ -1400,7 +1401,7 @@ def wait_instance_ping(ip: str, timeout: int = 600, interval: int = 60) -> bool:
                 ping_command,
                 check=False,
                 capture_output=True,
-                text=True,
+                **_SUBPROCESS_TEXT_KWARGS,
                 timeout=30,
             )
         except subprocess.SubprocessError as exc:
