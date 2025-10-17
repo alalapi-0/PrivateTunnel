@@ -836,22 +836,32 @@ def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, attempts: int = 12, i
     last_stderr = ""
     for attempt in range(1, attempts + 1):
         log_info(f"  ↻ 第 {attempt} 次免密检测：ssh root@{ip} true")
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            **_SUBPROCESS_TEXT_KWARGS,
-            timeout=45,
-        )
-        last_stdout = (result.stdout or "").strip()
-        last_stderr = (result.stderr or "").strip()
-        if result.returncode == 0:
-            log_success("   免密 SSH 校验通过。")
-            return True
-        if last_stdout:
-            log_warning(f"   stdout: {last_stdout}")
-        if last_stderr:
-            log_warning(f"   stderr: {last_stderr}")
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                **_SUBPROCESS_TEXT_KWARGS,
+                timeout=45,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_stdout = (exc.stdout or "").strip()
+            last_stderr = (exc.stderr or "").strip()
+            log_warning("   ssh 命令在 45 秒内未返回，可能受到网络限制或服务器尚未就绪。")
+            if last_stdout:
+                log_warning(f"   stdout: {last_stdout}")
+            if last_stderr:
+                log_warning(f"   stderr: {last_stderr}")
+        else:
+            last_stdout = (result.stdout or "").strip()
+            last_stderr = (result.stderr or "").strip()
+            if result.returncode == 0:
+                log_success("   免密 SSH 校验通过。")
+                return True
+            if last_stdout:
+                log_warning(f"   stdout: {last_stdout}")
+            if last_stderr:
+                log_warning(f"   stderr: {last_stderr}")
         time.sleep(interval)
 
     log_error(
