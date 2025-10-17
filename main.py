@@ -529,34 +529,19 @@ def _download_artifact(remote_path: str, local_path: Path) -> bool:
     return True
 
 
-def _generate_qr_from_config(config_path: Path, output_path: Path) -> None:
-    """Generate a QR code PNG from the given WireGuard config."""
+def _ensure_remote_artifact(remote_path: str, description: str) -> None:
+    """Ensure ``remote_path`` exists and is non-empty on the server."""
 
-    try:
-        config_text = config_path.read_text(encoding="utf-8").strip()
-    except OSError as exc:  # noqa: BLE001
-        raise DeploymentError(f"读取配置文件失败：{exc}") from exc
-
-    if not config_text:
-        raise DeploymentError("配置文件内容为空，无法生成二维码。")
-
-    try:
-        import qrcode  # type: ignore
-        from qrcode.constants import ERROR_CORRECT_Q  # type: ignore
-    except ImportError as exc:  # noqa: BLE001
+    check_cmd = f"test -s {shlex.quote(remote_path)} && echo OK || echo MISSING"
+    result = _ssh_run(
+        f"bash -lc {shlex.quote(check_cmd)}",
+        timeout=60,
+        description=f"校验远端文件 {remote_path}",
+    )
+    if "OK" not in result.stdout:
         raise DeploymentError(
-            "未安装 qrcode[pil]，无法生成二维码，请执行 `pip install qrcode[pil]` 后重试。",
-        ) from exc
-
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        qr = qrcode.QRCode(error_correction=ERROR_CORRECT_Q, box_size=8, border=2)
-        qr.add_data(config_text)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-        img.save(output_path)
-    except Exception as exc:  # noqa: BLE001
-        raise DeploymentError(f"生成二维码失败：{exc}") from exc
+            f"远端未生成{description}（{remote_path}），请查看部署日志与 /etc/wireguard/clients。"
+        )
 
 
 def deploy_wireguard_remote_script(
@@ -572,38 +557,29 @@ def deploy_wireguard_remote_script(
 
     return textwrap.dedent(
         f"""
-        cat <<'EOS' >/tmp/privatetunnel-wireguard.sh
         #!/usr/bin/env bash
         set -euo pipefail
 
-        log() {{
-          printf '[%s] %s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
-        }}
-
-        warn() {{
-          printf '[%s] ⚠️ %s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
-        }}
-
-        err() {{
-          printf '[%s] ❌ %s\\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2
-        }}
+        log()  {{ printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }}
+        warn() {{ printf '[%s] ⚠️ %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }}
+        err()  {{ printf '[%s] ❌ %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }}
 
         export DEBIAN_FRONTEND=noninteractive
 
-        WG_PORT={listen_port}
+        WG_PORT=${{WG_PORT:-{listen_port}}}
         WG_DIR=/etc/wireguard
         SERVER_CONF="$WG_DIR/wg0.conf"
         SERVER_PRIV="$WG_DIR/server.private"
-        SERVER_PUB="$WG_DIR/server.public"
+        SERVER_PUB_FILE="$WG_DIR/server.public"
         CLIENT_BASE="$WG_DIR/clients"
         DESKTOP_DIR="$CLIENT_BASE/desktop"
         IPHONE_DIR="$CLIENT_BASE/iphone"
-        DESKTOP_IP="{desktop_ip}"
-        IPHONE_IP="{iphone_ip}"
-        DNS_SERVERS="{dns_servers}"
-        ALLOWED_IPS="{allowed_ips}"
-        DESKTOP_MTU="{desktop_mtu}"
-        SERVER_FALLBACK_IP="{server_ip}"
+        DESKTOP_IP="${{PT_DESKTOP_IP:-{desktop_ip}}}"
+        IPHONE_IP="${{PT_IPHONE_IP:-{iphone_ip}}}"
+        DNS_SERVERS="${{PT_DNS:-{dns_servers}}}"
+        ALLOWED_IPS="${{PT_ALLOWED_IPS:-{allowed_ips}}}"
+        DESKTOP_MTU="${{PT_CLIENT_MTU:-{desktop_mtu}}}"
+        SERVER_FALLBACK_IP="$(ip -o -4 addr show dev \"$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)\" | awk '{{print $4}}' | cut -d/ -f1 | head -n1)"
 
         log "安装 WireGuard 组件"
         apt-get update -y
@@ -614,7 +590,7 @@ def deploy_wireguard_remote_script(
         sysctl -w net.ipv6.conf.all.forwarding=1
         echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wireguard-forward.conf
         echo 'net.ipv6.conf.all.forwarding=1' > /etc/sysctl.d/99-wireguard-forward6.conf
-        sysctl --system
+        sysctl --system || true
 
         WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
         if [ -z "${{WAN_IF:-}}" ]; then
@@ -625,13 +601,13 @@ def deploy_wireguard_remote_script(
 
         log "刷新并写入 NAT/FORWARD 规则"
         iptables -t nat -D POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
-        iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \\
+        iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
         iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
         iptables -D FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
-        iptables -C FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null || \\
+        iptables -C FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT
         iptables -D FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-        iptables -C FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \\
+        iptables -C FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
 
         if command -v ufw >/dev/null 2>&1; then
@@ -650,10 +626,9 @@ def deploy_wireguard_remote_script(
 
         if [ ! -f "$SERVER_PRIV" ]; then
           log "生成服务器密钥对"
-          wg genkey | tee "$SERVER_PRIV" | wg pubkey > "$SERVER_PUB"
+          wg genkey | tee "$SERVER_PRIV" | wg pubkey > "$SERVER_PUB_FILE"
         fi
         SERVER_PRIVATE=$(cat "$SERVER_PRIV")
-        SERVER_PUBLIC=$(cat "$SERVER_PUB")
 
         cat >"$SERVER_CONF" <<CFG
 [Interface]
@@ -668,17 +643,17 @@ CFG
         systemctl restart wg-quick@wg0
 
         ss -lun | grep -q ":$WG_PORT" || {{
-          err "ERROR: UDP {listen_port} not listening"
+          err "ERROR: UDP $WG_PORT not listening"
           systemctl status wg-quick@wg0 --no-pager -l || true
           exit 1
         }}
 
-        SERVER_PUB=$(wg show wg0 public-key)
+        SERVER_PUBLIC_KEY=$(wg show wg0 public-key)
         SERVER_ENDPOINT_IP=$(curl -4 -s ifconfig.me || true)
         if [ -z "$SERVER_ENDPOINT_IP" ]; then
-          SERVER_ENDPOINT_IP=$(ip -o -4 addr show dev "$WAN_IF" | awk '{{print $4}}' | cut -d/ -f1 | head -n1)
+          SERVER_ENDPOINT_IP="$SERVER_FALLBACK_IP"
         fi
-        ENDPOINT="${{SERVER_ENDPOINT_IP:-$SERVER_FALLBACK_IP}}:$WG_PORT"
+        ENDPOINT="${{SERVER_ENDPOINT_IP}}:${{WG_PORT}}"
 
         ensure_client_keys() {{
           local name="$1"
@@ -690,8 +665,7 @@ CFG
           else
             cat "$priv_file" | wg pubkey > "$pub_file"
           fi
-          chmod 600 "$priv_file"
-          chmod 600 "$pub_file"
+          chmod 600 "$priv_file" "$pub_file"
         }}
 
         ensure_client_keys "desktop" "$DESKTOP_DIR"
@@ -704,14 +678,10 @@ CFG
 PrivateKey = $DESKTOP_PRIV
 Address = $DESKTOP_IP
 DNS = $DNS_SERVERS
-CFG
-        if [ -n "$DESKTOP_MTU" ]; then
-          printf 'MTU = %s\n' "$DESKTOP_MTU" >>"$DESKTOP_DIR/desktop.conf"
-        fi
-        cat >>"$DESKTOP_DIR/desktop.conf" <<CFG
+MTU = $DESKTOP_MTU
 
 [Peer]
-PublicKey = $SERVER_PUB
+PublicKey = $SERVER_PUBLIC_KEY
 AllowedIPs = $ALLOWED_IPS
 Endpoint = $ENDPOINT
 PersistentKeepalive = 25
@@ -727,7 +697,7 @@ Address = $IPHONE_IP
 DNS = $DNS_SERVERS
 
 [Peer]
-PublicKey = $SERVER_PUB
+PublicKey = $SERVER_PUBLIC_KEY
 AllowedIPs = $ALLOWED_IPS
 Endpoint = $ENDPOINT
 PersistentKeepalive = 25
@@ -742,23 +712,43 @@ CFG
         wg-quick save wg0
         systemctl restart wg-quick@wg0
 
-        qrencode -o "$IPHONE_DIR/iphone.png" -s 8 -m 2 <"$IPHONE_DIR/iphone.conf"
+        qrencode -o "$IPHONE_DIR/iphone.png" -s 8 -m 2 <"$IPHONE_DIR/iphone.conf" || true
 
-        log "[OK] Server-side WireGuard fully configured."
+        missing=0
+        for f in "$DESKTOP_DIR/desktop.conf" "$IPHONE_DIR/iphone.conf" "$IPHONE_DIR/iphone.png"; do
+          if [ ! -s "$f" ]; then
+            err "文件未生成：$f"
+            missing=1
+          fi
+        done
+        if [ "$missing" -ne 0 ]; then
+          ls -l "$DESKTOP_DIR" "$IPHONE_DIR" || true
+          exit 1
+        fi
+
+        log "验证配置文件："
+        ls -lh "$DESKTOP_DIR" "$IPHONE_DIR" || true
+
+        printf 'SERVER_PUBLIC_KEY=%s\n' "$SERVER_PUBLIC_KEY"
+        printf 'DESKTOP_PUBLIC_KEY=%s\n' "$DESKTOP_PUB"
+        printf 'IPHONE_PUBLIC_KEY=%s\n' "$IPHONE_PUB"
+        printf 'ENDPOINT=%s\n' "$ENDPOINT"
+        printf 'WAN_IF=%s\n' "$WAN_IF"
+
         cat <<SUMMARY
-SERVER_PUBLIC_KEY=$SERVER_PUB
-DESKTOP_PUBLIC_KEY=$DESKTOP_PUB
-IPHONE_PUBLIC_KEY=$IPHONE_PUB
-ENDPOINT=$ENDPOINT
-WAN_IF=$WAN_IF
+──────────────────────────────
+[WireGuard 已配置完毕]
+服务器：
+  公钥：$SERVER_PUBLIC_KEY
+  端点：$ENDPOINT
+客户端：
+  桌面：/etc/wireguard/clients/desktop/desktop.conf
+  iPhone：/etc/wireguard/clients/iphone/iphone.conf
+  iPhone二维码：/etc/wireguard/clients/iphone/iphone.png
+──────────────────────────────
 SUMMARY
-        EOS
-        chmod +x /tmp/privatetunnel-wireguard.sh
-        bash /tmp/privatetunnel-wireguard.sh
-        rm -f /tmp/privatetunnel-wireguard.sh
         """
-    )
-
+    ).strip()
 
 def _wait_for_port_22(ip: str, *, attempts: int = 10, interval: int = 5) -> bool:
     """Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``attempts`` exhausted."""
@@ -1565,7 +1555,30 @@ def prepare_wireguard_access() -> None:
             allowed_ips,
             desktop_mtu,
         )
-        command = f"bash -lc {shlex.quote(remote_script)}"
+        script_payload = (
+            "cat <<'EOS' >/tmp/privatetunnel-wireguard.sh\n"
+            f"{remote_script}\n"
+            "EOS\n"
+        )
+        env_parts = [
+            f"{key}={shlex.quote(value)}"
+            for key, value in {
+                "WG_PORT": str(LISTEN_PORT),
+                "PT_DESKTOP_IP": desktop_ip,
+                "PT_IPHONE_IP": iphone_ip,
+                "PT_DNS": dns_value,
+                "PT_ALLOWED_IPS": allowed_ips,
+                "PT_CLIENT_MTU": desktop_mtu,
+            }.items()
+            if value
+        ]
+        env_prefix = " ".join(env_parts)
+        run_line = (
+            f"{env_prefix + ' ' if env_prefix else ''}bash /tmp/privatetunnel-wireguard.sh "
+            "&& rm -f /tmp/privatetunnel-wireguard.sh"
+        )
+        command_body = script_payload + run_line + "\n"
+        command = f"bash -lc {shlex.quote(command_body)}"
         result = _ssh_run(command, timeout=1800, description="部署 WireGuard 服务端")
 
         summary: dict[str, str] = {}
@@ -1594,21 +1607,30 @@ def prepare_wireguard_access() -> None:
         iphone_conf_local = artifacts_dir / "iphone.conf"
         iphone_png_local = artifacts_dir / "iphone.png"
 
+        remote_desktop_conf = "/etc/wireguard/clients/desktop/desktop.conf"
+        remote_iphone_conf = "/etc/wireguard/clients/iphone/iphone.conf"
+        remote_iphone_png = "/etc/wireguard/clients/iphone/iphone.png"
+
+        log_info("→ 校验远端桌面端配置是否生成…")
+        _ensure_remote_artifact(remote_desktop_conf, "桌面端配置文件")
+        log_info("→ 校验远端 iPhone 配置是否生成…")
+        _ensure_remote_artifact(remote_iphone_conf, "iPhone 配置文件")
+        log_info("→ 校验远端 iPhone 二维码是否生成…")
+        _ensure_remote_artifact(remote_iphone_png, "iPhone 二维码")
+
         log_info(f"→ 下载桌面端配置到 {desktop_conf_local}")
-        if not _download_artifact("/etc/wireguard/clients/desktop/desktop.conf", desktop_conf_local):
+        if not _download_artifact(remote_desktop_conf, desktop_conf_local):
             raise DeploymentError("下载桌面端配置失败，请手动检查 /etc/wireguard/clients/desktop/desktop.conf。")
 
         log_info(f"→ 下载 iPhone 配置到 {iphone_conf_local}")
-        if not _download_artifact("/etc/wireguard/clients/iphone/iphone.conf", iphone_conf_local):
+        if not _download_artifact(remote_iphone_conf, iphone_conf_local):
             raise DeploymentError("下载 iPhone 配置失败，请手动检查 /etc/wireguard/clients/iphone/iphone.conf。")
 
-        log_info("→ 基于本地配置生成 iPhone 二维码…")
-        try:
-            _generate_qr_from_config(iphone_conf_local, iphone_png_local)
-        except DeploymentError as exc:
-            raise DeploymentError("无法生成 iPhone 二维码：" + str(exc)) from exc
-        else:
-            log_success(f"✅ 已生成 iPhone 二维码：{iphone_png_local}")
+        log_info(f"→ 下载 iPhone 二维码到 {iphone_png_local}")
+        if not _download_artifact(remote_iphone_png, iphone_png_local):
+            raise DeploymentError("下载 iPhone 二维码失败，请检查远端 /etc/wireguard/clients/iphone/iphone.png。")
+
+        log_success(f"✅ 已下载 iPhone 二维码：{iphone_png_local}")
 
         for path in (desktop_conf_local, iphone_conf_local, iphone_png_local):
             if not path.exists():
