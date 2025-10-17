@@ -9,7 +9,7 @@ ENV_KEYS = (
     "WG_PORT",
 )
 
-DEFAULT_WG_PORT = 51820
+DEFAULT_WG_PORT = 443
 
 
 def _parse_port(value: str, *, source: str) -> int:
@@ -40,7 +40,7 @@ def get_default_wg_port() -> int:
 
     The helper inspects ``PRIVATETUNNEL_WG_PORT`` (preferred), ``PT_WG_PORT`` and
     ``WG_PORT``. The first non-empty variable wins. Values must be integers within
-    the 1-65535 range. When no overrides are present the default ``51820`` is
+    the 1-65535 range. When no overrides are present the default ``443`` is
     returned.
     """
 

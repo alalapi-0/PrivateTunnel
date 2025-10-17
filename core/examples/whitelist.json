@@ -3,7 +3,7 @@
   "profile_name": "mac-whitelist",
   "endpoint": {
     "host": "us.example.net",
-    "port": 51820,
+    "port": 443,
     "public_key": "sjVxi8cvRlBu8TX7uXbUWPONrP7610Tu1O3M2CowiGA=",
     "ipv6": false
   },

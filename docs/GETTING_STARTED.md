@@ -29,7 +29,7 @@ cd PrivateTunnel
    根据实际网卡名称调整 `WAN_IF`。干跑会打印即将执行的操作，确认无误后继续。
 3. 执行安装：
    ```bash
-   sudo WAN_IF=eth0 bash server/provision/wg-install.sh --port 51820 --ifname wg0
+   sudo WAN_IF=eth0 bash server/provision/wg-install.sh --port 443 --ifname wg0
    ```
 4. 添加第一个客户端（例如 iPhone）：
    ```bash
