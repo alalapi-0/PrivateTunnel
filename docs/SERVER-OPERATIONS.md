@@ -17,7 +17,7 @@ artifacts for auditing or rollback.
 
 2. **Install the server**
    ```bash
-   sudo bash wg-install.sh --port 51820 --ifname wg0 --wan-if eth0
+   sudo bash wg-install.sh --port 443 --ifname wg0 --wan-if eth0
    ```
    The script installs dependencies, generates `/etc/wireguard/wg0.conf`, enables
    `wg-quick@wg0`, and prints your public key plus connectivity details. Rerun
@@ -51,7 +51,7 @@ preferences such as `WG_PORT`, `WG_SUBNET`, `WG_SUBNET_V6`, `WG_ENDPOINT`, or
 | ------------------------------ | ----------- |
 | `--dry-run`                    | Print actions without touching the system. |
 | `--yes`                        | Skip confirmations when replacing existing config. |
-| `--port`, `WG_PORT`            | UDP listen port (default `51820`). Suggest `443` if UDP is filtered. |
+| `--port`, `WG_PORT`            | UDP listen port (default `443`). 若该端口被封锁，可改用 `51820` 或其它值。 |
 | `--ifname`, `WG_IF`            | WireGuard interface name (default `wg0`). |
 | `--wan-if`, `WAN_IF`           | Outbound NIC used for NAT (default `eth0`). |
 | `--subnet`, `WG_SUBNET`        | IPv4 tunnel network (default `10.6.0.0/24`). |

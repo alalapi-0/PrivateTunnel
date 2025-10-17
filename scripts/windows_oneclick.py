@@ -173,7 +173,7 @@ def _record_server_info(ip: str, provision_result: dict) -> None:
     try:
         default_port, _ = resolve_listen_port()
     except ValueError:
-        default_port = 51820
+        default_port = 443
     try:
         port_value = provision_result.get("port", default_port)
         port = int(port_value)
@@ -567,7 +567,10 @@ def deploy_wireguard(instance: Dict[str, object], private_key_path: Path) -> Non
     if listen_port_source:
         print(f"→ 使用环境变量 {listen_port_source} 设置 WireGuard UDP 端口：{listen_port}")
     else:
-        port_input = _prompt("WireGuard UDP 端口 (若 51820 被屏蔽可改为 443)", str(listen_port))
+        port_input = _prompt(
+            "WireGuard UDP 端口 (若 443 被拦截可改为 51820 或其他)",
+            str(listen_port),
+        )
         try:
             listen_port = int(port_input)
         except ValueError as exc:
