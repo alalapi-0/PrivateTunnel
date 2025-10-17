@@ -653,13 +653,35 @@ CFG
         CURRENT_PORT="$(wg show wg0 listen-port 2>/dev/null | tr -d '[:space:]' || true)"
         if [ -z "$CURRENT_PORT" ] || [ "$CURRENT_PORT" = "0" ]; then
           warn "未检测到 WireGuard 监听端口，尝试设置为 $WG_PORT…"
-          wg set wg0 listen-port "$WG_PORT" || true
+          if ! output=$(wg set wg0 listen-port "$WG_PORT" 2>&1); then
+            warn "wg set 调整监听端口失败：$output"
+          fi
           sleep 1
           CURRENT_PORT="$(wg show wg0 listen-port 2>/dev/null | tr -d '[:space:]' || true)"
         fi
 
         if [ "$CURRENT_PORT" != "$WG_PORT" ]; then
-          err "ERROR: WireGuard 实际监听端口 ($CURRENT_PORT) 与期望值 ($WG_PORT) 不符"
+          warn "WireGuard 当前监听端口为 $CURRENT_PORT，尝试使用 wg setconf 强制写入 $WG_PORT…"
+          TMP_CFG="$(mktemp)"
+          cat >"$TMP_CFG" <<FORCE
+[Interface]
+PrivateKey = $SERVER_PRIVATE
+ListenPort = $WG_PORT
+FORCE
+          if ! output=$(wg setconf wg0 "$TMP_CFG" 2>&1); then
+            warn "wg setconf 强制监听端口失败：$output"
+          fi
+          rm -f "$TMP_CFG"
+          sleep 1
+          CURRENT_PORT="$(wg show wg0 listen-port 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
+
+        if [ "$CURRENT_PORT" != "$WG_PORT" ]; then
+          in_use_msg=""
+          if ss -lun 2>/dev/null | grep -q ":$WG_PORT"; then
+            in_use_msg=" (检测到其他进程占用 $WG_PORT/udp)"
+          fi
+          err "ERROR: WireGuard 实际监听端口 ($CURRENT_PORT) 与期望值 ($WG_PORT) 不符$in_use_msg"
           wg show wg0 || true
           ss -lun || true
           systemctl status wg-quick@wg0 --no-pager -l || true
