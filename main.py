@@ -1078,6 +1078,93 @@ def create_vps() -> None:
     log_success(f"已写入 {instance_file}")
 
 
+def inspect_vps_inventory() -> None:
+    """Inspect existing Vultr instances and optionally destroy them."""
+
+    from core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
+        VultrError,
+        destroy_instance,
+        list_instances,
+    )
+
+    log_section("🧾 Step 4: 检查 Vultr 实例")
+    _log_selected_platform()
+
+    api_key = os.environ.get("VULTR_API_KEY", "").strip()
+    if not api_key:
+        log_error("❌ 未检测到环境变量 VULTR_API_KEY。请先设置后重试。")
+        return
+
+    log_info("→ 正在查询账户下的实例…")
+    try:
+        instances = list_instances(api_key)
+    except VultrError as exc:
+        log_error(f"❌ 查询实例失败：{exc}")
+        return
+
+    if not instances:
+        log_success("✅ 当前账户没有任何 Vultr 实例。")
+        return
+
+    def describe_instance(index: int, instance: dict[str, Any]) -> str:
+        instance_id = instance.get("id", "")
+        label = instance.get("label") or "-"
+        region = instance.get("region")
+        if isinstance(region, dict):
+            region_code = region.get("code") or region.get("id") or ""
+        else:
+            region_code = str(region or "")
+        main_ip = instance.get("main_ip") or "-"
+        status = instance.get("status") or "-"
+        power_status = instance.get("power_status") or "-"
+        return (
+            f"{index}) id={instance_id} | label={label} | region={region_code or '-'} | "
+            f"ip={main_ip} | status={status}/{power_status}"
+        )
+
+    while True:
+        log_info("→ 当前账号存在以下实例：")
+        for idx, item in enumerate(instances, start=1):
+            log_info(describe_instance(idx, item))
+
+        choice = input("输入序号销毁实例，或直接回车返回主菜单: ").strip().lower()
+        if choice in {"", "q", "quit", "exit"}:
+            log_info("→ 已退出实例检查，不执行销毁操作。")
+            return
+        if not choice.isdigit():
+            log_error("❌ 无效选择，请输入列表中的序号或直接回车退出。")
+            continue
+
+        index = int(choice)
+        if index < 1 or index > len(instances):
+            log_error("❌ 序号超出范围，请重试。")
+            continue
+
+        target = instances[index - 1]
+        instance_id = target.get("id", "")
+        label = target.get("label") or instance_id or "实例"
+        confirm = input(f"确认销毁实例 {label}? (y/N): ").strip().lower()
+        if confirm not in {"y", "yes"}:
+            log_info("→ 已取消销毁。")
+            continue
+
+        if not instance_id:
+            log_error("❌ 目标实例缺少 ID，无法执行销毁。")
+            continue
+
+        try:
+            destroy_instance(api_key, instance_id)
+        except VultrError as exc:
+            log_error(f"❌ 销毁实例失败：{exc}")
+            continue
+
+        log_success(f"✅ 已提交销毁实例 {instance_id}。")
+        instances.pop(index - 1)
+        if not instances:
+            log_success("✅ 当前账户已无其他 Vultr 实例。")
+            return
+
+
 def _log_selected_platform() -> None:
     if SELECTED_PLATFORM:
         label = PLATFORM_CHOICES.get(SELECTED_PLATFORM, SELECTED_PLATFORM)
@@ -1424,12 +1511,6 @@ def run_environment_check() -> None:
     _maybe_run_network_diagnostics()
 
 
-def run_prune() -> None:
-    code = subprocess.call([sys.executable, "scripts/prune_non_windows_only.py"])
-    if code == 0:
-        print("\n🧹 精简完成。请查看 PROJECT_PRUNE_REPORT.md")
-    else:
-        print("\n⚠️ 精简脚本返回异常，请查看输出。")
 from core.ssh_utils import (
     ask_key_path,
     nuke_known_host,
@@ -1739,61 +1820,13 @@ def prepare_wireguard_access() -> None:
         SSH_CTX = None
 
 
-def generate_mobile_qr() -> None:
-    """Generate a QR code for importing the desktop config on mobile devices."""
-
-    log_section("📱 Step 4: 生成移动端二维码配置")
-    _log_selected_platform()
-
-    artifacts_dir = ARTIFACTS_DIR
-    conf_local = artifacts_dir / "desktop.conf"
-    if not conf_local.exists():
-        log_error("❌ 未找到桌面端配置文件，请先执行第 3 步生成配置。")
-        return
-
-    try:
-        config_text = conf_local.read_text(encoding="utf-8").strip()
-    except OSError as exc:  # noqa: BLE001
-        log_error(f"❌ 读取配置文件失败：{exc}")
-        return
-
-    if not config_text:
-        log_error("❌ 配置文件内容为空，无法生成二维码。")
-        return
-
-    try:
-        import qrcode  # type: ignore
-    except ImportError as exc:  # noqa: BLE001
-        log_error(f"❌ 未安装 qrcode 包：{exc}")
-        log_warning("⚠️ 请执行 `pip install qrcode[pil]` 后重试。")
-        return
-
-    qr_local = artifacts_dir / "desktop.png"
-    try:
-        qr_local.parent.mkdir(parents=True, exist_ok=True)
-        img = qrcode.make(config_text)
-        img.save(qr_local)
-    except Exception as exc:  # noqa: BLE001
-        log_error(f"❌ 生成二维码失败：{exc}")
-        return
-
-    _update_server_info({
-        "client_config": str(conf_local),
-        "qr_code": str(qr_local),
-    })
-
-    log_success(f"✅ 已生成二维码：{qr_local}")
-    log_info("→ 可使用手机 WireGuard 或其他支持 WireGuard 的客户端扫码导入。")
-
-
 def main() -> None:
     while True:
         print("\n=== PrivateTunnel 桌面助手 ===")
         print("1) 检查本机环境（Windows/macOS）")
         print("2) 创建 VPS（Vultr）")
         print("3) 准备本机接入 VPS 网络")
-        print("4) 生成移动端二维码配置")
-        print("5) 执行项目精简（移除/归档非 Windows 代码与 CI）")
+        print("4) 检查账户中的 Vultr 实例")
         print("q) 退出")
         choice = input("请选择: ").strip().lower()
         if choice == "1":
@@ -1803,9 +1836,7 @@ def main() -> None:
         elif choice == "3":
             prepare_wireguard_access()
         elif choice == "4":
-            generate_mobile_qr()
-        elif choice == "5":
-            run_prune()
+            inspect_vps_inventory()
         elif choice == "q":
             break
         else:

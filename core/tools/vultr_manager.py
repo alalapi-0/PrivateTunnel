@@ -96,6 +96,32 @@ def list_ssh_keys(api_key: str) -> list[Dict[str, Any]]:
     return keys
 
 
+def list_instances(api_key: str) -> list[Dict[str, Any]]:
+    """Return all VPS instances associated with the account."""
+
+    session = _session(api_key)
+    instances: list[Dict[str, Any]] = []
+    cursor: str | None = None
+
+    while True:
+        params = {"per_page": 100}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            response = session.get(f"{API}/instances", params=params, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as exc:  # pragma: no cover - network
+            message = _friendly_error_message(exc)
+            raise VultrError(f"List instances failed: {message}") from exc
+
+        payload = response.json()
+        instances.extend(payload.get("instances", []))
+        cursor = payload.get("meta", {}).get("links", {}).get("next")
+        if not cursor:
+            break
+    return instances
+
+
 def create_ssh_key(api_key: str, name: str, key_text: str) -> Dict[str, Any]:
     """Create a new SSH key in Vultr."""
 

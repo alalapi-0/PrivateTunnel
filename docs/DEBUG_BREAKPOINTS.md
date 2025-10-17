@@ -9,7 +9,7 @@ inspect state.
 | Location | Why to break |
 | --- | --- |
 | `main.py:L668` (`main()` before reading `choice`) | Inspect the rendered menu and confirm what `input()` returns. Useful when menu choices behave unexpectedly. |
-| `main.py:L676-L683` (branching on `choice`) | Step into the selected workflow (`run_doctor`, `create_vps`, `deploy_wireguard`, `run_prune`). |
+| `main.py:L676-L683` (branching on `choice`) | Step into the selected workflow (`run_doctor`, `create_vps`, `deploy_wireguard`, `inspect_vps_inventory`). |
 
 ## Vultr Provisioning (`create_vps` in `main.py`)
 
@@ -45,12 +45,12 @@ Supporting functions worth instrumenting:
 | `main.py:L626-L639` | Confirm SFTP downloads (QR code and client config) succeed and land in `artifacts/`. |
 | `main.py:L641-L660` | Inspect the metadata written to `artifacts/server.json` (including `server_pub`). |
 
-## Health & Prune Utilities (`run_doctor` / `run_prune`)
+## Health & Inventory Utilities (`run_doctor` / `inspect_vps_inventory`)
 
 | Location | Why to break |
 | --- | --- |
 | `main.py:L355-L360` | Inspect the exit code of `scripts/project_doctor.py` when the health check fails. |
-| `main.py:L363-L368` | Inspect the exit code of `scripts/prune_non_windows_only.py` when pruning fails. |
+| `main.py:L363-L368` | Observe interactive prompts when enumerating or destroying existing Vultr instances. |
 
 # SSH Helper Breakpoints (`core/ssh_utils.py`)
 
@@ -72,6 +72,7 @@ Supporting functions worth instrumenting:
 | `_session` / `_hdr` | `core/tools/vultr_manager.py:L41-L55` | Confirm the API key is injected and IPv4-only adapter is applied when needed. |
 | `_friendly_error_message` | `core/tools/vultr_manager.py:L58-L70` | Inspect generated messages for HTTP errors surfaced in the UI. |
 | `list_ssh_keys` | `core/tools/vultr_manager.py:L73-L96` | Debug pagination or authentication problems when no keys are returned. |
+| `list_instances` | `core/tools/vultr_manager.py:L99-L122` | Trace pagination and filtering when enumerating existing VPS instances. |
 | `create_instance` | `core/tools/vultr_manager.py:L113-L159` | Inspect the request payload and server response when provisioning fails. |
 | `wait_instance_active` | `core/tools/vultr_manager.py:L162-L194` | Monitor polling state and the final payload that provides the public IP. |
 | `destroy_instance` | `core/tools/vultr_manager.py:L197-L211` | Ensure cleanup requests succeed after failed provisioning. |
