@@ -116,6 +116,14 @@ def provision(
             sysctl -w net.ipv4.ip_forward=1
             WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
             iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
+            iptables -D INPUT -p udp --dport "{listen_port}" -j ACCEPT 2>/dev/null || true
+            iptables -C INPUT -p udp --dport "{listen_port}" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "{listen_port}" -j ACCEPT
+            if command -v ufw >/dev/null 2>&1; then
+              if ufw status | grep -qi "Status: active"; then
+                ufw allow "{listen_port}"/udp || true
+                ufw reload || true
+              fi
+            fi
             netfilter-persistent save || true
             systemctl enable wg-quick@wg0
             systemctl restart wg-quick@wg0

@@ -600,7 +600,7 @@ def deploy_wireguard_remote_script(
         fi
         log "检测到默认路由接口: $WAN_IF"
 
-        log "刷新并写入 NAT/FORWARD 规则"
+        log "刷新并写入 NAT/FORWARD/INPUT 规则"
         iptables -t nat -D POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
         iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
         iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
@@ -610,11 +610,16 @@ def deploy_wireguard_remote_script(
         iptables -D FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
         iptables -C FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -i "$WAN_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+        iptables -D INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || true
+        iptables -C INPUT -p udp --dport "$WG_PORT" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p udp --dport "$WG_PORT" -j ACCEPT
 
         if command -v ufw >/dev/null 2>&1; then
           if ufw status | grep -qi "Status: active"; then
+            ufw allow "$WG_PORT"/udp || true
             ufw route allow in on wg0 out on "$WAN_IF" || true
             ufw route allow in on "$WAN_IF" out on wg0 || true
+            ufw reload || true
           fi
         fi
 
