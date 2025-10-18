@@ -9,6 +9,8 @@ import time
 import shlex
 import shutil
 import textwrap
+
+from core.project_overview import generate_project_overview
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1322,6 +1324,98 @@ def _desktop_usage_tip() -> None:
         )
 
 
+def launch_gui() -> None:
+    """打开可视化界面以操作各项功能。"""
+
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, scrolledtext, simpledialog
+    except Exception as exc:  # noqa: BLE001 - 捕获所有异常以保证 CLI 可继续执行
+        log_error(f"❌ 无法加载图形界面组件：{exc}")
+        return
+
+    import builtins
+    import contextlib
+    import io
+
+    window = tk.Tk()
+    window.title("PrivateTunnel 桌面助手 - 图形界面")
+
+    text_area = scrolledtext.ScrolledText(window, wrap=tk.WORD, width=100, height=30, state=tk.DISABLED)
+    text_area.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+
+    button_frame = tk.Frame(window)
+    button_frame.pack(fill=tk.X, padx=12, pady=(0, 12))
+
+    def append_output(message: str) -> None:
+        text_area.configure(state=tk.NORMAL)
+        text_area.insert(tk.END, message)
+        text_area.see(tk.END)
+        text_area.configure(state=tk.DISABLED)
+
+    @contextlib.contextmanager
+    def patched_streams() -> Any:
+        buffer = io.StringIO()
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = buffer
+        sys.stderr = buffer
+        try:
+            yield buffer
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+    @contextlib.contextmanager
+    def patched_input() -> Any:
+        original_input = builtins.input
+
+        def gui_input(prompt: str = "") -> str:
+            response = simpledialog.askstring("输入", prompt, parent=window)
+            if response is None:
+                return ""
+            return response
+
+        builtins.input = gui_input
+        try:
+            yield
+        finally:
+            builtins.input = original_input
+
+    def run_action(action: Any, description: str) -> None:
+        append_output(f"\n=== {description} ===\n")
+        window.update_idletasks()
+        try:
+            with patched_streams() as buffer:
+                with patched_input():
+                    action()
+        except SystemExit as exc:
+            append_output(f"程序退出：{exc}\n")
+        except Exception as exc:  # noqa: BLE001
+            append_output(f"❌ {description} 失败：{exc}\n")
+            messagebox.showerror("错误", f"{description} 失败：{exc}")
+        else:
+            output = buffer.getvalue()
+            if output:
+                append_output(output)
+            messagebox.showinfo("完成", f"{description} 已完成。")
+
+    actions = [
+        ("检查本机环境（Windows/macOS）", run_environment_check, "检查本机环境"),
+        ("创建 VPS（Vultr）", create_vps, "创建 VPS"),
+        ("准备本机接入 VPS 网络", prepare_wireguard_access, "准备本机接入 VPS 网络"),
+        ("检查账户中的 Vultr 实例", inspect_vps_inventory, "检查账户中的 Vultr 实例"),
+    ]
+
+    for label, func, description in actions:
+        button = tk.Button(button_frame, text=label, command=lambda f=func, d=description: run_action(f, d))
+        button.pack(fill=tk.X, pady=3)
+
+    tk.Button(button_frame, text="关闭", command=window.destroy).pack(fill=tk.X, pady=(12, 0))
+
+    window.mainloop()
+
+
 def _load_instance_for_diagnostics() -> tuple[str, Path] | None:
     """Return the Vultr instance IP recorded on disk, if any."""
 
@@ -1821,12 +1915,19 @@ def prepare_wireguard_access() -> None:
 
 
 def main() -> None:
+    try:
+        overview_path = generate_project_overview(ROOT, ARTIFACTS_DIR / "project_overview.md")
+        log_info(f"→ 已生成项目功能概览：{overview_path}")
+    except Exception as exc:  # noqa: BLE001 - 后台任务失败不应阻止主流程
+        log_warning(f"⚠️ 生成项目功能概览失败：{exc}")
+
     while True:
         print("\n=== PrivateTunnel 桌面助手 ===")
         print("1) 检查本机环境（Windows/macOS）")
         print("2) 创建 VPS（Vultr）")
         print("3) 准备本机接入 VPS 网络")
         print("4) 检查账户中的 Vultr 实例")
+        print("5) 打开图形界面")
         print("q) 退出")
         choice = input("请选择: ").strip().lower()
         if choice == "1":
@@ -1837,6 +1938,8 @@ def main() -> None:
             prepare_wireguard_access()
         elif choice == "4":
             inspect_vps_inventory()
+        elif choice == "5":
+            launch_gui()
         elif choice == "q":
             break
         else:
