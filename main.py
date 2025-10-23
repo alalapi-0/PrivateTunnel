@@ -14,7 +14,7 @@ from core.project_overview import generate_project_overview
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 if sys.version_info < (3, 8):
     raise SystemExit(
@@ -70,6 +70,15 @@ class SSHContext:
 
 class DeploymentError(RuntimeError):
     """Raised when the automated WireGuard deployment fails."""
+
+
+@dataclass(frozen=True)
+class MenuAction:
+    """Define an interactive menu option for the CLI."""
+
+    key: str
+    description: str
+    handler: Callable[[], None]
 
 
 LOG_FILE: Path | None = None
@@ -1914,6 +1923,26 @@ def prepare_wireguard_access() -> None:
         SSH_CTX = None
 
 
+MENU_ACTIONS: tuple[MenuAction, ...] = (
+    MenuAction("1", "检查本机环境（Windows/macOS）", run_environment_check),
+    MenuAction("2", "创建 VPS（Vultr）", create_vps),
+    MenuAction("3", "准备本机接入 VPS 网络", prepare_wireguard_access),
+    MenuAction("4", "检查账户中的 Vultr 实例", inspect_vps_inventory),
+    MenuAction("5", "打开图形界面", launch_gui),
+)
+
+EXIT_CHOICES = {"q", "quit", "exit"}
+
+
+def _print_main_menu() -> None:
+    """Render the interactive menu in a consistent order."""
+
+    print("\n=== PrivateTunnel 桌面助手 ===")
+    for action in MENU_ACTIONS:
+        print(f"{action.key}) {action.description}")
+    print("q) 退出")
+
+
 def main() -> None:
     try:
         overview_path = generate_project_overview(ROOT, ARTIFACTS_DIR / "project_overview.md")
@@ -1922,26 +1951,14 @@ def main() -> None:
         log_warning(f"⚠️ 生成项目功能概览失败：{exc}")
 
     while True:
-        print("\n=== PrivateTunnel 桌面助手 ===")
-        print("1) 检查本机环境（Windows/macOS）")
-        print("2) 创建 VPS（Vultr）")
-        print("3) 准备本机接入 VPS 网络")
-        print("4) 检查账户中的 Vultr 实例")
-        print("5) 打开图形界面")
-        print("q) 退出")
+        _print_main_menu()
         choice = input("请选择: ").strip().lower()
-        if choice == "1":
-            run_environment_check()
-        elif choice == "2":
-            create_vps()
-        elif choice == "3":
-            prepare_wireguard_access()
-        elif choice == "4":
-            inspect_vps_inventory()
-        elif choice == "5":
-            launch_gui()
-        elif choice == "q":
+        if choice in EXIT_CHOICES:
             break
+        for action in MENU_ACTIONS:
+            if choice == action.key:
+                action.handler()
+                break
         else:
             print("无效选项，请重试。")
 
