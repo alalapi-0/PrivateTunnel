@@ -12,8 +12,8 @@ import time
 from pathlib import Path
 from typing import Dict
 
-from core.port_config import resolve_listen_port
-from core.ssh_utils import (
+from ..core.port_config import resolve_listen_port
+from ..core.ssh_utils import (
     SSHAttempt,
     SmartSSHError,
     ask_key_path,
@@ -23,8 +23,8 @@ from core.ssh_utils import (
     smart_ssh,
     wait_port_open,
 )
-from core.tools.vultr_manager import VultrError, list_ssh_keys
-from core.vultr_api import (
+from ..core.tools.vultr_manager import VultrError, list_ssh_keys
+from ..core.vultr_api import (
     VultrAPIError,
     create_instance as api_create_instance,
     ensure_ssh_key,

@@ -10,8 +10,8 @@ from typing import Optional
 
 import paramiko
 
-from core.port_config import get_default_wg_port
-from core.ssh_utils import SSHKeyLoadError, load_private_key
+from ..port_config import get_default_wg_port
+from ..ssh_utils import SSHKeyLoadError, load_private_key
 
 
 @dataclass

@@ -10,7 +10,7 @@ import shlex
 import shutil
 import textwrap
 
-from core.project_overview import generate_project_overview
+from .core.project_overview import generate_project_overview
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,7 +23,7 @@ if sys.version_info < (3, 8):
 
 import paramiko
 
-from core.port_config import resolve_listen_port
+from .core.port_config import resolve_listen_port
 
 
 if os.name == "nt":
@@ -896,7 +896,7 @@ def _print_manual_ssh_hint() -> None:
 def create_vps() -> None:
     """Create a Vultr VPS using environment-driven defaults."""
 
-    from core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
+    from .core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
         VultrError,
         create_instance,
         destroy_instance,
@@ -1092,7 +1092,7 @@ def create_vps() -> None:
 def inspect_vps_inventory() -> None:
     """Inspect existing Vultr instances and optionally destroy them."""
 
-    from core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
+    from .core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
         VultrError,
         destroy_instance,
         list_instances,
@@ -1614,7 +1614,7 @@ def run_environment_check() -> None:
     _maybe_run_network_diagnostics()
 
 
-from core.ssh_utils import (
+from .core.ssh_utils import (
     ask_key_path,
     nuke_known_host,
     pick_default_key,

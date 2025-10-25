@@ -6,6 +6,6 @@ if "%PYTHON_CMD%"=="" set "PYTHON_CMD=python"
 
 %PYTHON_CMD% --version || (echo 请先安装 Python 3.8+ 并将其添加到 PATH，或在运行前设置 PYTHON_CMD && pause && exit /b)
 %PYTHON_CMD% -m pip install -r requirements.txt
-%PYTHON_CMD% main.py
+%PYTHON_CMD% -m portable_bundle
 endlocal
 pause
