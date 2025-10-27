@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -192,7 +193,8 @@ def create_instance(
             body["sshkey_ids"] = deduped_ids
             body["sshkey_id"] = deduped_ids
     if user_data:
-        body["user_data"] = user_data
+        encoded = base64.b64encode(user_data.encode("utf-8")).decode("ascii")
+        body["user_data"] = encoded
 
     session = _session(api_key)
 
