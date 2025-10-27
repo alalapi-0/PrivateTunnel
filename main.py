@@ -934,7 +934,6 @@ def create_vps() -> None:
         plan = input(f"plan [{default_plan}]: ").strip() or default_plan
 
     snapshot_id = ""
-    snapshot_desc = env_snapshot_id or "VULTR_SNAPSHOT_ID"
     default_mode = "1" if env_snapshot_id else "2"
     mode_prompt = "实例来源 [1=使用快照"
     if env_snapshot_id:
@@ -944,39 +943,56 @@ def create_vps() -> None:
 
     use_snapshot = mode == "1"
     if use_snapshot:
+        snapshots_cache: list[dict[str, Any]] | None = None
         while True:
-            snapshot_input = input(
-                f"snapshot_id [{snapshot_desc}] (?=列出快照): "
-            ).strip()
-            command = snapshot_input.lower()
-            if command in {"?", "help", "h", "ls", "list", "show"} or snapshot_input in {
-                "查看",
-                "查看快照",
-                "列出快照",
-                "快照列表",
-            }:
+            if snapshots_cache is None:
                 log_info("→ 查询快照列表…")
                 try:
-                    snapshots = list_snapshots(api_key)
+                    snapshots_cache = list_snapshots(api_key)
                 except VultrError as exc:
                     log_error(f"❌ 获取快照列表失败：{exc}")
-                    continue
-                if not snapshots:
+                    retry = input("是否重试获取快照列表？[Y/n]: ").strip().lower()
+                    if retry in {"", "y", "yes"}:
+                        snapshots_cache = None
+                        continue
+                    log_error("❌ 无法获取快照列表，已中止创建流程。")
+                    return
+                if not snapshots_cache:
                     log_warning("⚠️ 当前账号没有可用快照。")
-                    continue
-                log_info("→ 当前账号可用快照：")
-                for item in snapshots:
-                    snap_id = item.get("id", "") or "-"
-                    description = (item.get("description") or "").strip() or "-"
-                    created = (item.get("date_created") or "").strip() or "-"
-                    size_val = item.get("size_gigabytes") or item.get("size")
-                    size_text = f"{size_val} GB" if size_val else "-"
-                    log_info(
-                        f"   {snap_id} | {description} | 创建时间: {created} | 大小: {size_text}"
-                    )
-                continue
+                    log_warning("   请在 Vultr 控制台创建快照后重试，或选择全新 Ubuntu 22.04。")
+                    return
+            log_info("→ 当前账号可用快照：")
+            for index, item in enumerate(snapshots_cache, start=1):
+                snap_id = item.get("id", "") or "-"
+                description = (item.get("description") or "").strip() or "-"
+                created = (item.get("date_created") or "").strip() or "-"
+                size_val = item.get("size_gigabytes") or item.get("size")
+                size_text = f"{size_val} GB" if size_val else "-"
+                marker = " (默认)" if snap_id == env_snapshot_id and env_snapshot_id else ""
+                log_info(
+                    f"   {index}. {snap_id} | {description} | 创建时间: {created} | 大小: {size_text}{marker}"
+                )
 
-            snapshot_id = snapshot_input or env_snapshot_id
+            prompt_default = env_snapshot_id or "编号/ID"
+            snapshot_input = input(
+                f"请选择快照 (输入编号或快照ID，?=刷新列表) [{prompt_default}]: "
+            ).strip()
+            command = snapshot_input.lower()
+            if command in {"?", "help", "h", "ls", "list", "show", "刷新", "重新加载"}:
+                snapshots_cache = None
+                continue
+            if not snapshot_input and env_snapshot_id:
+                snapshot_id = env_snapshot_id
+            elif snapshot_input.isdigit():
+                selection = int(snapshot_input)
+                if 1 <= selection <= len(snapshots_cache):
+                    snapshot_id = snapshots_cache[selection - 1].get("id", "") or ""
+                else:
+                    log_error("❌ 无效的编号，请重新输入。")
+                    continue
+            else:
+                snapshot_id = snapshot_input
+
             if not snapshot_id:
                 log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
                 continue
