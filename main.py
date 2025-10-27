@@ -921,18 +921,6 @@ def create_vps() -> None:
     default_region = env_region or "nrt"
     default_plan = env_plan or "vc2-4c-8gb"
 
-    if env_region:
-        region = env_region
-        log_info(f"→ 使用环境变量 VULTR_REGION={region}")
-    else:
-        region = input(f"region [{default_region}]: ").strip() or default_region
-
-    if env_plan:
-        plan = env_plan
-        log_info(f"→ 使用环境变量 VULTR_PLAN={plan}")
-    else:
-        plan = input(f"plan [{default_plan}]: ").strip() or default_plan
-
     snapshot_id = ""
     default_mode = "1" if env_snapshot_id else "2"
     mode_prompt = "实例来源 [1=使用快照"
@@ -1004,6 +992,18 @@ def create_vps() -> None:
     else:
         if env_snapshot_id:
             log_info("→ 已选择全新 Ubuntu 22.04，将忽略环境变量 VULTR_SNAPSHOT_ID。")
+
+    if env_region:
+        region = env_region
+        log_info(f"→ 使用环境变量 VULTR_REGION={region}")
+    else:
+        region = input(f"region [{default_region}]: ").strip() or default_region
+
+    if env_plan:
+        plan = env_plan
+        log_info(f"→ 使用环境变量 VULTR_PLAN={plan}")
+    else:
+        plan = input(f"plan [{default_plan}]: ").strip() or default_plan
 
     selected_keyname = env_sshkey_name
     sshkey_prompt_default = env_sshkey_name or "VULTR_SSHKEY_NAME"
