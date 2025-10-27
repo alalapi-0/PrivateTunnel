@@ -900,6 +900,7 @@ def create_vps() -> None:
         VultrError,
         create_instance,
         destroy_instance,
+        list_snapshots,
         list_ssh_keys,
         wait_instance_active,
     )
@@ -943,15 +944,47 @@ def create_vps() -> None:
 
     use_snapshot = mode == "1"
     if use_snapshot:
-        snapshot_input = input(f"snapshot_id [{snapshot_desc}]: ").strip()
-        snapshot_id = snapshot_input or env_snapshot_id
-        if not snapshot_id:
-            log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
-            return
-        if env_snapshot_id and snapshot_id == env_snapshot_id:
-            log_info(f"→ 使用环境变量 VULTR_SNAPSHOT_ID={snapshot_id}")
-        else:
-            log_info(f"→ 使用 snapshot_id={snapshot_id}")
+        while True:
+            snapshot_input = input(
+                f"snapshot_id [{snapshot_desc}] (?=列出快照): "
+            ).strip()
+            command = snapshot_input.lower()
+            if command in {"?", "help", "h", "ls", "list", "show"} or snapshot_input in {
+                "查看",
+                "查看快照",
+                "列出快照",
+                "快照列表",
+            }:
+                log_info("→ 查询快照列表…")
+                try:
+                    snapshots = list_snapshots(api_key)
+                except VultrError as exc:
+                    log_error(f"❌ 获取快照列表失败：{exc}")
+                    continue
+                if not snapshots:
+                    log_warning("⚠️ 当前账号没有可用快照。")
+                    continue
+                log_info("→ 当前账号可用快照：")
+                for item in snapshots:
+                    snap_id = item.get("id", "") or "-"
+                    description = (item.get("description") or "").strip() or "-"
+                    created = (item.get("date_created") or "").strip() or "-"
+                    size_val = item.get("size_gigabytes") or item.get("size")
+                    size_text = f"{size_val} GB" if size_val else "-"
+                    log_info(
+                        f"   {snap_id} | {description} | 创建时间: {created} | 大小: {size_text}"
+                    )
+                continue
+
+            snapshot_id = snapshot_input or env_snapshot_id
+            if not snapshot_id:
+                log_error("❌ 请选择有效的快照 ID，或返回重新选择全新系统选项。")
+                continue
+            if env_snapshot_id and snapshot_id == env_snapshot_id:
+                log_info(f"→ 使用环境变量 VULTR_SNAPSHOT_ID={snapshot_id}")
+            else:
+                log_info(f"→ 使用 snapshot_id={snapshot_id}")
+            break
     else:
         if env_snapshot_id:
             log_info("→ 已选择全新 Ubuntu 22.04，将忽略环境变量 VULTR_SNAPSHOT_ID。")
