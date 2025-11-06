@@ -1,3 +1,5 @@
+"""便携包专用的裁剪脚本，剔除非 Windows 所需内容。"""
+
 from __future__ import annotations
 
 import shutil

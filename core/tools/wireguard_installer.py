@@ -1,4 +1,4 @@
-"""WireGuard provisioning helpers."""
+"""WireGuard 部署相关的辅助函数集合。WireGuard provisioning helpers."""
 
 from __future__ import annotations
 

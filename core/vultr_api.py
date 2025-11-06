@@ -1,4 +1,4 @@
-"""Vultr API helpers used by the Windows one-click workflow."""
+"""Vultr API 辅助函数集合，支撑 Windows 一键流程调用云端能力。Vultr API helpers used by the Windows one-click workflow."""
 
 from __future__ import annotations
 

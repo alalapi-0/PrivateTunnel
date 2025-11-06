@@ -1,4 +1,4 @@
-"""Utilities for working with SSH connections and private keys."""
+"""便携包中的 SSH 连接与私钥处理工具集合。Utilities for working with SSH connections and private keys."""
 
 from __future__ import annotations
 

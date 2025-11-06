@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Utility helpers for provisioning a Vultr instance and preparing it for
+"""Vultr 实例自动化部署脚本，协助准备 WireGuard 环境。
+
+核心功能：
+1. 通过 Vultr API 创建或重装实例，可按需选择区域、套餐、快照与 SSH Key。
+2. 封装等待实例就绪、同步部署脚本等操作，确保 Windows 一键流程可复用。
+3. 保持对 Python 标准库的依赖，避免额外安装要求，适合零基础用户按示例执行。
+
+Utility helpers for provisioning a Vultr instance and preparing it for
 PrivateTunnel's WireGuard automation.
 
 The script intentionally keeps its dependencies limited to Python's standard

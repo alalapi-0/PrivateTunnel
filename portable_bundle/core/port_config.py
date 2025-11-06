@@ -1,4 +1,4 @@
-"""Helpers for resolving the default WireGuard listen port."""
+"""解析 WireGuard 默认监听端口的便携版工具函数。Helpers for resolving the default WireGuard listen port."""
 from __future__ import annotations
 
 import os

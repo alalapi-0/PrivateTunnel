@@ -1,4 +1,4 @@
-"""Vultr API helpers used by the Windows one-click workflow."""
+"""便携包版本的 Vultr API 工具集，保持与主模块一致的接口。Vultr API helpers used by the Windows one-click workflow."""
 
 from __future__ import annotations
 

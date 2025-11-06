@@ -1,4 +1,4 @@
-"""Utilities for working with SSH connections and private keys."""
+"""封装 SSH 连接与私钥处理的工具函数，便于脚本复用。Utilities for working with SSH connections and private keys."""
 
 from __future__ import annotations
 

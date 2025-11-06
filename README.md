@@ -4,6 +4,105 @@
 
 # PrivateTunnel
 
+## 项目综述与多轮 Prompt 演进
+
+PrivateTunnel 起初是覆盖 iOS、macOS、服务器脚本与 CI 的一体化仓库。经过多轮 prompt 迭代后，我们将精力集中在“Windows 本地一键接入”的实用场景：
+
+1. **Prompt Round 1~2**：整理历史资产，把 iOS、macOS、CI 等模块迁移到 `legacy/`，并在 `PROJECT_PRUNE_REPORT.md` 中记录裁剪理由。
+2. **Prompt Round 3~4**：构建 Windows 友好的自动化脚本，统一日志、错误提示与远程执行逻辑，确保零基础用户能跟随提示一步步部署。
+3. **Prompt Round 5 之后**：补全 GUI、二维码生成器、健康检查、网络诊断等辅助功能，并将常用脚本打包到 `portable_bundle/`，方便离线携带。
+
+当前仓库即是上述演进的整合成果：一份可在本地 Windows 机器上完成 Vultr 实例创建、WireGuard 安装与客户端配置生成的脚本集合。
+
+## 环境准备 Checklist
+
+| 类型 | 必要内容 | 说明 |
+| --- | --- | --- |
+| 操作系统 | Windows 10/11，或支持 Python 3.8+ 的 macOS / Linux | Windows 是主力场景，其他平台仍可运行 CLI。 |
+| Python | Python ≥ 3.8，并确保 `python3`、`pip` 指向该版本 | 建议使用官方安装包或 Microsoft Store 版本。 |
+| 依赖库 | `requests`、`paramiko`、`qrcode[pil]`、`PySimpleGUI`、`rich` 等 | `pip install -r requirements.txt` 一次性装齐。 |
+| 外部工具 | Git、OpenSSH、WireGuard for Windows（可选自动安装） | `main.py` 会尝试帮你安装缺失的 WireGuard。 |
+| 云端账号 | Vultr 账户 + API Key + 预先上传的 SSH 公钥 | API Key 用于创建实例，公钥保证免密登录。 |
+| 其他 | 稳定的网络、可写入的工作目录 | 自动脚本会生成 `artifacts/` 与日志。 |
+
+> 提示：如果你在公司或校园网络内，请确认对外 443/22 端口未被阻断，以免部署阶段失败。
+
+## 技术栈一览
+
+- **语言与运行时**：Python 3.8+、Shell（服务器侧 `wg-install.sh`）、批处理脚本（Windows 安装器）。
+- **网络与安全库**：Paramiko（SSH）、Requests（Vultr API）、WireGuard 官方工具。
+- **界面与辅助**：PySimpleGUI（图形界面）、qrcode（二维码生成）、Rich/Colorama（彩色日志）。
+- **自动化生态**：GitHub Actions（`One-Click Connect` 工作流）、Makefile、便携式 `portable_bundle/`。
+
+## 零基础全流程操作指南
+
+以下步骤覆盖从环境初始化到生成客户端二维码的完整旅程，可按顺序执行：
+
+1. **克隆仓库**
+   ```bash
+   git clone https://github.com/your-org/PrivateTunnel.git
+   cd PrivateTunnel
+   ```
+2. **安装依赖**（Windows 可在 PowerShell 中运行）
+   ```bash
+   python -m pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+3. **准备密钥与 API 配置**
+   - 在 Vultr 控制台创建 SSH Key 并下载私钥，私钥路径可通过 `PT_SSH_PRIVATE_KEY` 覆盖。
+   - 创建 API Key，设置环境变量：
+     ```powershell
+     setx VULTR_API_KEY "<你的 API Key>"
+     setx VULTR_SSHKEY_NAME "<控制台里的 SSH Key 名称>"
+     ```
+4. **可选：先熟悉 GUI 配置生成器**
+   - 运行 `python core/tools/generate_wg_conf_gui.py`，按界面提示选择 schema、配置与输出路径。
+   - 该工具底层调用 `generate_wg_conf.py`，适合提前校验 JSON 配置是否符合 Schema。
+5. **启动主菜单脚本**
+   ```powershell
+   python main.py
+   ```
+   首次运行会提示创建 `artifacts/` 目录并生成部署日志文件，所有输出都会保存到 `artifacts/deploy-*.log`。
+6. **菜单结构与功能详解**
+   - `1) 创建 Vultr 实例`：调用 `scripts/windows_oneclick.py` 流程，收集区域、套餐、快照、标签等参数，自动注入 SSH Key。
+   - `2) 查看/销毁现有实例`：列出 Vultr 当前实例，支持确认后销毁；也可以查询历史记录文件 `artifacts/instance.json`。
+   - `3) 准备本机接入 VPS 网络`：执行核心自动化部署，完成服务器 WireGuard 安装、客户端配置生成及二维码导出。
+   - `4) 下载客户端配置/二维码`：在无需重新部署的情况下重新导出 `desktop.conf`、`iphone.conf` 与 `iphone.png`。
+   - `5) 网络诊断`：综合使用 `ping`、端口连通、SSH 测试等手段确认实例状态。
+   - `6) 生成项目概览文档`：调用 `core/project_overview.py` 扫描代码，输出最新功能说明。
+   - `7) 打开 GUI 配置生成器`：在 CLI 内直接唤起 PySimpleGUI 界面。
+   - `Q) 退出`：结束脚本并释放 SSH 连接。
+7. **自动部署阶段细节**
+   - `main.py` 会根据 `core/port_config.py` 自动选择监听端口，若环境变量指定则优先使用。
+   - `core/ssh_utils.py` 会统一处理 Paramiko 与系统 `ssh` 回退逻辑，确保远程执行稳定。
+   - 部署脚本会上传至服务器 `/root/server/provision`，执行 `wg-install.sh` 完成 WireGuard 安装、IP 转发、NAT、防火墙、密钥生成。
+   - 完成后自动下载客户端配置，并调用 `qrcode` 生成 PNG 二维码。
+8. **安装 WireGuard for Windows（如未安装）**
+   - 主脚本会尝试通过 PowerShell 下载官方安装包。
+   - 也可手动访问 <https://www.wireguard.com/install/> 安装。
+9. **导入配置并测试连接**
+   - 在 Windows 客户端导入 `artifacts/desktop.conf`；在 iOS 客户端扫描 `artifacts/iphone.png`。
+   - 连接成功后，可在服务器执行 `wg show` 查看 peer 状态。
+10. **日常运维建议**
+    - 使用 `scripts/project_doctor.py --platform windows` 检查依赖是否齐全。
+    - 定期运行 `docs/HEALTH-AUTO-RECONNECT.md` 中的健康检查步骤，确保线路可用。
+
+## 常用命令速查
+
+```bash
+# 启动主菜单
+python main.py
+
+# 生成 WireGuard 配置（命令行版）
+python core/tools/generate_wg_conf.py --schema core/config-schema.json --in core/examples/minimal.json --out artifacts/sample.conf --force
+
+# 校验配置文件
+python core/tools/validate_config.py --schema core/config-schema.json --in artifacts/sample.conf.json --pretty
+
+# 生成项目概览
+python core/project_overview.py --output docs/PROJECT_OVERVIEW.md
+```
+
 ## 🖥️ GUI 快速生成 WireGuard 配置
 
 1. 在终端执行 `python3 core/tools/generate_wg_conf_gui.py` 启动界面工具。

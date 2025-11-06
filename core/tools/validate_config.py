@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Validate PrivateTunnel client configuration files.
+"""校验 PrivateTunnel 客户端配置文件，确保满足 JSON Schema 要求。
+
+用法示例::
+
+    python3 core/tools/validate_config.py \
+        --schema core/config-schema.json \
+        --in core/examples/minimal.json
+
+成功返回 0，失败返回非零，可加 ``--pretty`` 输出脱敏后的配置协助人工审查。
+
+Validate PrivateTunnel client configuration files.
 
 Usage examples::
 

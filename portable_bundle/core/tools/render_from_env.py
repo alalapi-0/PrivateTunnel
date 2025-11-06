@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Render a configuration template by substituting environment variables.
+"""通过环境变量渲染配置模板的便携脚本，适配 CI/CD 场景。
+
+示例::
+
+    export WG_CLIENT_KEY="..."
+    python3 core/tools/render_from_env.py \
+        --template core/examples/minimal.json \
+        --out /tmp/rendered.json \
+        --force
+
+可加 ``--strict`` 阻止未解析占位符继续执行。
+
+Render a configuration template by substituting environment variables.
 
 This helper bridges CI/CD environments where secrets or per-device fields are
 provided through environment variables.  Placeholders use ``${VAR}`` syntax and

@@ -1,3 +1,5 @@
+"""便携版主程序入口：在任何支持 Python 的环境中执行一键部署流程。"""
+
 from __future__ import annotations
 
 import json

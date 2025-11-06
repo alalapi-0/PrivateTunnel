@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Resolve domain groups into aggregated CIDR blocks for PrivateTunnel split routing.
+"""将域名分组解析为 PrivateTunnel 分流所需的 CIDR 聚合结果。
+
+脚本会解析 ``domains.yaml`` 并生成两个状态文件：
+
+``state/resolved.json``
+    记录详细解析结果、时间戳与诊断信息，便于排查。
+
+``state/cidr.txt``
+    汇总 IPv4 CIDR 列表，可直接用于 ipset/nftables。
+
+Resolve domain groups into aggregated CIDR blocks for PrivateTunnel split routing.
 
 This script parses ``domains.yaml`` and generates two state files:
 

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Toy UDP <-> TUN gateway for development-only end-to-end testing.
+"""便携包内的 Toy UDP ↔︎ TUN 网关，仅供开发测试使用。
+
+Toy UDP <-> TUN gateway for development-only end-to-end testing.
 
 The gateway bridges UDP datagrams carrying raw IPv4 packets (in a minimal
 custom frame) to a Linux TUN interface. It is intentionally simple, has no

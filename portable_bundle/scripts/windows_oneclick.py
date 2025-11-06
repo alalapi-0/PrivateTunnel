@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Windows-friendly one-click provisioning workflow for PrivateTunnel."""
+"""Windows 环境下一键部署 PrivateTunnel 的便携脚本。Windows-friendly one-click provisioning workflow for PrivateTunnel."""
 
 from __future__ import annotations
 

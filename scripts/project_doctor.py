@@ -1,3 +1,5 @@
+"""项目体检脚本：检查依赖、环境与目录结构，辅助快速定位问题。"""
+
 from __future__ import annotations
 
 import importlib
