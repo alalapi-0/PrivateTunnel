@@ -1,3 +1,5 @@
+"""裁剪非 Windows 所需文件的辅助脚本，用于缩减仓库内容。"""
+
 from __future__ import annotations
 
 import shutil

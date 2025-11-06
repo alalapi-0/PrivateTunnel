@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate relative Markdown links used in documentation."""
+"""校验便携包文档中的相对 Markdown 链接。Validate relative Markdown links used in documentation."""
 
 import argparse
 import pathlib

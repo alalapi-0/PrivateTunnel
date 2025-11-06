@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Windows-friendly one-click provisioning workflow for PrivateTunnel."""
+"""Windows 环境下一键部署 PrivateTunnel 的流程封装。Windows-friendly one-click provisioning workflow for PrivateTunnel.
+
+脚本流程概览：
+1. 交互式询问区域、套餐、公钥等关键信息，可读取默认值快速回车。
+2. 调用 Vultr API 创建实例，并等待实例通电、注入 SSH Key。
+3. 远程执行自动化部署脚本，下载二维码与客户端配置。
+"""
 
 from __future__ import annotations
 

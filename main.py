@@ -1,3 +1,11 @@
+"""主程序入口：提供 Windows 一键部署 WireGuard 的交互式脚本。
+
+本模块承担以下职责：
+1. 组织交互式菜单，让零基础用户也能依序完成 Vultr 实例创建、SSH 探活、WireGuard 部署与客户端配置下载。
+2. 封装 SSH、Paramiko、scp 等后端的调度逻辑，在失败时给出直观的中文提示。
+3. 提供部署日志记录、网络诊断、实例销毁等辅助功能，确保在一台 Windows 机器上即可完成端到端操作。
+"""
+
 from __future__ import annotations
 
 import json
@@ -52,7 +60,7 @@ SELECTED_PLATFORM: str | None = None
 
 @dataclass
 class SSHResult:
-    """Result of a remote SSH command execution."""
+    """远程 SSH 命令执行的结果容器。Result of a remote SSH command execution."""
 
     returncode: int
     stdout: str
@@ -62,19 +70,19 @@ class SSHResult:
 
 @dataclass
 class SSHContext:
-    """Connection parameters for remote SSH execution."""
+    """封装远程 SSH 执行所需的连接参数。Connection parameters for remote SSH execution."""
 
     hostname: str
     key_path: Path
 
 
 class DeploymentError(RuntimeError):
-    """Raised when the automated WireGuard deployment fails."""
+    """在自动化部署 WireGuard 失败时抛出的异常。Raised when the automated WireGuard deployment fails."""
 
 
 @dataclass(frozen=True)
 class MenuAction:
-    """Define an interactive menu option for the CLI."""
+    """定义交互式菜单选项。Define an interactive menu option for the CLI."""
 
     key: str
     description: str
@@ -88,13 +96,13 @@ _SUBPROCESS_TEXT_KWARGS = {"text": True, "encoding": "utf-8", "errors": "replace
 
 
 def _colorize(message: str, color: str) -> str:
-    """Return ``message`` wrapped in ANSI color codes."""
+    """用 ANSI 颜色编码包装文本。Return ``message`` wrapped in ANSI color codes."""
 
     return f"{color}{message}{RESET}"
 
 
 def _log_to_file(message: str) -> None:
-    """Append ``message`` to the deploy log if enabled."""
+    """如启用则把日志写入文件。Append ``message`` to the deploy log if enabled."""
 
     if LOG_FILE is None:
         return
@@ -108,7 +116,7 @@ def _log_to_file(message: str) -> None:
 
 
 def logwrite(message: str, *, color: str | None = None) -> None:
-    """Print ``message`` (optionally colorized) and persist to the log file."""
+    """打印信息（可选颜色）并写入日志。Print ``message`` (optionally colorized) and persist to the log file."""
 
     text = _colorize(message, color) if color else message
     print(text)
@@ -116,31 +124,31 @@ def logwrite(message: str, *, color: str | None = None) -> None:
 
 
 def log_info(message: str) -> None:
-    """Print an informational message in blue."""
+    """以蓝色输出一般信息。Print an informational message in blue."""
 
     logwrite(message, color=BLUE)
 
 
 def log_success(message: str) -> None:
-    """Print a success message in green."""
+    """以绿色输出成功提示。Print a success message in green."""
 
     logwrite(message, color=GREEN)
 
 
 def log_warning(message: str) -> None:
-    """Print a warning message in yellow."""
+    """以黄色输出警告信息。Print a warning message in yellow."""
 
     logwrite(message, color=YELLOW)
 
 
 def log_error(message: str) -> None:
-    """Print an error message in red."""
+    """以红色输出错误信息。Print an error message in red."""
 
     logwrite(message, color=RED)
 
 
 def log_section(title: str) -> None:
-    """Print a visual separator for a workflow step."""
+    """打印分隔线用于标记流程步骤。Print a visual separator for a workflow step."""
 
     divider = "=" * 24
     log_info(divider)

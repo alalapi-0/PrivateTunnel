@@ -1,4 +1,4 @@
-"""Core helpers that power the PrivateTunnel automation bundle."""
+"""便携包核心模块：整合 SSH、WireGuard 与 Vultr 辅助函数。Core helpers that power the PrivateTunnel automation bundle."""
 
 from __future__ import annotations
 

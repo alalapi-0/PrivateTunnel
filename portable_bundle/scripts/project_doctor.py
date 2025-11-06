@@ -1,3 +1,5 @@
+"""便携包体检脚本：检测依赖、环境变量与目录是否完整。"""
+
 from __future__ import annotations
 
 import importlib

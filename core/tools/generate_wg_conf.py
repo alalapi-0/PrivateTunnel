@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Generate WireGuard client configuration from validated JSON input.
+"""根据校验后的 JSON 输入生成 WireGuard 客户端配置文件。
+
+使用流程示例::
+
+    python3 core/tools/generate_wg_conf.py \
+        --schema core/config-schema.json \
+        --in core/examples/minimal.json \
+        --out /tmp/iphone.conf --force
+
+脚本会先通过 JSON Schema 校验配置，再渲染输出，默认不覆盖已有文件，敏感字段只写入目标路径。
+
+Generate WireGuard client configuration from validated JSON input.
 
 Typical usage::
 

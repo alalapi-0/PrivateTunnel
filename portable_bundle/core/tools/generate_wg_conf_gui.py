@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tkinter UI for generating WireGuard client configurations."""
+"""Tkinter 图形界面，用于生成 WireGuard 客户端配置。Tkinter UI for generating WireGuard client configurations."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Module entry point so the bundle can be executed with ``python -m``."""
+"""便携包的模块入口，使其可通过 ``python -m portable_bundle`` 直接运行。Module entry point so the bundle can be executed with ``python -m``."""
 
 from __future__ import annotations
 

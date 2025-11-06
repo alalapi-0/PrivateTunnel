@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Utility helpers for provisioning a Vultr instance and preparing it for
+"""便携包的 Vultr 实例部署脚本，复用主仓库一键流程。
+
+核心功能：
+1. 以环境变量读取默认参数，简化命令输入。
+2. 提供实例创建、等待就绪、同步部署脚本的整体流程。
+3. 仅依赖标准库，确保在解压即用的环境里可直接运行。
+
+Utility helpers for provisioning a Vultr instance and preparing it for
 PrivateTunnel's WireGuard automation.
 
 The script intentionally keeps its dependencies limited to Python's standard
