@@ -575,7 +575,7 @@ def deploy_wireguard_remote_script(
     """Return the shell script that configures WireGuard end-to-end on the server."""
 
     return textwrap.dedent(
-        f"""
+        """
         #!/usr/bin/env bash
         set -euo pipefail
 
@@ -607,10 +607,10 @@ def deploy_wireguard_remote_script(
           shift
           local cmd=("$@")
 
-          for i in {1..10}; do
-            log "执行 apt 操作（第 ${i} 次）：${desc}"
-            if "${cmd[@]}"; then
-              log "apt 操作成功：${desc}"
+          for i in {{1..10}}; do
+            log "执行 apt 操作（第 ${{i}} 次）：${{desc}}"
+            if "${{cmd[@]}}"; then
+              log "apt 操作成功：${{desc}}"
               return 0
             fi
 
@@ -618,7 +618,7 @@ def deploy_wireguard_remote_script(
             sleep 10
           done
 
-          err "apt 操作多次重试仍失败：${desc}"
+          err "apt 操作多次重试仍失败：${{desc}}"
           return 1
         }
 
@@ -837,8 +837,16 @@ CFG
   iPhone：/etc/wireguard/clients/iphone/iphone.conf
   iPhone二维码：/etc/wireguard/clients/iphone/iphone.png
 ──────────────────────────────
-SUMMARY
+        SUMMARY
         """
+    ).format(
+        listen_port=listen_port,
+        desktop_ip=desktop_ip,
+        iphone_ip=iphone_ip,
+        server_ip=server_ip,
+        dns_servers=dns_servers,
+        allowed_ips=allowed_ips,
+        desktop_mtu=desktop_mtu,
     ).strip()
 
 def _wait_for_port_22(ip: str, *, attempts: int = 10, interval: int = 5) -> bool:
