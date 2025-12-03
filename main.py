@@ -530,23 +530,22 @@ def _download_with_paramiko(remote_path: str, local_path: Path) -> None:
         raise DeploymentError(f"SFTP 下载 {remote_path} 失败：{exc}") from exc
 
 
-def _download_artifact(remote_path: str, local_path: Path) -> bool:
-    """Download ``remote_path`` to ``local_path``.
+def _download_artifact(remote_path: str, local_path: Path) -> None:
+    """Download ``remote_path`` to ``local_path`` with scp fallback to SFTP.
 
-    Returns ``True`` on success. When both ``scp`` and Paramiko downloads fail the
-    error is logged and ``False`` is returned instead of raising, allowing callers
-    to decide whether the artifact is optional.
+    Raises ``DeploymentError`` when both transports fail.
     """
 
     if _download_with_scp(remote_path, local_path):
-        return True
-    log_warning("⚠️ scp 下载失败，改用 Paramiko SFTP。")
+        return
+
+    log_warning(f"⚠️ scp 下载失败，改用 Paramiko SFTP：{remote_path}")
     try:
         _download_with_paramiko(remote_path, local_path)
     except DeploymentError as exc:
-        log_warning(f"⚠️ SFTP 下载失败：{exc}")
-        return False
-    return True
+        raise DeploymentError(
+            f"下载远端文件失败（{remote_path} → {local_path}）：scp 与 SFTP 均失败。详情：{exc}"
+        ) from exc
 
 
 def _ensure_remote_artifact(remote_path: str, description: str) -> None:
@@ -602,8 +601,30 @@ def deploy_wireguard_remote_script(
         SERVER_FALLBACK_IP="$(ip -o -4 addr show dev \"$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)\" | awk '{{print $4}}' | cut -d/ -f1 | head -n1)"
 
         log "安装 WireGuard 组件"
-        apt-get update -y
-        apt-get install -y wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
+
+        apt_retry() {
+          local desc="$1"
+          shift
+          local cmd=("$@")
+
+          for i in {1..10}; do
+            log "执行 apt 操作（第 ${i} 次）：${desc}"
+            if "${cmd[@]}"; then
+              log "apt 操作成功：${desc}"
+              return 0
+            fi
+
+            warn "apt 命令失败，可能是 dpkg 锁或网络问题，等待 10 秒后重试…"
+            sleep 10
+          done
+
+          err "apt 操作多次重试仍失败：${desc}"
+          return 1
+        }
+
+        apt_retry "apt-get update" apt-get update -y
+        apt_retry "安装 wireguard 及相关组件" apt-get install -y \
+          wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
 
         log "开启 IPv4/IPv6 转发并持久化"
         sysctl -w net.ipv4.ip_forward=1
@@ -782,7 +803,7 @@ CFG
         missing=0
         for f in "$DESKTOP_DIR/desktop.conf" "$IPHONE_DIR/iphone.conf" "$IPHONE_DIR/iphone.png"; do
           if [ ! -s "$f" ]; then
-            err "文件未生成：$f"
+            err "文件未生成或为空：$f"
             missing=1
           fi
         done
@@ -793,6 +814,11 @@ CFG
 
         log "验证配置文件："
         ls -lh "$DESKTOP_DIR" "$IPHONE_DIR" || true
+
+        log "WireGuard 已配置完毕，客户端文件路径："
+        log "  桌面：$DESKTOP_DIR/desktop.conf"
+        log "  iPhone：$IPHONE_DIR/iphone.conf"
+        log "  iPhone二维码：$IPHONE_DIR/iphone.png"
 
         printf 'SERVER_PUBLIC_KEY=%s\n' "$SERVER_PUBLIC_KEY"
         printf 'DESKTOP_PUBLIC_KEY=%s\n' "$DESKTOP_PUB"
@@ -1916,16 +1942,28 @@ def prepare_wireguard_access() -> None:
         _ensure_remote_artifact(remote_iphone_png, "iPhone 二维码")
 
         log_info(f"→ 下载桌面端配置到 {desktop_conf_local}")
-        if not _download_artifact(remote_desktop_conf, desktop_conf_local):
-            raise DeploymentError("下载桌面端配置失败，请手动检查 /etc/wireguard/clients/desktop/desktop.conf。")
+        try:
+            _download_artifact(remote_desktop_conf, desktop_conf_local)
+        except DeploymentError as exc:
+            raise DeploymentError(
+                "下载桌面端配置失败，请手动检查 /etc/wireguard/clients/desktop/desktop.conf。"
+            ) from exc
 
         log_info(f"→ 下载 iPhone 配置到 {iphone_conf_local}")
-        if not _download_artifact(remote_iphone_conf, iphone_conf_local):
-            raise DeploymentError("下载 iPhone 配置失败，请手动检查 /etc/wireguard/clients/iphone/iphone.conf。")
+        try:
+            _download_artifact(remote_iphone_conf, iphone_conf_local)
+        except DeploymentError as exc:
+            raise DeploymentError(
+                "下载 iPhone 配置失败，请手动检查 /etc/wireguard/clients/iphone/iphone.conf。"
+            ) from exc
 
         log_info(f"→ 下载 iPhone 二维码到 {iphone_png_local}")
-        if not _download_artifact(remote_iphone_png, iphone_png_local):
-            raise DeploymentError("下载 iPhone 二维码失败，请检查远端 /etc/wireguard/clients/iphone/iphone.png。")
+        try:
+            _download_artifact(remote_iphone_png, iphone_png_local)
+        except DeploymentError as exc:
+            raise DeploymentError(
+                "下载 iPhone 二维码失败，请检查远端 /etc/wireguard/clients/iphone/iphone.png。"
+            ) from exc
 
         log_success(f"✅ 已下载 iPhone 二维码：{iphone_png_local}")
 
@@ -1939,6 +1977,10 @@ def prepare_wireguard_access() -> None:
             except ValueError:
                 return str(path)
 
+        log_success("✅ WireGuard 部署完成，并已下载客户端配置：")
+        log_success(f"   - {desktop_conf_local}")
+        log_success(f"   - {iphone_conf_local}")
+        log_success(f"   - {iphone_png_local}")
         log_success(f"✅ Windows 客户端配置：{_rel(desktop_conf_local)}")
         log_success(f"✅ iPhone 配置：{_rel(iphone_conf_local)}")
         log_success(f"✅ iPhone 二维码：{_rel(iphone_png_local)}")
