@@ -602,7 +602,7 @@ def deploy_wireguard_remote_script(
 
         log "安装 WireGuard 组件"
 
-        apt_retry() {
+        apt_retry() {{
           local desc="$1"
           shift
           local cmd=("$@")
@@ -620,7 +620,7 @@ def deploy_wireguard_remote_script(
 
           err "apt 操作多次重试仍失败：${{desc}}"
           return 1
-        }
+        }}
 
         apt_retry "apt-get update" apt-get update -y
         apt_retry "安装 wireguard 及相关组件" apt-get install -y \
