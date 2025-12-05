@@ -1,0 +1,15 @@
+{
+  "id": "a0f3bc99-5a0a-4b91-8021-185da2baf567",
+  "ip": "45.32.253.146",
+  "region": "nrt",
+  "plan": "vc2-4c-8gb",
+  "source": "snapshot",
+  "ssh_key": "alalapi",
+  "ssh_key_name": "alalapi",
+  "ssh_key_id": "75a8feb0-1b99-489f-88c1-5c64d8203cda",
+  "ssh_key_ids": [
+    "75a8feb0-1b99-489f-88c1-5c64d8203cda"
+  ],
+  "created_at": 1764899900,
+  "cloud_init_injected": true
+}

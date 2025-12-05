@@ -17,6 +17,7 @@ import time
 import shlex
 import shutil
 import textwrap
+import threading
 
 from core.project_overview import generate_project_overview
 from dataclasses import dataclass
@@ -357,6 +358,9 @@ def _ensure_paramiko_client() -> paramiko.SSHClient:
             look_for_keys=False,
             timeout=30,
         )
+        # 设置keepalive以保持连接稳定（每30秒发送一次keepalive包）
+        if client.get_transport():
+            client.get_transport().set_keepalive(30)
     except Exception as exc:  # noqa: BLE001
         raise DeploymentError(f"Paramiko 连接 {ctx.hostname} 失败：{exc}") from exc
 
@@ -403,6 +407,94 @@ def _clean_known_host(ip: str) -> None:
         pass
 
 
+def _monitor_deployment_progress(ip: str, key_path: Path, stop_event: threading.Event) -> None:
+    """在后台监控部署进度，定期检查远程脚本状态并显示进度信息"""
+    
+    check_interval = 30# 每30秒检查一次
+    last_status = ""
+    check_count = 0
+    
+    ssh_executable = shutil.which("ssh") or "ssh"
+    
+    while not stop_event.is_set():
+        try:
+            check_count += 1
+            # 检查部署脚本是否还在运行
+            check_cmd = [
+                ssh_executable,
+                "-i", str(key_path),
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ServerAliveInterval=10",
+                f"root@{ip}",
+                "ps aux | grep -E '[b]ash.*privatetunnel-wireguard|[a]pt-get.*wireguard' | head -3 || echo '脚本未运行'"
+            ]
+            
+            result = subprocess.run(
+                check_cmd,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                if output and "脚本未运行" not in output:
+                    # 提取关键信息
+                    lines = output.split('\n')
+                    status_lines = []
+                    for line in lines[:2]:  # 只显示前2行
+                        if 'apt-get' in line or 'apt' in line:
+                            status_lines.append(f"  📦 [{check_count * check_interval}秒] 正在安装软件包...")
+                        elif 'wireguard' in line.lower() or 'wg' in line.lower():
+                            status_lines.append(f"  ⚙️ [{check_count * check_interval}秒] 正在配置 WireGuard...")
+                        elif 'bash' in line or 'sh' in line:
+                            status_lines.append(f"  🔄 [{check_count * check_interval}秒] 部署脚本运行中...")
+                    
+                    if status_lines:
+                        current_status = "\n".join(status_lines)
+                        if current_status != last_status:
+                            # 显示状态更新
+                            log_info(current_status)
+                            last_status = current_status
+                else:
+                    # 脚本可能已完成，检查WireGuard服务
+                    wg_check = subprocess.run(
+                        [
+                            ssh_executable,
+                            "-i", str(key_path),
+                            "-o", "BatchMode=yes",
+                            "-o", "ConnectTimeout=5",
+                            "-o", "StrictHostKeyChecking=no",
+                            "-o", "ServerAliveInterval=10",
+                            f"root@{ip}",
+                            "systemctl is-active wg-quick@wg0 2>/dev/null || echo 'inactive'"
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=8,
+                        encoding='utf-8',
+                        errors='replace'
+                    )
+                    if wg_check.returncode == 0:
+                        wg_status = wg_check.stdout.strip()
+                        if "active" in wg_status:
+                            log_success("  ✅ WireGuard 服务已启动")
+                            break
+        except Exception as exc:
+            # 监控过程中的错误不影响主流程，但可以记录
+            if check_count % 6 == 0:  # 每60秒才显示一次错误，避免刷屏
+                pass  # 静默处理，不显示错误
+        finally:
+            # 等待下一次检查
+            if not stop_event.wait(check_interval):
+                continue
+            break
+
+
 def _ssh_run(command: str, *, timeout: int = 900, description: str | None = None) -> SSHResult:
     """Execute ``command`` on the remote host via OpenSSH with Paramiko fallback."""
 
@@ -416,6 +508,12 @@ def _ssh_run(command: str, *, timeout: int = 900, description: str | None = None
         "BatchMode=yes",
         "-o",
         "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ServerAliveInterval=30",
+        "-o",
+        "ServerAliveCountMax=10",
+        "-o",
+        "ConnectTimeout=30",
         f"root@{ctx.hostname}",
         command,
     ]
@@ -849,25 +947,48 @@ CFG
         desktop_mtu=desktop_mtu,
     ).strip()
 
-def _wait_for_port_22(ip: str, *, attempts: int = 10, interval: int = 5) -> bool:
-    """Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``attempts`` exhausted."""
-
-    for attempt in range(1, attempts + 1):
-        log_info(f"  ↻ 第 {attempt} 次检测：连接 {ip}:22 …")
+def _wait_for_port_22(ip: str, *, timeout: int = 1200, interval: int = 5) -> bool:
+    """Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``timeout`` seconds elapsed.
+    
+    Args:
+        ip: Target IP address
+        timeout: Maximum time to wait in seconds (default: 1200 = 20 minutes)
+        interval: Time between attempts in seconds (default: 5)
+    """
+    deadline = time.time() + timeout
+    attempt = 1
+    elapsed_seconds = 0
+    
+    while time.time() < deadline:
+        elapsed_seconds = int(time.time() - (deadline - timeout))
+        remaining_seconds = int(deadline - time.time())
+        log_info(f"  ↻ 第 {attempt} 次检测：连接 {ip}:22 … (已等待 {elapsed_seconds}秒，剩余 {remaining_seconds}秒)")
         try:
             with socket.create_connection((ip, 22), timeout=5):
                 log_success("   SSH 端口已开放。")
                 return True
         except OSError as exc:
             log_warning(f"⚠️ 连接失败：{exc}")
+        
+        # 检查是否还有时间继续尝试
+        if time.time() + interval >= deadline:
+            break
         time.sleep(interval)
-    log_error("❌ 在预设次数内未检测到 SSH 端口开放。")
+        attempt += 1
+    
+    log_error(f"❌ 在 {timeout} 秒（{timeout // 60} 分钟）内未检测到 SSH 端口开放。")
     return False
 
 
-def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, attempts: int = 12, interval: int = 10) -> bool:
-    """Attempt ``ssh root@ip true`` until passwordless login succeeds."""
-
+def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, timeout: int = 1200, interval: int = 10) -> bool:
+    """Attempt ``ssh root@ip true`` until passwordless login succeeds or timeout.
+    
+    Args:
+        ip: Target IP address
+        key_path: Path to SSH private key
+        timeout: Maximum time to wait in seconds (default: 1200 = 20 minutes)
+        interval: Time between attempts in seconds (default: 10)
+    """
     expanded = key_path.expanduser()
     if not expanded.exists():
         log_warning(f"⚠️ 找不到私钥文件：{expanded}，无法完成免密校验。")
@@ -885,10 +1006,15 @@ def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, attempts: int = 12, i
         "true",
     ]
 
+    deadline = time.time() + timeout
+    attempt = 1
     last_stdout = ""
     last_stderr = ""
-    for attempt in range(1, attempts + 1):
-        log_info(f"  ↻ 第 {attempt} 次免密检测：ssh root@{ip} true")
+    
+    while time.time() < deadline:
+        elapsed_seconds = int(time.time() - (deadline - timeout))
+        remaining_seconds = int(deadline - time.time())
+        log_info(f"  ↻ 第 {attempt} 次免密检测：ssh root@{ip} true (已等待 {elapsed_seconds}秒，剩余 {remaining_seconds}秒)")
         try:
             result = subprocess.run(
                 command,
@@ -906,6 +1032,7 @@ def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, attempts: int = 12, i
             if last_stderr:
                 log_warning(f"   stderr: {last_stderr}")
         else:
+            # 处理正常返回的结果
             last_stdout = (result.stdout or "").strip()
             last_stderr = (result.stderr or "").strip()
             if result.returncode == 0:
@@ -915,10 +1042,15 @@ def _wait_for_passwordless_ssh(ip: str, key_path: Path, *, attempts: int = 12, i
                 log_warning(f"   stdout: {last_stdout}")
             if last_stderr:
                 log_warning(f"   stderr: {last_stderr}")
+        
+        # 检查是否还有时间继续尝试
+        if time.time() + interval >= deadline:
+            break
         time.sleep(interval)
+        attempt += 1
 
     log_error(
-        "❌ 免密 SSH 校验失败。"
+        f"❌ 在 {timeout} 秒（{timeout // 60} 分钟）内免密 SSH 校验失败。"
         + (f" 最近一次 stdout: {last_stdout}" if last_stdout else "")
         + (f" stderr: {last_stderr}" if last_stderr else "")
     )
@@ -1135,7 +1267,7 @@ def create_vps() -> None:
         log_success(f"✅ 实例就绪：id={instance_id}  ip={ip}")
         log_info("→ 执行 ssh-keygen -R 清理旧指纹…")
         subprocess.run(["ssh-keygen", "-R", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最多 10 次）…")
+        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最长等待 20 分钟）…")
         key_path_default = Path.home() / ".ssh" / "id_ed25519"
         port_ready = _wait_for_port_22(ip)
         if port_ready:
@@ -1864,7 +1996,7 @@ def prepare_wireguard_access() -> None:
         log_warning(f"⚠️ 清理 known_hosts 时出现问题：{exc}")
 
     try:
-        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最多 10 次）…")
+        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最长等待 20 分钟）…")
         if not _wait_for_port_22(ip):
             _print_manual_ssh_hint()
             raise DeploymentError("未检测到 VPS SSH 端口开放。")
@@ -1904,13 +2036,42 @@ def prepare_wireguard_access() -> None:
             if value
         ]
         env_prefix = " ".join(env_parts)
+        # 直接执行脚本，同时启动后台监控显示进度
         run_line = (
             f"{env_prefix + ' ' if env_prefix else ''}bash /tmp/privatetunnel-wireguard.sh "
             "&& rm -f /tmp/privatetunnel-wireguard.sh"
         )
         command_body = script_payload + run_line + "\n"
         command = f"bash -lc {shlex.quote(command_body)}"
-        result = _ssh_run(command, timeout=1800, description="部署 WireGuard 服务端")
+        
+        log_info("→ 开始部署 WireGuard 服务端（已启用SSH连接保活，超时时间：3600秒）…")
+        log_info("→ 正在启动后台监控，每10秒检查一次部署进度…")
+        log_info("")
+        
+        # 启动后台监控线程
+        stop_monitor = threading.Event()
+        monitor_thread = threading.Thread(
+            target=_monitor_deployment_progress,
+            args=(ip, key_path, stop_monitor),
+            daemon=True
+        )
+        monitor_thread.start()
+        
+        try:
+            # 执行部署命令
+            result = _ssh_run(command, timeout=3600, description="部署 WireGuard 服务端")
+            
+            # 停止监控
+            stop_monitor.set()
+            monitor_thread.join(timeout=3)
+            log_info("")  # 空行分隔
+            
+        except Exception as e:
+            # 确保监控线程停止
+            stop_monitor.set()
+            monitor_thread.join(timeout=3)
+            log_info("")  # 空行分隔
+            raise
 
         summary: dict[str, str] = {}
         for line in result.stdout.splitlines():

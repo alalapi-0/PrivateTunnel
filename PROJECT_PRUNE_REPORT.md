@@ -1,5 +1,5 @@
 # 项目精简报告（Windows 本地一键版）
-_Generated at: 2025-10-12T11:52:01.011580Z_
+_Generated at: 2025-10-13T01:53:28.236999Z_
 
 ## 已归档到 `legacy/`
 - apps/ios -> legacy/ios
