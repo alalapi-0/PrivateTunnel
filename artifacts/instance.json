@@ -1,6 +1,6 @@
 {
-  "id": "a6dfa024-78fc-4347-ad48-cefb3d03b9d7",
-  "ip": "108.160.133.189",
+  "id": "79ccd855-b4d8-43fc-96b6-ed11ac4978e3",
+  "ip": "108.61.160.98",
   "region": "nrt",
   "plan": "vc2-4c-8gb",
   "source": "snapshot",
@@ -10,6 +10,6 @@
   "ssh_key_ids": [
     "75a8feb0-1b99-489f-88c1-5c64d8203cda"
   ],
-  "created_at": 1764905388,
+  "created_at": 1764942883,
   "cloud_init_injected": true
 }

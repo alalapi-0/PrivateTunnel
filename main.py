@@ -481,7 +481,7 @@ def _monitor_deployment_progress(ip: str, key_path: Path, stop_event: threading.
                     )
                     if wg_check.returncode == 0:
                         wg_status = wg_check.stdout.strip()
-                        if "active" in wg_status:
+                        if wg_status == "active":
                             log_success("  ✅ WireGuard 服务已启动")
                             break
         except Exception as exc:
@@ -682,6 +682,11 @@ def deploy_wireguard_remote_script(
         err()  {{ printf '[%s] ❌ %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }}
 
         export DEBIAN_FRONTEND=noninteractive
+        # 跳过NVIDIA驱动的交互式安装，避免阻塞脚本执行
+        export NVIDIA_INSTALLER_OPTIONS="--no-questions --accept-license --no-backup"
+        export NVIDIA_DRIVER_SKIP_INSTALL=1
+        # 禁用NVIDIA驱动的自动安装触发器
+        export NVIDIA_AUTO_INSTALL=no
 
         WG_PORT=${{WG_PORT:-{listen_port}}}
         WG_DIR=/etc/wireguard
@@ -699,6 +704,39 @@ def deploy_wireguard_remote_script(
         SERVER_FALLBACK_IP="$(ip -o -4 addr show dev \"$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)\" | awk '{{print $4}}' | cut -d/ -f1 | head -n1)"
 
         log "安装 WireGuard 组件"
+        
+        # 等待dpkg锁释放（如果有其他apt操作正在进行）
+        wait_for_dpkg_lock() {{
+          local max_wait=300  # 最长等待5分钟
+          local waited=0
+          local interval=5
+          
+          while [ $waited -lt $max_wait ]; do
+            # 检查锁文件是否被占用
+            if ! lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+               ! lsof /var/lib/dpkg/lock >/dev/null 2>&1; then
+              # 检查是否有apt/dpkg进程在运行
+              if ! pgrep -x apt-get >/dev/null 2>&1 && ! pgrep -x dpkg >/dev/null 2>&1; then
+                # 锁已释放且无进程运行
+                return 0
+              fi
+            fi
+            
+            # 检查是否有apt/dpkg进程在运行
+            local apt_pid=$(pgrep -x apt-get 2>/dev/null | head -1)
+            if [ -n "$apt_pid" ]; then
+              log "检测到其他apt-get进程（PID: $apt_pid）正在运行，等待其完成…（已等待 ${waited}秒）"
+            fi
+            
+            sleep $interval
+            waited=$((waited + interval))
+          done
+          
+          warn "等待dpkg锁释放超时（${max_wait}秒），继续尝试安装…"
+          return 1
+        }}
+        
+        wait_for_dpkg_lock || true
 
         apt_retry() {{
           local desc="$1"
@@ -721,6 +759,18 @@ def deploy_wireguard_remote_script(
         }}
 
         apt_retry "apt-get update" apt-get update -y
+        
+        # 如果系统有NVIDIA驱动相关的包，先禁用其触发器，避免在安装WireGuard时触发NVIDIA驱动安装
+        if dpkg -l | grep -q "^ii.*nvidia"; then
+          log "检测到NVIDIA相关包，禁用NVIDIA驱动自动安装触发器"
+          # 禁用NVIDIA驱动的post-install脚本
+          if [ -f /usr/lib/nvidia/post-install ]; then
+            chmod -x /usr/lib/nvidia/post-install || true
+          fi
+          # 设置环境变量跳过NVIDIA驱动安装
+          export NVIDIA_INSTALLER_OPTIONS="--no-questions --accept-license --no-backup --skip-depmod"
+        fi
+        
         apt_retry "安装 wireguard 及相关组件" apt-get install -y \
           wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
 
@@ -2190,7 +2240,7 @@ def prepare_wireguard_access() -> None:
                 # 检查WireGuard服务状态
                 wg_check_cmd = "systemctl is-active wg-quick@wg0 2>/dev/null || echo 'inactive'"
                 wg_result = _ssh_run(wg_check_cmd, timeout=10, description="检查WireGuard服务")
-                if "active" in wg_result.stdout:
+                if wg_result.stdout.strip() == "active":
                     log_success(f"  ✅ [{elapsed}秒] WireGuard 服务已启动！")
                     # 读取完整日志
                     log_cmd = f"cat {log_file} 2>/dev/null || echo ''"
