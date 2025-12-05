@@ -2081,42 +2081,152 @@ def prepare_wireguard_access() -> None:
             if value
         ]
         env_prefix = " ".join(env_parts)
-        # 直接执行脚本，同时启动后台监控显示进度
-        run_line = (
-            f"{env_prefix + ' ' if env_prefix else ''}bash /tmp/privatetunnel-wireguard.sh "
-            "&& rm -f /tmp/privatetunnel-wireguard.sh"
-        )
-        command_body = script_payload + run_line + "\n"
-        command = f"bash -lc {shlex.quote(command_body)}"
+        # 使用nohup后台执行脚本，然后定期检查状态
+        log_file = "/tmp/privatetunnel-wireguard.log"
+        pid_file = "/tmp/privatetunnel-wireguard.pid"
         
-        log_info("→ 开始部署 WireGuard 服务端（已启用SSH连接保活，超时时间：3600秒）…")
-        log_info("→ 正在启动后台监控，每10秒检查一次部署进度…")
+        # 先上传脚本
+        upload_cmd = script_payload
+        _ssh_run(upload_cmd, timeout=30, description="上传部署脚本")
+        
+        # 后台启动脚本
+        start_cmd = (
+            f"{env_prefix + ' ' if env_prefix else ''}nohup bash /tmp/privatetunnel-wireguard.sh "
+            f"> {log_file} 2>&1 & echo $! > {pid_file}"
+        )
+        log_info("→ 开始部署 WireGuard 服务端（后台执行模式）…")
+        log_info("→ 脚本已在后台启动，正在监控部署进度…")
         log_info("")
         
-        # 启动后台监控线程
-        stop_monitor = threading.Event()
-        monitor_thread = threading.Thread(
-            target=_monitor_deployment_progress,
-            args=(ip, key_path, stop_monitor),
-            daemon=True
-        )
-        monitor_thread.start()
+        _ssh_run(start_cmd, timeout=30, description="启动部署脚本")
         
+        # 等待脚本启动
+        time.sleep(2)
+        
+        # 定期检查部署状态
+        max_wait_time = 3600  # 最长等待1小时
+        check_interval = 15  # 每15秒检查一次
+        start_time = time.time()
+        result: SSHResult | None = None
+        last_status = ""  # 记录上次显示的状态，避免重复
+        check_count = 0
+        
+        while time.time() - start_time < max_wait_time:
+            elapsed = int(time.time() - start_time)
+            remaining = int(max_wait_time - (time.time() - start_time))
+            check_count += 1
+            
+            try:
+                # 检查进程是否还在运行
+                check_pid_cmd = f"test -f {pid_file} && cat {pid_file} || echo ''"
+                pid_result = _ssh_run(check_pid_cmd, timeout=10, description="检查进程ID")
+                pid = pid_result.stdout.strip()
+                
+                if pid:
+                    # 检查进程是否还在运行
+                    check_process_cmd = f"ps -p {pid} > /dev/null 2>&1 && echo 'running' || echo 'stopped'"
+                    process_result = _ssh_run(check_process_cmd, timeout=10, description="检查进程状态")
+                    is_running = "running" in process_result.stdout
+                    
+                    if not is_running:
+                        # 进程已结束，读取日志
+                        log_info(f"  ⏱️ [{elapsed}秒] 部署脚本执行完成，正在读取结果…")
+                        log_cmd = f"cat {log_file} 2>/dev/null || echo ''"
+                        log_result = _ssh_run(log_cmd, timeout=30, description="读取部署日志")
+                        result = SSHResult(
+                            returncode=0,
+                            stdout=log_result.stdout,
+                            stderr=log_result.stderr,
+                            backend="openssh"
+                        )
+                        break
+                    else:
+                        # 进程还在运行，读取最新日志
+                        log_cmd = f"tail -n 20 {log_file} 2>/dev/null || echo ''"
+                        log_result = _ssh_run(log_cmd, timeout=10, description="读取最新日志")
+                        current_log = log_result.stdout
+                        
+                        # 显示最新日志内容
+                        if current_log:
+                            lines = current_log.split('\n')
+                            # 提取关键日志行（包含时间戳、状态信息等）
+                            important_lines = []
+                            for line in lines:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                # 显示包含时间戳、状态标记或关键信息的行
+                                if any(marker in line for marker in ['[20', 'log', 'warn', 'err', '✅', '⚠️', '❌', '安装', '配置', 'WireGuard', 'apt-get', 'systemctl']):
+                                    important_lines.append(line)
+                            
+                            if important_lines:
+                                # 只显示最后几条重要日志，避免刷屏
+                                display_lines = important_lines[-2:]  # 只显示最后2行
+                                for line in display_lines:
+                                    if line and line not in last_status:
+                                        log_info(f"    {line}")
+                                        last_status = line if len(last_status) < 100 else ""  # 限制状态缓存大小
+                            else:
+                                # 如果没有重要日志，显示简单状态
+                                if check_count % 4 == 0:  # 每60秒显示一次简单状态
+                                    log_info(f"  ⏱️ [{elapsed}秒] 部署进行中（剩余约 {remaining}秒）…")
+                else:
+                    # PID文件不存在，可能脚本已经完成
+                    log_info(f"  ⏱️ [{elapsed}秒] 检查部署状态…")
+                    log_cmd = f"cat {log_file} 2>/dev/null || echo ''"
+                    log_result = _ssh_run(log_cmd, timeout=30, description="读取部署日志")
+                    if log_result.stdout.strip():
+                        result = SSHResult(
+                            returncode=0,
+                            stdout=log_result.stdout,
+                            stderr=log_result.stderr,
+                            backend="openssh"
+                        )
+                        break
+                    else:
+                        # 日志文件不存在或为空，继续等待
+                        log_info(f"  ⏱️ [{elapsed}秒] 等待脚本启动…")
+                
+                # 检查WireGuard服务状态
+                wg_check_cmd = "systemctl is-active wg-quick@wg0 2>/dev/null || echo 'inactive'"
+                wg_result = _ssh_run(wg_check_cmd, timeout=10, description="检查WireGuard服务")
+                if "active" in wg_result.stdout:
+                    log_success(f"  ✅ [{elapsed}秒] WireGuard 服务已启动！")
+                    # 读取完整日志
+                    log_cmd = f"cat {log_file} 2>/dev/null || echo ''"
+                    log_result = _ssh_run(log_cmd, timeout=30, description="读取完整日志")
+                    result = SSHResult(
+                        returncode=0,
+                        stdout=log_result.stdout,
+                        stderr=log_result.stderr,
+                        backend="openssh"
+                    )
+                    break
+                    
+            except Exception as exc:
+                log_warning(f"  ⚠️ [{elapsed}秒] 检查状态时出错：{exc}，继续等待…")
+            
+            # 等待下一次检查
+            time.sleep(check_interval)
+        else:
+            # 超时
+            log_cmd = f"tail -n 50 {log_file} 2>/dev/null || echo '无法读取日志'"
+            log_result = _ssh_run(log_cmd, timeout=30, description="读取超时前的日志")
+            raise DeploymentError(
+                f"部署超时（{max_wait_time}秒）。最后日志：\n{log_result.stdout[:500]}"
+            )
+        
+        # 清理临时文件
         try:
-            # 执行部署命令
-            result = _ssh_run(command, timeout=3600, description="部署 WireGuard 服务端")
-            
-            # 停止监控
-            stop_monitor.set()
-            monitor_thread.join(timeout=3)
-            log_info("")  # 空行分隔
-            
-        except Exception as e:
-            # 确保监控线程停止
-            stop_monitor.set()
-            monitor_thread.join(timeout=3)
-            log_info("")  # 空行分隔
-            raise
+            cleanup_cmd = f"rm -f {pid_file} {log_file} /tmp/privatetunnel-wireguard.sh"
+            _ssh_run(cleanup_cmd, timeout=10, description="清理临时文件")
+        except Exception:
+            pass  # 清理失败不影响主流程
+        
+        log_info("")  # 空行分隔
+
+        if result is None:
+            raise DeploymentError("部署过程中未能获取结果，请检查远程服务器状态。")
 
         summary: dict[str, str] = {}
         for line in result.stdout.splitlines():

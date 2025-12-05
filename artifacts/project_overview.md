@@ -1,6 +1,6 @@
 # 项目功能概览
 
-自动生成时间：2025-12-05 11:40:27
+自动生成时间：2025-12-05 12:21:54
 
 ## artifacts\tools\networkCheck.py
 - 函数 `check_instance_status`：检查远程实例是否还在运行
@@ -196,8 +196,8 @@
 - 函数 `_download_artifact`：Download ``remote_path`` to ``local_path`` with scp fallback to SFTP.
 - 函数 `_ensure_remote_artifact`：Ensure ``remote_path`` exists and is non-empty on the server.
 - 函数 `deploy_wireguard_remote_script`：Return the shell script that configures WireGuard end-to-end on the server.
-- 函数 `_wait_for_port_22`：Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``attempts`` exhausted.
-- 函数 `_wait_for_passwordless_ssh`：Attempt ``ssh root@ip true`` until passwordless login succeeds.
+- 函数 `_wait_for_port_22`：Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``timeout`` seconds elapsed.
+- 函数 `_wait_for_passwordless_ssh`：Attempt ``ssh root@ip true`` until passwordless login succeeds or timeout.
 - 函数 `_print_manual_ssh_hint`：Display manual troubleshooting guidance for SSH key injection issues.
 - 函数 `create_vps`：Create a Vultr VPS using environment-driven defaults.
 - 函数 `inspect_vps_inventory`：Inspect existing Vultr instances and optionally destroy them.
@@ -215,7 +215,7 @@
 - 函数 `_resolve_diagnostic_key_path`：Return a reasonable private-key path for diagnostic SSH probes.
 - 函数 `_diagnostic_passwordless_ssh`：Attempt a single passwordless SSH probe with ``key_path``.
 - 函数 `_run_network_diagnostics`：Run connectivity diagnostics against the recorded Vultr instance.
-- 函数 `_maybe_run_network_diagnostics`：Automatically run network diagnostics when an instance is recorded.
+- 函数 `_check_vultr_instances`：检查Vultr账户中是否有实例，如果没有则提示创建。
 - 函数 `run_environment_check`：无文档
 - 函数 `wait_instance_ping`：Ping ``ip`` every ``interval`` seconds until reachable or timeout.
 - 函数 `_resolve_env_default`：Return the first non-empty environment override and its key.
