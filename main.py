@@ -947,20 +947,20 @@ CFG
         desktop_mtu=desktop_mtu,
     ).strip()
 
-def _wait_for_port_22(ip: str, *, timeout: int = 1200, interval: int = 5) -> bool:
+def _wait_for_port_22(ip: str, *, timeout: int = 1200, interval: int = 20) -> bool:
     """Probe TCP/22 on ``ip`` every ``interval`` seconds until success or ``timeout`` seconds elapsed.
     
     Args:
         ip: Target IP address
         timeout: Maximum time to wait in seconds (default: 1200 = 20 minutes)
-        interval: Time between attempts in seconds (default: 5)
+        interval: Time between attempts in seconds (default: 20)
     """
-    deadline = time.time() + timeout
+    start_time = time.time()
+    deadline = start_time + timeout
     attempt = 1
-    elapsed_seconds = 0
     
     while time.time() < deadline:
-        elapsed_seconds = int(time.time() - (deadline - timeout))
+        elapsed_seconds = int(time.time() - start_time)
         remaining_seconds = int(deadline - time.time())
         log_info(f"  ↻ 第 {attempt} 次检测：连接 {ip}:22 … (已等待 {elapsed_seconds}秒，剩余 {remaining_seconds}秒)")
         try:
@@ -1267,9 +1267,9 @@ def create_vps() -> None:
         log_success(f"✅ 实例就绪：id={instance_id}  ip={ip}")
         log_info("→ 执行 ssh-keygen -R 清理旧指纹…")
         subprocess.run(["ssh-keygen", "-R", ip], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最长等待 20 分钟）…")
+        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 20 秒，最长等待 20 分钟）…")
         key_path_default = Path.home() / ".ssh" / "id_ed25519"
-        port_ready = _wait_for_port_22(ip)
+        port_ready = _wait_for_port_22(ip, interval=20)
         if port_ready:
             log_info("→ 第二阶段：校验免密 SSH 是否可用…")
             ssh_ready = _wait_for_passwordless_ssh(ip, key_path_default)
@@ -1675,13 +1675,25 @@ def _diagnostic_ping(ip: str) -> bool:
     log_info(f"→ 排查步骤：ping {ip}")
     ping_cmd = ["ping", "-n" if os.name == "nt" else "-c", "1", ip]
     try:
-        result = subprocess.run(  # noqa: S603
-            ping_cmd,
-            check=False,
-            capture_output=True,
-            **_SUBPROCESS_TEXT_KWARGS,
-            timeout=20,
-        )
+        # Windows ping命令输出使用GBK编码，需要特殊处理
+        if os.name == "nt":
+            result = subprocess.run(  # noqa: S603
+                ping_cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="gbk",
+                errors="replace",
+                timeout=20,
+            )
+        else:
+            result = subprocess.run(  # noqa: S603
+                ping_cmd,
+                check=False,
+                capture_output=True,
+                **_SUBPROCESS_TEXT_KWARGS,
+                timeout=20,
+            )
     except subprocess.SubprocessError as exc:
         log_error(f"❌ 无法执行 ping：{exc}")
         log_info("→ 请确认本机允许发起 ICMP 请求或尝试改用稳定的国际出口网络。")
@@ -1695,9 +1707,9 @@ def _diagnostic_ping(ip: str) -> bool:
     stderr = (result.stderr or "").strip()
     log_error("❌ ping 失败，可能是网络抖动或运营商屏蔽 ICMP。")
     if stdout:
-        log_warning(f"   stdout: {stdout}")
+        log_warning(f"   输出: {stdout}")
     if stderr:
-        log_warning(f"   stderr: {stderr}")
+        log_warning(f"   错误: {stderr}")
     log_info("→ 建议：检查当前出口网络、关闭可能干扰的代理/防火墙，或稍后重试。")
     return False
 
@@ -1785,20 +1797,50 @@ def _run_network_diagnostics(ip: str) -> bool:
     return overall_ok
 
 
-def _maybe_run_network_diagnostics() -> None:
-    """Automatically run network diagnostics when an instance is recorded."""
+def _check_vultr_instances() -> None:
+    """检查Vultr账户中是否有实例，如果没有则提示创建。"""
 
-    instance = _load_instance_for_diagnostics()
-    if not instance:
-        log_info("→ 未检测到 Vultr 实例记录，跳过网络排查。")
+    api_key = os.environ.get("VULTR_API_KEY", "").strip()
+    if not api_key:
+        log_warning("⚠️ 未检测到环境变量 VULTR_API_KEY，跳过Vultr实例检查。")
+        log_info("→ 提示：如需创建VPS，请先设置 VULTR_API_KEY 环境变量。")
         return
 
-    ip, inst_path = instance
-    log_info(f"→ 检测到实例记录：{inst_path}，即将尝试排查与 {ip} 的连通性…")
-    if _run_network_diagnostics(ip):
-        log_success("✅ 网络排查完成，当前环境可直连 VPS。")
+    try:
+        from core.tools.vultr_manager import (  # pylint: disable=import-outside-toplevel
+            VultrError,
+            list_instances,
+        )
+    except ImportError:
+        log_warning("⚠️ 无法导入Vultr管理模块，跳过实例检查。")
+        return
+
+    log_info("→ 正在检查Vultr账户中的实例…")
+    try:
+        instances = list_instances(api_key)
+    except VultrError as exc:
+        log_warning(f"⚠️ 查询Vultr实例失败：{exc}")
+        log_info("→ 提示：请检查 VULTR_API_KEY 是否正确，或稍后重试。")
+        return
+
+    if not instances:
+        log_info("ℹ️ 当前Vultr账户中没有任何实例。")
+        log_info("→ 建议：请执行第2步「创建 VPS（Vultr）」来创建新的VPS实例。")
     else:
-        log_warning("⚠️ 网络排查发现异常，请根据上方提示处理后再继续。")
+        log_success(f"✅ 检测到 {len(instances)} 个Vultr实例。")
+        # 检查是否有本地记录的实例
+        local_instance = _load_instance_for_diagnostics()
+        if local_instance:
+            ip, inst_path = local_instance
+            # 检查这个IP是否在Vultr实例列表中
+            instance_found = any(
+                inst.get("main_ip") == ip for inst in instances
+            )
+            if instance_found:
+                log_info(f"→ 本地记录的实例 {ip} 在Vultr账户中存在。")
+            else:
+                log_warning(f"⚠️ 本地记录的实例 {ip} 在Vultr账户中未找到，可能已被删除。")
+                log_info("→ 建议：请重新创建VPS实例或更新本地记录。")
 
 
 def run_environment_check() -> None:
@@ -1830,11 +1872,14 @@ def run_environment_check() -> None:
     ]
     code = subprocess.call(command)
     if code == 0:
-        log_success("✅ 体检通过。详见 PROJECT_HEALTH_REPORT.md")
+        log_success("✅ 本地环境体检通过。详见 PROJECT_HEALTH_REPORT.md")
     else:
-        log_warning("⚠️ 体检发现问题，请按报告提示修复后再继续。")
+        log_warning("⚠️ 本地环境体检发现问题，请按报告提示修复后再继续。")
+        return
 
-    _maybe_run_network_diagnostics()
+    # 检查Vultr账户中的实例
+    log_info("")
+    _check_vultr_instances()
 
 
 from core.ssh_utils import (
@@ -1996,8 +2041,8 @@ def prepare_wireguard_access() -> None:
         log_warning(f"⚠️ 清理 known_hosts 时出现问题：{exc}")
 
     try:
-        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 5 秒，最长等待 20 分钟）…")
-        if not _wait_for_port_22(ip):
+        log_info("→ 第一阶段：检测 SSH 端口 22 是否开放（每 20 秒，最长等待 20 分钟）…")
+        if not _wait_for_port_22(ip, interval=20):
             _print_manual_ssh_hint()
             raise DeploymentError("未检测到 VPS SSH 端口开放。")
 
