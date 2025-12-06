@@ -1,15 +1,15 @@
 {
-  "id": "993267cb-1e19-4d87-9fcc-d9c9d131ab30",
-  "ip": "198.13.32.41",
+  "id": "d558a305-3533-45ab-a94c-178def206a7d",
+  "ip": "45.76.51.145",
   "region": "nrt",
   "plan": "vc2-4c-8gb",
-  "source": "snapshot",
+  "source": "os",
   "ssh_key": "alalapi",
   "ssh_key_name": "alalapi",
   "ssh_key_id": "75a8feb0-1b99-489f-88c1-5c64d8203cda",
   "ssh_key_ids": [
     "75a8feb0-1b99-489f-88c1-5c64d8203cda"
   ],
-  "created_at": 1764991014,
-  "cloud_init_injected": true
+  "created_at": 1765000454,
+  "cloud_init_injected": false
 }
