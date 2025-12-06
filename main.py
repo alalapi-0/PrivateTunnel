@@ -725,14 +725,14 @@ def deploy_wireguard_remote_script(
             # 检查是否有apt/dpkg进程在运行
             local apt_pid=$(pgrep -x apt-get 2>/dev/null | head -1)
             if [ -n "$apt_pid" ]; then
-              log "检测到其他apt-get进程（PID: $apt_pid）正在运行，等待其完成…（已等待 ${waited}秒）"
+              log "检测到其他apt-get进程（PID: $apt_pid）正在运行，等待其完成…（已等待 $waited 秒）"
             fi
             
             sleep $interval
             waited=$((waited + interval))
           done
           
-          warn "等待dpkg锁释放超时（${max_wait}秒），继续尝试安装…"
+          warn "等待dpkg锁释放超时（$max_wait 秒），继续尝试安装…"
           return 1
         }}
         
