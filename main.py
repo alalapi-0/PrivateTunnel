@@ -356,7 +356,7 @@ def _ensure_paramiko_client() -> paramiko.SSHClient:
             username="root",
             pkey=pkey,
             look_for_keys=False,
-            timeout=30,
+            timeout=60,  # 从30秒增加到60秒，适应不稳定网络
         )
         # 设置keepalive以保持连接稳定（每30秒发送一次keepalive包）
         if client.get_transport():
@@ -495,11 +495,30 @@ def _monitor_deployment_progress(ip: str, key_path: Path, stop_event: threading.
             break
 
 
-def _ssh_run(command: str, *, timeout: int = 900, description: str | None = None) -> SSHResult:
-    """Execute ``command`` on the remote host via OpenSSH with Paramiko fallback."""
+def _ssh_run(command: str, *, timeout: int = 900, description: str | None = None, max_retries: int = 1) -> SSHResult:
+    """Execute ``command`` on the remote host via OpenSSH with Paramiko fallback.
+    
+    Args:
+        command: Command to execute
+        timeout: Timeout for each attempt
+        description: Description for error messages
+        max_retries: Maximum number of retries (default: 1, meaning no retry)
+    """
 
     ctx = _require_ssh_context()
     ssh_executable = shutil.which("ssh")
+    
+    # 检查是否有SSH代理配置
+    ssh_proxy = os.environ.get("SSH_PROXY", "").strip()
+    proxy_command = None
+    if ssh_proxy:
+        # 支持格式：user@host:port 或 host:port (SOCKS代理)
+        if "@" in ssh_proxy:
+            proxy_command = f"ssh -W %h:%p {ssh_proxy}"
+        else:
+            # SOCKS代理，需要nc命令
+            proxy_command = f"nc -X 5 -x {ssh_proxy} %h %p"
+    
     ssh_cmd = [
         ssh_executable or "ssh",
         "-i",
@@ -513,46 +532,85 @@ def _ssh_run(command: str, *, timeout: int = 900, description: str | None = None
         "-o",
         "ServerAliveCountMax=10",
         "-o",
-        "ConnectTimeout=30",
+        "ConnectTimeout=60",  # 从30秒增加到60秒，适应不稳定网络
+    ]
+    
+    # 如果有代理，添加ProxyCommand
+    if proxy_command:
+        ssh_cmd.extend(["-o", f"ProxyCommand={proxy_command}"])
+        log_info(f"→ 使用SSH代理：{ssh_proxy}")
+    
+    ssh_cmd.extend([
         f"root@{ctx.hostname}",
         command,
-    ]
+    ])
 
-    if ssh_executable:
-        logwrite(f"$ {' '.join(ssh_cmd)}")
-        try:
-            completed = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                **_SUBPROCESS_TEXT_KWARGS,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise DeploymentError(f"远端命令超时：{description or command}") from exc
-        except OSError as exc:
-            log_warning(f"⚠️ 调用 OpenSSH 失败：{exc}，将尝试 Paramiko 回退。")
-        else:
-            _log_remote_output("[stdout] ", completed.stdout)
-            _log_remote_output("[stderr] ", completed.stderr)
-            if completed.returncode != 0:
-                details = completed.stderr.strip() or completed.stdout.strip() or f"退出码 {completed.returncode}"
-                raise DeploymentError(
-                    f"远端命令失败（{description or command}）：{details}"
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        if ssh_executable:
+            logwrite(f"$ {' '.join(ssh_cmd)}" + (f" (尝试 {attempt}/{max_retries})" if max_retries > 1 else ""))
+            try:
+                completed = subprocess.run(
+                    ssh_cmd,
+                    capture_output=True,
+                    **_SUBPROCESS_TEXT_KWARGS,
+                    timeout=timeout,
+                    check=False,
                 )
-            return SSHResult(
-                returncode=completed.returncode,
-                stdout=completed.stdout,
-                stderr=completed.stderr,
-                backend="openssh",
-            )
+            except subprocess.TimeoutExpired as exc:
+                last_error = DeploymentError(f"远端命令超时：{description or command}")
+                if attempt < max_retries:
+                    log_warning(f"⚠️ SSH命令超时（尝试 {attempt}/{max_retries}），5秒后重试…")
+                    time.sleep(5)
+                    continue
+                raise last_error
+            except OSError as exc:
+                last_error = DeploymentError(f"调用 OpenSSH 失败：{exc}")
+                if attempt < max_retries:
+                    log_warning(f"⚠️ SSH连接失败（尝试 {attempt}/{max_retries}），5秒后重试…")
+                    time.sleep(5)
+                    continue
+                log_warning(f"⚠️ 调用 OpenSSH 失败：{exc}，将尝试 Paramiko 回退。")
+            else:
+                _log_remote_output("[stdout] ", completed.stdout)
+                _log_remote_output("[stderr] ", completed.stderr)
+                if completed.returncode != 0:
+                    details = completed.stderr.strip() or completed.stdout.strip() or f"退出码 {completed.returncode}"
+                    last_error = DeploymentError(
+                        f"远端命令失败（{description or command}）：{details}"
+                    )
+                    if attempt < max_retries:
+                        log_warning(f"⚠️ SSH命令失败（尝试 {attempt}/{max_retries}），5秒后重试…")
+                        time.sleep(5)
+                        continue
+                    raise last_error
+                return SSHResult(
+                    returncode=completed.returncode,
+                    stdout=completed.stdout,
+                    stderr=completed.stderr,
+                    backend="openssh",
+                )
+    
+    # 如果所有重试都失败，尝试Paramiko回退
+    if last_error:
+        log_warning(f"⚠️ OpenSSH 所有重试均失败，尝试 Paramiko 回退…")
 
-    client = _ensure_paramiko_client()
-    logwrite(f"(paramiko) $ {command}")
-    try:
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001
-        raise DeploymentError(f"Paramiko 执行命令失败：{exc}") from exc
+    # Paramiko回退（也支持重试）
+    last_paramiko_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            client = _ensure_paramiko_client()
+            logwrite(f"(paramiko) $ {command}" + (f" (尝试 {attempt}/{max_retries})" if max_retries > 1 else ""))
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_paramiko_error = exc
+            if attempt < max_retries:
+                log_warning(f"⚠️ Paramiko 连接失败（尝试 {attempt}/{max_retries}），5秒后重试…")
+                _close_paramiko_client()  # 关闭旧连接
+                time.sleep(5)
+                continue
+            raise DeploymentError(f"Paramiko 执行命令失败：{exc}") from exc
 
     try:
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output=False)
@@ -581,6 +639,16 @@ def _download_with_scp(remote_path: str, local_path: Path, *, timeout: int = 300
         return False
 
     local_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # 检查是否有SSH代理配置（与_ssh_run保持一致）
+    ssh_proxy = os.environ.get("SSH_PROXY", "").strip()
+    proxy_command = None
+    if ssh_proxy:
+        if "@" in ssh_proxy:
+            proxy_command = f"ssh -W %h:%p {ssh_proxy}"
+        else:
+            proxy_command = f"nc -X 5 -x {ssh_proxy} %h %p"
+    
     scp_cmd = [
         scp_executable,
         "-i",
@@ -589,9 +657,18 @@ def _download_with_scp(remote_path: str, local_path: Path, *, timeout: int = 300
         "BatchMode=yes",
         "-o",
         "StrictHostKeyChecking=accept-new",
+        "-o",
+        "ConnectTimeout=60",  # 增加连接超时时间
+    ]
+    
+    # 如果有代理，添加ProxyCommand
+    if proxy_command:
+        scp_cmd.extend(["-o", f"ProxyCommand={proxy_command}"])
+    
+    scp_cmd.extend([
         f"root@{ctx.hostname}:{remote_path}",
         str(local_path),
-    ]
+    ])
     logwrite(f"$ {' '.join(scp_cmd)}")
     try:
         result = subprocess.run(
@@ -654,6 +731,7 @@ def _ensure_remote_artifact(remote_path: str, description: str) -> None:
         f"bash -lc {shlex.quote(check_cmd)}",
         timeout=60,
         description=f"校验远端文件 {remote_path}",
+        max_retries=3,  # 增加重试次数，文件校验很重要
     )
     if "OK" not in result.stdout:
         raise DeploymentError(
@@ -704,6 +782,23 @@ def deploy_wireguard_remote_script(
         SERVER_FALLBACK_IP="$(ip -o -4 addr show dev \"$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)\" | awk '{{print $4}}' | cut -d/ -f1 | head -n1)"
 
         log "安装 WireGuard 组件"
+        
+        # 彻底禁用NVIDIA驱动自动安装（必须在apt操作之前）
+        log "彻底禁用NVIDIA驱动自动安装"
+        # 标记所有NVIDIA相关包为hold，防止自动安装或升级
+        for pkg in $(dpkg -l | grep -E "^ii.*nvidia" | awk '{{print $2}}' 2>/dev/null); do
+          apt-mark hold "$pkg" 2>/dev/null || true
+        done
+        # 禁用NVIDIA驱动的post-install脚本
+        if [ -f /usr/lib/nvidia/post-install ]; then
+          chmod -x /usr/lib/nvidia/post-install || true
+          mv /usr/lib/nvidia/post-install /usr/lib/nvidia/post-install.disabled 2>/dev/null || true
+        fi
+        # 设置环境变量彻底跳过NVIDIA驱动安装
+        export NVIDIA_INSTALLER_OPTIONS="--no-questions --accept-license --no-backup --skip-depmod --no-nvidia-modprobe"
+        export NVIDIA_DRIVER_SKIP_INSTALL=1
+        export NVIDIA_AUTO_INSTALL=no
+        export DEBIAN_FRONTEND=noninteractive
         
         # 等待dpkg锁释放（如果有其他apt操作正在进行）
         wait_for_dpkg_lock() {{
@@ -760,18 +855,7 @@ def deploy_wireguard_remote_script(
 
         apt_retry "apt-get update" apt-get update -y
         
-        # 如果系统有NVIDIA驱动相关的包，先禁用其触发器，避免在安装WireGuard时触发NVIDIA驱动安装
-        if dpkg -l | grep -q "^ii.*nvidia"; then
-          log "检测到NVIDIA相关包，禁用NVIDIA驱动自动安装触发器"
-          # 禁用NVIDIA驱动的post-install脚本
-          if [ -f /usr/lib/nvidia/post-install ]; then
-            chmod -x /usr/lib/nvidia/post-install || true
-          fi
-          # 设置环境变量跳过NVIDIA驱动安装
-          export NVIDIA_INSTALLER_OPTIONS="--no-questions --accept-license --no-backup --skip-depmod"
-        fi
-        
-        apt_retry "安装 wireguard 及相关组件" apt-get install -y \
+        apt_retry "安装 wireguard 及相关组件" apt-get install -y --no-install-recommends \
           wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
 
         log "开启 IPv4/IPv6 转发并持久化"
@@ -2135,11 +2219,11 @@ def prepare_wireguard_access() -> None:
         log_file = "/tmp/privatetunnel-wireguard.log"
         pid_file = "/tmp/privatetunnel-wireguard.pid"
         
-        # 先上传脚本
+        # 先上传脚本（增加重试机制）
         upload_cmd = script_payload
-        _ssh_run(upload_cmd, timeout=30, description="上传部署脚本")
+        _ssh_run(upload_cmd, timeout=60, description="上传部署脚本", max_retries=3)
         
-        # 后台启动脚本
+        # 后台启动脚本（增加重试机制）
         start_cmd = (
             f"{env_prefix + ' ' if env_prefix else ''}nohup bash /tmp/privatetunnel-wireguard.sh "
             f"> {log_file} 2>&1 & echo $! > {pid_file}"
@@ -2148,18 +2232,21 @@ def prepare_wireguard_access() -> None:
         log_info("→ 脚本已在后台启动，正在监控部署进度…")
         log_info("")
         
-        _ssh_run(start_cmd, timeout=30, description="启动部署脚本")
+        _ssh_run(start_cmd, timeout=60, description="启动部署脚本", max_retries=3)
         
         # 等待脚本启动
         time.sleep(2)
         
         # 定期检查部署状态
         max_wait_time = 3600  # 最长等待1小时
-        check_interval = 15  # 每15秒检查一次
+        # 根据网络环境调整检查间隔（可通过环境变量覆盖）
+        check_interval = int(os.environ.get("PT_DEPLOY_CHECK_INTERVAL", "30"))  # 从15秒增加到30秒
         start_time = time.time()
         result: SSHResult | None = None
         last_status = ""  # 记录上次显示的状态，避免重复
         check_count = 0
+        consecutive_failures = 0  # 连续失败次数
+        max_consecutive_failures = 20  # 允许连续失败20次（约10分钟）
         
         while time.time() - start_time < max_wait_time:
             elapsed = int(time.time() - start_time)
@@ -2167,22 +2254,23 @@ def prepare_wireguard_access() -> None:
             check_count += 1
             
             try:
-                # 检查进程是否还在运行
+                # 检查进程是否还在运行（增加重试机制）
                 check_pid_cmd = f"test -f {pid_file} && cat {pid_file} || echo ''"
-                pid_result = _ssh_run(check_pid_cmd, timeout=10, description="检查进程ID")
+                pid_result = _ssh_run(check_pid_cmd, timeout=20, description="检查进程ID", max_retries=2)
+                consecutive_failures = 0  # 成功时重置计数器
                 pid = pid_result.stdout.strip()
                 
                 if pid:
-                    # 检查进程是否还在运行
+                    # 检查进程是否还在运行（增加重试机制）
                     check_process_cmd = f"ps -p {pid} > /dev/null 2>&1 && echo 'running' || echo 'stopped'"
-                    process_result = _ssh_run(check_process_cmd, timeout=10, description="检查进程状态")
+                    process_result = _ssh_run(check_process_cmd, timeout=20, description="检查进程状态", max_retries=2)
                     is_running = "running" in process_result.stdout
                     
                     if not is_running:
-                        # 进程已结束，读取日志
+                        # 进程已结束，读取日志（增加重试机制）
                         log_info(f"  ⏱️ [{elapsed}秒] 部署脚本执行完成，正在读取结果…")
                         log_cmd = f"cat {log_file} 2>/dev/null || echo ''"
-                        log_result = _ssh_run(log_cmd, timeout=30, description="读取部署日志")
+                        log_result = _ssh_run(log_cmd, timeout=60, description="读取部署日志", max_retries=3)
                         result = SSHResult(
                             returncode=0,
                             stdout=log_result.stdout,
@@ -2191,9 +2279,16 @@ def prepare_wireguard_access() -> None:
                         )
                         break
                     else:
-                        # 进程还在运行，读取最新日志
+                        # 进程还在运行，读取最新日志（增加重试机制，但失败时不影响主流程）
                         log_cmd = f"tail -n 20 {log_file} 2>/dev/null || echo ''"
-                        log_result = _ssh_run(log_cmd, timeout=10, description="读取最新日志")
+                        try:
+                            log_result = _ssh_run(log_cmd, timeout=20, description="读取最新日志", max_retries=2)
+                        except DeploymentError:
+                            # 读取日志失败不影响主流程，继续等待
+                            if check_count % 4 == 0:  # 每2分钟显示一次
+                                log_warning(f"  ⚠️ [{elapsed}秒] 无法读取日志（网络可能不稳定），继续等待…")
+                            time.sleep(check_interval)
+                            continue
                         current_log = log_result.stdout
                         
                         # 显示最新日志内容
@@ -2221,10 +2316,17 @@ def prepare_wireguard_access() -> None:
                                 if check_count % 4 == 0:  # 每60秒显示一次简单状态
                                     log_info(f"  ⏱️ [{elapsed}秒] 部署进行中（剩余约 {remaining}秒）…")
                 else:
-                    # PID文件不存在，可能脚本已经完成
+                    # PID文件不存在，可能脚本已经完成（增加重试机制）
                     log_info(f"  ⏱️ [{elapsed}秒] 检查部署状态…")
                     log_cmd = f"cat {log_file} 2>/dev/null || echo ''"
-                    log_result = _ssh_run(log_cmd, timeout=30, description="读取部署日志")
+                    try:
+                        log_result = _ssh_run(log_cmd, timeout=60, description="读取部署日志", max_retries=3)
+                    except DeploymentError:
+                        # 读取失败时继续等待
+                        if check_count % 4 == 0:
+                            log_warning(f"  ⚠️ [{elapsed}秒] 无法读取日志，继续等待…")
+                        time.sleep(check_interval)
+                        continue
                     if log_result.stdout.strip():
                         result = SSHResult(
                             returncode=0,
@@ -2237,14 +2339,21 @@ def prepare_wireguard_access() -> None:
                         # 日志文件不存在或为空，继续等待
                         log_info(f"  ⏱️ [{elapsed}秒] 等待脚本启动…")
                 
-                # 检查WireGuard服务状态
+                # 检查WireGuard服务状态（增加重试机制）
                 wg_check_cmd = "systemctl is-active wg-quick@wg0 2>/dev/null || echo 'inactive'"
-                wg_result = _ssh_run(wg_check_cmd, timeout=10, description="检查WireGuard服务")
+                try:
+                    wg_result = _ssh_run(wg_check_cmd, timeout=20, description="检查WireGuard服务", max_retries=2)
+                except DeploymentError:
+                    # 检查失败时继续等待，不立即失败
+                    if check_count % 4 == 0:
+                        log_warning(f"  ⚠️ [{elapsed}秒] 无法检查WireGuard服务状态，继续等待…")
+                    time.sleep(check_interval)
+                    continue
                 if wg_result.stdout.strip() == "active":
                     log_success(f"  ✅ [{elapsed}秒] WireGuard 服务已启动！")
-                    # 读取完整日志
+                    # 读取完整日志（增加重试机制）
                     log_cmd = f"cat {log_file} 2>/dev/null || echo ''"
-                    log_result = _ssh_run(log_cmd, timeout=30, description="读取完整日志")
+                    log_result = _ssh_run(log_cmd, timeout=60, description="读取完整日志", max_retries=3)
                     result = SSHResult(
                         returncode=0,
                         stdout=log_result.stdout,
@@ -2253,23 +2362,44 @@ def prepare_wireguard_access() -> None:
                     )
                     break
                     
+            except DeploymentError as exc:
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    # 连续失败太多次，可能网络完全不可用
+                    log_error(f"❌ 连续 {max_consecutive_failures} 次检查失败，网络可能完全不可用")
+                    log_error(f"   建议：1) 检查网络连接 2) 使用代理（设置环境变量 SSH_PROXY） 3) 手动SSH到VPS完成部署")
+                    raise DeploymentError(f"网络连接不稳定，无法完成部署检查（连续失败 {consecutive_failures} 次）") from exc
+                
+                # 记录错误但继续等待（减少日志输出频率）
+                if check_count % 4 == 0:  # 每2分钟显示一次
+                    log_warning(f"  ⚠️ [{elapsed}秒] 检查失败（{consecutive_failures}/{max_consecutive_failures}）：{exc}，继续等待…")
             except Exception as exc:
-                log_warning(f"  ⚠️ [{elapsed}秒] 检查状态时出错：{exc}，继续等待…")
+                consecutive_failures += 1
+                if check_count % 4 == 0:
+                    log_warning(f"  ⚠️ [{elapsed}秒] 检查状态时出错：{exc}，继续等待…")
             
             # 等待下一次检查
             time.sleep(check_interval)
         else:
             # 超时
-            log_cmd = f"tail -n 50 {log_file} 2>/dev/null || echo '无法读取日志'"
-            log_result = _ssh_run(log_cmd, timeout=30, description="读取超时前的日志")
-            raise DeploymentError(
-                f"部署超时（{max_wait_time}秒）。最后日志：\n{log_result.stdout[:500]}"
-            )
+            log_error(f"❌ 部署超时（{max_wait_time}秒）")
+            log_error("   可能原因：1) 网络连接不稳定 2) NVIDIA驱动安装阻塞 3) 部署脚本执行时间过长")
+            log_error("   建议：1) 使用代理（设置环境变量 SSH_PROXY） 2) 手动SSH到VPS检查部署状态")
+            try:
+                log_cmd = f"tail -n 50 {log_file} 2>/dev/null || echo '无法读取日志'"
+                log_result = _ssh_run(log_cmd, timeout=60, description="读取超时前的日志", max_retries=3)
+                raise DeploymentError(
+                    f"部署超时（{max_wait_time}秒）。最后日志：\n{log_result.stdout[:500]}"
+                )
+            except Exception as exc:
+                raise DeploymentError(
+                    f"部署超时（{max_wait_time}秒），且无法读取日志：{exc}"
+                ) from exc
         
-        # 清理临时文件
+        # 清理临时文件（清理失败不影响主流程，但也要支持重试）
         try:
             cleanup_cmd = f"rm -f {pid_file} {log_file} /tmp/privatetunnel-wireguard.sh"
-            _ssh_run(cleanup_cmd, timeout=10, description="清理临时文件")
+            _ssh_run(cleanup_cmd, timeout=20, description="清理临时文件", max_retries=2)
         except Exception:
             pass  # 清理失败不影响主流程
         
