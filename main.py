@@ -747,10 +747,22 @@ def deploy_wireguard_remote_script(
     dns_servers: str,
     allowed_ips: str,
     desktop_mtu: str,
+    keepalive: str,
+    enable_v2ray: bool = False,
+    v2ray_port: int = 443,
+    v2ray_uuid: str | None = None,
 ) -> str:
     """Return the shell script that configures WireGuard end-to-end on the server.
     
     Args:
+        listen_port: WireGuard 监听端口
+        desktop_ip: 桌面客户端 IP 地址
+        iphone_ip: iPhone 客户端 IP 地址
+        server_ip: 服务器 IP 地址
+        dns_servers: DNS 服务器地址
+        allowed_ips: 允许的 IP 地址范围
+        desktop_mtu: 桌面客户端 MTU
+        keepalive: Keepalive 间隔
         enable_v2ray: 是否启用 V2Ray 流量伪装
         v2ray_port: V2Ray 监听端口（默认 443）
         v2ray_uuid: V2Ray UUID（如果为 None 则在脚本中生成）
@@ -1024,11 +1036,11 @@ config = {{
         "error": "/var/log/v2ray/error.log"
     }},
     "inbounds": [{{
-        "port": {v2ray_port},
+        "port": $V2RAY_PORT,
         "protocol": "vmess",
         "settings": {{
             "clients": [{{
-                "id": "{v2ray_uuid}",
+                "id": "$V2RAY_UUID",
                 "alterId": 0,
                 "security": "auto"
             }}],
@@ -1057,7 +1069,7 @@ config = {{
     }}]
 }}
 
-with open("{v2ray_config}", "w") as f:
+with open("$V2RAY_CONFIG", "w") as f:
     json.dump(config, f, indent=2)
 PYTHON_EOF
           
@@ -1480,6 +1492,9 @@ PYTHON_EOF
         allowed_ips=allowed_ips,
         desktop_mtu=desktop_mtu,
         keepalive=keepalive,
+        enable_v2ray="true" if enable_v2ray else "false",
+        v2ray_port=v2ray_port,
+        v2ray_uuid=v2ray_uuid or "",
     ).strip()
 
 def _wait_for_port_22(ip: str, *, timeout: int = 1200, interval: int = 20) -> bool:
