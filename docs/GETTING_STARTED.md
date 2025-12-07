@@ -53,16 +53,110 @@ cd PrivateTunnel
 4. 切换到系统设置 → VPN → PrivateTunnel，点击连接；
 5. 若成功建立隧道，终端日志与应用 UI 会显示绿色状态。可访问 `https://ifconfig.co` 等站点确认出口 IP 已变更。
 
+## 新功能快速体验
+
+### 多节点管理
+
+1. **启用多节点模式**：
+   ```bash
+   export PT_MULTI_NODE=true
+   ```
+
+2. **创建多个节点**：
+   - 重复执行"创建 Vultr 实例"步骤
+   - 系统会自动管理所有节点
+
+3. **管理节点**：
+   - 使用菜单选项 `6) 多节点管理`
+   - 查看、设置默认节点、更新状态
+
+### 健康检查
+
+使用菜单选项 `7) 节点健康检查` 查看所有节点状态：
+
+- 自动检查延迟、丢包率、连接性
+- 显示节点健康状态
+- 自动触发故障转移（如果启用）
+
+### 智能选路
+
+启用智能选路：
+
+```bash
+export PT_SMART_ROUTING=true
+export PT_ROUTING_STRATEGY=balanced
+```
+
+使用菜单选项 `8) 智能节点选择` 手动选择最优节点。
+
+### 连接质量监控
+
+启用监控：
+
+```bash
+export PT_ENABLE_MONITORING=true
+export PT_MONITOR_INTERVAL=30
+```
+
+使用菜单选项 `9) 连接质量报告` 查看监控数据。
+
+### ChatGPT 专用优化
+
+启用 ChatGPT 模式：
+
+```bash
+export PT_CHATGPT_MODE=true
+```
+
+使用菜单选项 `11) ChatGPT 连接测试` 测试连接。
+
 ## 调优建议
 
 - **固定出口与时区**：服务器与客户端尽量保持统一时区，避免因时间漂移导致密钥刷新失败。
 - **心跳间隔**：在 `core/examples/` 中提供了全局路由与白名单示例，可根据需求调整 `persistent_keepalive`。
 - **灰度启用白名单**：先在小范围设备启用域名分流，确认 `server/split/resolve_domains.py` 输出的 IP 集合无误后，再推广到所有客户端。
+- **多节点配置**：建议至少创建 2-3 个节点以实现高可用，并启用智能选路和健康检查。
+- **监控与自适应**：启用连接监控和自适应参数调整，系统会自动优化连接参数。
 
 ## 后续步骤
 
-- 构建自动化：阅读 [docs/CI.md](CI.md) 了解 GitHub Actions 的编译与脚本检查。
-- 分发方案：根据需要选择 [TestFlight](DISTRIBUTION_TESTFLIGHT.md) 或 [Ad-Hoc](DISTRIBUTION_ADHOC.md)。
-- 故障排查：遇到连接或性能问题时，参阅 [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
+- **功能探索**：阅读 [功能说明](FEATURES.md) 了解所有新功能
+- **使用指南**：查看 [用户使用指南](USER_GUIDE.md) 获取详细使用说明
+- **环境变量**：参考 [环境变量说明](ENVIRONMENT_VARIABLES.md) 配置高级功能
+- **构建自动化**：阅读 [CI.md](CI.md) 了解 GitHub Actions 的编译与脚本检查
+- **分发方案**：根据需要选择 [TestFlight](DISTRIBUTION_TESTFLIGHT.md) 或 [Ad-Hoc](DISTRIBUTION_ADHOC.md)
+- **故障排查**：遇到连接或性能问题时，参阅 [故障排查手册](TROUBLESHOOTING.md)
+
+## 推荐配置
+
+### 基础使用（单节点）
+
+```bash
+export VULTR_API_KEY="your-api-key"
+export VULTR_SSHKEY_NAME="my-ssh-key"
+```
+
+### 高可用配置（多节点）
+
+```bash
+export VULTR_API_KEY="your-api-key"
+export VULTR_SSHKEY_NAME="my-ssh-key"
+export PT_MULTI_NODE=true
+export PT_SMART_ROUTING=true
+export PT_ROUTING_STRATEGY=balanced
+export PT_ENABLE_MONITORING=true
+```
+
+### ChatGPT 专用配置
+
+```bash
+export VULTR_API_KEY="your-api-key"
+export VULTR_SSHKEY_NAME="my-ssh-key"
+export PT_MULTI_NODE=true
+export PT_CHATGPT_MODE=true
+export PT_SMART_ROUTING=true
+export PT_ROUTING_STRATEGY=latency_first
+export PT_ENABLE_MONITORING=true
+```
 
 祝使用愉快，保持自建服务的最小暴露面，合理规划访问策略。

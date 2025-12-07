@@ -9,7 +9,7 @@ ENV_KEYS = (
     "WG_PORT",
 )
 
-DEFAULT_WG_PORT = 443
+DEFAULT_WG_PORT = 51820
 
 
 def _parse_port(value: str, *, source: str) -> int:

@@ -667,7 +667,7 @@ DNS = 1.1.1.1
 PublicKey = ${{SERVER_PUB}}
 AllowedIPs = 0.0.0.0/0
 Endpoint = ${{ENDPOINT}}
-PersistentKeepalive = 25
+PersistentKeepalive = 15
 EOF
 
 echo "=== QR below ==="

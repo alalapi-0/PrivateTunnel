@@ -748,7 +748,13 @@ def deploy_wireguard_remote_script(
     allowed_ips: str,
     desktop_mtu: str,
 ) -> str:
-    """Return the shell script that configures WireGuard end-to-end on the server."""
+    """Return the shell script that configures WireGuard end-to-end on the server.
+    
+    Args:
+        enable_v2ray: 是否启用 V2Ray 流量伪装
+        v2ray_port: V2Ray 监听端口（默认 443）
+        v2ray_uuid: V2Ray UUID（如果为 None 则在脚本中生成）
+    """
 
     return textwrap.dedent(
         """
@@ -779,7 +785,15 @@ def deploy_wireguard_remote_script(
         DNS_SERVERS="${{PT_DNS:-{dns_servers}}}"
         ALLOWED_IPS="${{PT_ALLOWED_IPS:-{allowed_ips}}}"
         DESKTOP_MTU="${{PT_CLIENT_MTU:-{desktop_mtu}}}"
+        KEEPALIVE="${{PT_KEEPALIVE:-{keepalive}}}"
         SERVER_FALLBACK_IP="$(ip -o -4 addr show dev \"$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)\" | awk '{{print $4}}' | cut -d/ -f1 | head -n1)"
+        
+        # V2Ray 配置变量
+        ENABLE_V2RAY="${{PT_ENABLE_V2RAY:-{enable_v2ray}}}"
+        V2RAY_PORT="${{PT_V2RAY_PORT:-{v2ray_port}}}"
+        V2RAY_UUID="${{PT_V2RAY_UUID:-{v2ray_uuid}}}"
+        V2RAY_DIR=/usr/local/etc/v2ray
+        V2RAY_CONFIG="$V2RAY_DIR/config.json"
 
         log "安装 WireGuard 组件"
         
@@ -858,12 +872,206 @@ def deploy_wireguard_remote_script(
         apt_retry "安装 wireguard 及相关组件" apt-get install -y --no-install-recommends \
           wireguard wireguard-tools qrencode iptables-persistent netfilter-persistent curl
 
+        # 可选：安装 V2Ray（用于流量伪装）
+        if [ "${{ENABLE_V2RAY}}" = "true" ] || [ "${{ENABLE_V2RAY}}" = "1" ]; then
+          log "安装 V2Ray 用于流量伪装"
+          
+          # 检查是否已安装 V2Ray
+          if command -v v2ray >/dev/null 2>&1; then
+            log "V2Ray 已安装，跳过安装步骤"
+          else
+            # 使用官方安装脚本
+            log "下载 V2Ray 安装脚本"
+            if ! curl -L https://raw.githubusercontent.com/v2fly/fhs-install-v2ray/master/install-release.sh -o /tmp/install-v2ray.sh; then
+              err "下载 V2Ray 安装脚本失败"
+              exit 1
+            fi
+            
+            log "执行 V2Ray 安装"
+            bash /tmp/install-v2ray.sh --version latest || {{
+              err "V2Ray 安装失败"
+              exit 1
+            }}
+            
+            # 清理临时文件
+            rm -f /tmp/install-v2ray.sh
+            
+            log "V2Ray 安装完成"
+          fi
+          
+          # 检查 V2Ray 服务
+          if systemctl list-unit-files | grep -q v2ray.service; then
+            log "V2Ray systemd 服务已存在"
+          else
+            warn "V2Ray systemd 服务未找到，可能需要手动配置"
+          fi
+        else
+          log "跳过 V2Ray 安装（未启用）"
+        fi
+
         log "开启 IPv4/IPv6 转发并持久化"
         sysctl -w net.ipv4.ip_forward=1
         sysctl -w net.ipv6.conf.all.forwarding=1
         echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wireguard-forward.conf
         echo 'net.ipv6.conf.all.forwarding=1' > /etc/sysctl.d/99-wireguard-forward6.conf
+        
+        log "优化网络性能参数（UDP 缓冲区、BBR 拥塞控制、连接跟踪）"
+        cat > /etc/sysctl.d/99-wireguard-optimize.conf <<EOF
+# WireGuard 网络优化参数
+# 增强 UDP 缓冲区配置
+net.core.rmem_max = 268435456
+net.core.wmem_max = 268435456
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+net.ipv4.udp_mem = 786432 1048576 2097152
+
+# UDP MTU 探测和优化
+net.ipv4.udp_mtu_probe = 1
+net.ipv4.ip_no_pmtu_disc = 0
+net.ipv4.tcp_mtu_probing = 1
+
+# NAT 和连接跟踪优化（如果系统支持）
+net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+
+# 网络接口和路由优化
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# 网络队列和调度优化
+net.core.netdev_max_backlog = 5000
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# BBR 拥塞控制（已有）
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+
+# WireGuard 特定优化
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+net.ipv4.ip_local_port_range = 10000 65535
+EOF
         sysctl --system || true
+        
+        # 检查并加载连接跟踪模块（如果支持）
+        log "检查连接跟踪模块支持"
+        if modprobe -n nf_conntrack >/dev/null 2>&1; then
+          log "检测到 nf_conntrack 支持，尝试加载模块"
+          modprobe nf_conntrack 2>/dev/null || true
+          # 重新应用 sysctl 以确保连接跟踪参数生效
+          sysctl -w net.netfilter.nf_conntrack_max=262144 >/dev/null 2>&1 || true
+        else
+          log "系统不支持 nf_conntrack，跳过连接跟踪优化（不影响 WireGuard 功能）"
+        fi
+
+        # 配置 V2Ray（如果启用）
+        if [ "${{ENABLE_V2RAY}}" = "true" ] || [ "${{ENABLE_V2RAY}}" = "1" ]; then
+          log "配置 V2Ray 服务器"
+          
+          # 创建 V2Ray 配置目录
+          mkdir -p "$V2RAY_DIR" /var/log/v2ray
+          chmod 755 "$V2RAY_DIR" /var/log/v2ray
+          
+          # 生成 UUID（如果未提供）
+          if [ -z "$V2RAY_UUID" ]; then
+            log "生成 V2Ray UUID"
+            V2RAY_UUID=$(cat /proc/sys/kernel/random/uuid)
+          fi
+          
+          # 生成自签名 TLS 证书（用于测试，生产环境建议使用真实证书）
+          log "生成 TLS 证书"
+          mkdir -p /etc/v2ray
+          if [ ! -f /etc/v2ray/cert.pem ] || [ ! -f /etc/v2ray/key.pem ]; then
+            if ! command -v openssl >/dev/null 2>&1; then
+              log "安装 openssl"
+              apt_retry "安装 openssl" apt-get install -y openssl
+            fi
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+              -keyout /etc/v2ray/key.pem \
+              -out /etc/v2ray/cert.pem \
+              -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" \
+              2>/dev/null || {{
+              err "OpenSSL 证书生成失败"
+              exit 1
+            }}
+            chmod 600 /etc/v2ray/key.pem
+            chmod 644 /etc/v2ray/cert.pem
+            log "TLS 证书已生成"
+          else
+            log "TLS 证书已存在，跳过生成"
+          fi
+          
+          # 生成 V2Ray 配置（使用 Python 脚本）
+          log "生成 V2Ray 配置文件"
+          python3 <<PYTHON_EOF
+import json
+import sys
+
+config = {{
+    "log": {{
+        "loglevel": "warning",
+        "access": "/var/log/v2ray/access.log",
+        "error": "/var/log/v2ray/error.log"
+    }},
+    "inbounds": [{{
+        "port": {v2ray_port},
+        "protocol": "vmess",
+        "settings": {{
+            "clients": [{{
+                "id": "{v2ray_uuid}",
+                "alterId": 0,
+                "security": "auto"
+            }}],
+            "disableInsecureEncryption": True
+        }},
+        "streamSettings": {{
+            "network": "ws",
+            "security": "tls",
+            "wsSettings": {{
+                "path": "/ray",
+                "headers": {{}}
+            }},
+            "tlsSettings": {{
+                "certificates": [{{
+                    "certificateFile": "/etc/v2ray/cert.pem",
+                    "keyFile": "/etc/v2ray/key.pem"
+                }}],
+                "minVersion": "1.2",
+                "maxVersion": "1.3"
+            }}
+        }}
+    }}],
+    "outbounds": [{{
+        "protocol": "freedom",
+        "settings": {{}}
+    }}]
+}}
+
+with open("{v2ray_config}", "w") as f:
+    json.dump(config, f, indent=2)
+PYTHON_EOF
+          
+          if [ ! -f "$V2RAY_CONFIG" ]; then
+            err "V2Ray 配置文件生成失败"
+            exit 1
+          fi
+          
+          chmod 600 "$V2RAY_CONFIG"
+          log "V2Ray 配置文件已生成: $V2RAY_CONFIG"
+          log "V2Ray UUID: $V2RAY_UUID"
+          log "V2Ray 端口: $V2RAY_PORT"
+          log "V2Ray WebSocket 路径: /ray"
+        fi
 
         WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
         if [ -z "${{WAN_IF:-}}" ]; then
@@ -1002,7 +1210,7 @@ MTU = $DESKTOP_MTU
 PublicKey = $SERVER_PUBLIC_KEY
 AllowedIPs = $ALLOWED_IPS
 Endpoint = $ENDPOINT
-PersistentKeepalive = 25
+PersistentKeepalive = $KEEPALIVE
 CFG
         chmod 600 "$DESKTOP_DIR/desktop.conf"
 
@@ -1018,9 +1226,190 @@ DNS = $DNS_SERVERS
 PublicKey = $SERVER_PUBLIC_KEY
 AllowedIPs = $ALLOWED_IPS
 Endpoint = $ENDPOINT
-PersistentKeepalive = 25
+PersistentKeepalive = $KEEPALIVE
 CFG
         chmod 600 "$IPHONE_DIR/iphone.conf"
+
+        # 生成 V2Ray 客户端配置（如果启用）
+        if [ "${{ENABLE_V2RAY}}" = "true" ] || [ "${{ENABLE_V2RAY}}" = "1" ]; then
+          log "生成 V2Ray 客户端配置"
+          
+          # V2Ray 客户端配置目录
+          V2RAY_CLIENT_DIR="$CLIENT_BASE/v2ray"
+          mkdir -p "$V2RAY_CLIENT_DIR"
+          chmod 700 "$V2RAY_CLIENT_DIR"
+          
+          # 确保 V2RAY_UUID 已生成（在服务器配置阶段应该已生成，但以防万一）
+          if [ -z "$V2RAY_UUID" ]; then
+            V2RAY_UUID=$(cat /proc/sys/kernel/random/uuid)
+          fi
+          
+          # 生成桌面端 V2Ray 配置
+          cat >"$V2RAY_CLIENT_DIR/desktop.json" <<V2RAY_CFG
+{{
+  "log": {{
+    "loglevel": "warning"
+  }},
+  "inbounds": [{{
+    "port": 10808,
+    "protocol": "socks",
+    "settings": {{
+      "auth": "noauth",
+      "udp": true
+    }},
+    "tag": "socks-in"
+  }}, {{
+    "port": 10809,
+    "protocol": "http",
+    "settings": {{}},
+    "tag": "http-in"
+  }}],
+  "outbounds": [{{
+    "protocol": "vmess",
+    "settings": {{
+      "vnext": [{{
+        "address": "$SERVER_ENDPOINT_IP",
+        "port": $V2RAY_PORT,
+        "users": [{{
+          "id": "$V2RAY_UUID",
+          "alterId": 0,
+          "security": "auto"
+        }}]
+      }}]
+    }},
+    "streamSettings": {{
+      "network": "ws",
+      "security": "tls",
+      "wsSettings": {{
+        "path": "/ray"
+      }},
+      "tlsSettings": {{
+        "allowInsecure": true,
+        "serverName": "$SERVER_ENDPOINT_IP"
+      }}
+    }},
+    "tag": "proxy"
+  }}, {{
+    "protocol": "freedom",
+    "settings": {{}},
+    "tag": "direct"
+  }}],
+  "routing": {{
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [{{
+      "type": "field",
+      "inboundTag": ["socks-in", "http-in"],
+      "outboundTag": "proxy"
+    }}]
+  }}
+}}
+V2RAY_CFG
+          
+          # 生成 iPhone 端 V2Ray 配置（简化版）
+          cat >"$V2RAY_CLIENT_DIR/iphone.json" <<V2RAY_CFG
+{{
+  "log": {{
+    "loglevel": "warning"
+  }},
+  "inbounds": [{{
+    "port": 10808,
+    "protocol": "socks",
+    "settings": {{
+      "auth": "noauth",
+      "udp": true
+    }}
+  }}],
+  "outbounds": [{{
+    "protocol": "vmess",
+    "settings": {{
+      "vnext": [{{
+        "address": "$SERVER_ENDPOINT_IP",
+        "port": $V2RAY_PORT,
+        "users": [{{
+          "id": "$V2RAY_UUID",
+          "alterId": 0,
+          "security": "auto"
+        }}]
+      }}]
+    }},
+    "streamSettings": {{
+      "network": "ws",
+      "security": "tls",
+      "wsSettings": {{
+        "path": "/ray"
+      }},
+      "tlsSettings": {{
+        "allowInsecure": true,
+        "serverName": "$SERVER_ENDPOINT_IP"
+      }}
+    }}
+  }}]
+}}
+V2RAY_CFG
+          
+          chmod 600 "$V2RAY_CLIENT_DIR"/*.json 2>/dev/null || true
+          
+          # 生成 VMess URL（用于客户端快速导入）
+          # 格式：vmess://base64(json)
+          V2RAY_VMESS_JSON=$(cat <<VMESS_JSON
+{{
+  "v": "2",
+  "ps": "PrivateTunnel-V2Ray",
+  "add": "$SERVER_ENDPOINT_IP",
+  "port": "$V2RAY_PORT",
+  "id": "$V2RAY_UUID",
+  "aid": "0",
+  "scy": "auto",
+  "net": "ws",
+  "type": "none",
+  "host": "",
+  "path": "/ray",
+  "tls": "tls",
+  "sni": "$SERVER_ENDPOINT_IP"
+}}
+VMESS_JSON
+          )
+          
+          # Base64 编码（需要 base64 命令）
+          if command -v base64 >/dev/null 2>&1; then
+            V2RAY_VMESS_URL="vmess://$(echo -n "$V2RAY_VMESS_JSON" | base64 -w 0)"
+          else
+            # 如果没有 base64 命令，使用 Python
+            V2RAY_VMESS_URL=$(python3 <<PYTHON_EOF
+import json
+import base64
+import sys
+
+vmess_data = {{
+    "v": "2",
+    "ps": "PrivateTunnel-V2Ray",
+    "add": "$SERVER_ENDPOINT_IP",
+    "port": "$V2RAY_PORT",
+    "id": "$V2RAY_UUID",
+    "aid": "0",
+    "scy": "auto",
+    "net": "ws",
+    "type": "none",
+    "host": "",
+    "path": "/ray",
+    "tls": "tls",
+    "sni": "$SERVER_ENDPOINT_IP"
+}}
+
+json_str = json.dumps(vmess_data, separators=(',', ':'))
+encoded = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
+print(f"vmess://{{encoded}}")
+PYTHON_EOF
+            )
+          fi
+          echo "$V2RAY_VMESS_URL" > "$V2RAY_CLIENT_DIR/vmess-url.txt"
+          chmod 600 "$V2RAY_CLIENT_DIR/vmess-url.txt"
+          
+          log "V2Ray 客户端配置已生成："
+          log "  桌面：$V2RAY_CLIENT_DIR/desktop.json"
+          log "  iPhone：$V2RAY_CLIENT_DIR/iphone.json"
+          log "  VMess URL：$V2RAY_CLIENT_DIR/vmess-url.txt"
+        fi
 
         wg set wg0 peer "$DESKTOP_PUB" remove 2>/dev/null || true
         wg set wg0 peer "$DESKTOP_PUB" allowed-ips "$DESKTOP_IP"
@@ -1057,6 +1446,17 @@ CFG
         printf 'IPHONE_PUBLIC_KEY=%s\n' "$IPHONE_PUB"
         printf 'ENDPOINT=%s\n' "$ENDPOINT"
         printf 'WAN_IF=%s\n' "$WAN_IF"
+        
+        # V2Ray 信息（如果启用）
+        if [ "${{ENABLE_V2RAY}}" = "true" ] || [ "${{ENABLE_V2RAY}}" = "1" ]; then
+          printf 'V2RAY_ENABLED=true\n'
+          printf 'V2RAY_PORT=%s\n' "$V2RAY_PORT"
+          printf 'V2RAY_UUID=%s\n' "$V2RAY_UUID"
+          printf 'V2RAY_WS_PATH=/ray\n'
+          printf 'V2RAY_SERVER_IP=%s\n' "$SERVER_ENDPOINT_IP"
+        else
+          printf 'V2RAY_ENABLED=false\n'
+        fi
 
         cat <<SUMMARY
 ──────────────────────────────
@@ -1079,6 +1479,7 @@ CFG
         dns_servers=dns_servers,
         allowed_ips=allowed_ips,
         desktop_mtu=desktop_mtu,
+        keepalive=keepalive,
     ).strip()
 
 def _wait_for_port_22(ip: str, *, timeout: int = 1200, interval: int = 20) -> bool:
@@ -1425,6 +1826,11 @@ def create_vps() -> None:
 
     artifacts_dir = ARTIFACTS_DIR
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # 解析节点优先级和权重（如果启用多节点）
+    use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+    node_priority = int(os.environ.get("PT_NODE_PRIORITY", "1"))
+    node_weight = int(os.environ.get("PT_NODE_WEIGHT", "100"))
+
     instance_info: dict[str, Any] = {
         "id": instance_id,
         "ip": ip,
@@ -1438,6 +1844,13 @@ def create_vps() -> None:
         "created_at": int(time.time()),
         "cloud_init_injected": bool(cloud_init),
     }
+
+    # 如果启用多节点，添加节点配置
+    if use_multi_node:
+        instance_info["priority"] = node_priority
+        instance_info["weight"] = node_weight
+        log_info(f"→ 节点优先级：{node_priority}，权重：{node_weight}")
+
     instance_file = artifacts_dir / "instance.json"
     instance_file.write_text(
         json.dumps(instance_info, ensure_ascii=False, indent=2),
@@ -1542,20 +1955,76 @@ def _log_selected_platform() -> None:
 
 
 def _update_server_info(data: dict[str, Any]) -> None:
+    """更新服务器信息，支持多节点。Update server info, supporting multi-node."""
     artifacts_dir = ARTIFACTS_DIR
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    server_file = artifacts_dir / "server.json"
-    existing: dict[str, Any] = {}
-    if server_file.exists():
-        try:
-            existing = json.loads(server_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            existing = {}
-    existing.update(data)
-    server_file.write_text(
-        json.dumps(existing, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+
+    # 多节点模式：使用 MultiNodeManager
+    use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+
+    if use_multi_node:
+        from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
+
+        manager = MultiNodeManager()
+        instance_id = data.get("id", "")
+
+        if instance_id:
+            # 从 instance.json 获取基础信息
+            instance_file = artifacts_dir / "instance.json"
+            instance_data = {}
+            if instance_file.exists():
+                try:
+                    instance_data = json.loads(instance_file.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    pass
+
+            # 创建或更新节点
+            node_id = f"node-{instance_id[:8]}"
+            node = manager.add_node_from_instance(
+                instance_id=instance_id,
+                ip=data.get("ip", instance_data.get("ip", "")),
+                region=instance_data.get("region", "unknown"),
+                plan=instance_data.get("plan", "unknown"),
+                priority=int(data.get("priority", instance_data.get("priority", 1))),
+                weight=int(data.get("weight", instance_data.get("weight", 100))),
+                node_id=node_id,
+            )
+
+            # 更新节点详细信息
+            metadata = {
+                "wan_interface": data.get("wan_interface"),
+                "desktop_config": data.get("desktop_config"),
+                "iphone_config": data.get("iphone_config"),
+                "v2ray_enabled": data.get("v2ray_enabled", False),
+                "v2ray_port": data.get("v2ray_port"),
+                "v2ray_uuid": data.get("v2ray_uuid"),
+            }
+
+            manager.update_node_info(
+                node_id=node_id,
+                server_pub=data.get("server_pub"),
+                endpoint=data.get("endpoint"),
+                metadata=metadata,
+            )
+
+            # 设置节点状态为活跃
+            manager.update_node_status(node_id, NodeStatus.ACTIVE)
+
+            log_info(f"→ 节点信息已更新到多节点配置：{node_id}")
+    else:
+        # 单节点模式：保持原有逻辑（向后兼容）
+        server_file = artifacts_dir / "server.json"
+        existing: dict[str, Any] = {}
+        if server_file.exists():
+            try:
+                existing = json.loads(server_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                existing = {}
+        existing.update(data)
+        server_file.write_text(
+            json.dumps(existing, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def _wireguard_windows_candidate_paths() -> list[Path]:
@@ -1688,6 +2157,274 @@ def _desktop_usage_tip() -> None:
         log_info(
             "→ 可在任意支持 WireGuard 的桌面客户端中导入该配置以连接 VPS。"
         )
+
+
+def manage_nodes() -> None:
+    """管理多节点配置。Manage multi-node configuration."""
+    from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
+
+    log_section("🔧 多节点管理")
+
+    use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+    if not use_multi_node:
+        log_warning("⚠️ 多节点模式未启用")
+        log_info("→ 提示：设置环境变量 PT_MULTI_NODE=true 启用多节点模式")
+        return
+
+    manager = MultiNodeManager()
+    nodes = manager.get_all_nodes()
+
+    if not nodes:
+        log_info("ℹ️ 当前没有配置任何节点")
+        return
+
+    log_info("→ 当前节点列表：")
+    for idx, node in enumerate(nodes, 1):
+        status_icon = "✅" if node.status == NodeStatus.ACTIVE else "⚠️"
+        default_mark = " (默认)" if manager.config and manager.config.default_node_id == node.id else ""
+        log_info(f"  {idx}. {status_icon} {node.id} | {node.ip} | {node.region} | "
+                f"优先级:{node.priority} 权重:{node.weight} | {node.status.value}{default_mark}")
+
+    log_info("")
+    log_info("操作选项：")
+    log_info("  1) 设置默认节点")
+    log_info("  2) 更新节点状态")
+    log_info("  3) 删除节点")
+    log_info("  q) 返回")
+
+    choice = input("请选择: ").strip().lower()
+
+    if choice == "1":
+        # 设置默认节点
+        node_choice = input(f"请选择节点编号 [1-{len(nodes)}]: ").strip()
+        try:
+            node_idx = int(node_choice)
+            if 1 <= node_idx <= len(nodes):
+                selected_node = nodes[node_idx - 1]
+                if manager.config:
+                    manager.config.set_default_node(selected_node.id)
+                    manager.save()
+                    log_success(f"✅ 已设置 {selected_node.id} 为默认节点")
+                else:
+                    log_error("❌ 配置管理器未初始化")
+            else:
+                log_error("❌ 无效的节点编号")
+        except ValueError:
+            log_error("❌ 无效输入")
+
+    elif choice == "2":
+        # 更新节点状态
+        node_choice = input(f"请选择节点编号 [1-{len(nodes)}]: ").strip()
+        try:
+            node_idx = int(node_choice)
+            if 1 <= node_idx <= len(nodes):
+                selected_node = nodes[node_idx - 1]
+                log_info("可用状态：")
+                log_info("  1) active - 活跃")
+                log_info("  2) inactive - 非活跃")
+                log_info("  3) failing - 故障")
+                log_info("  4) maintenance - 维护中")
+                status_choice = input("请选择状态 [1-4]: ").strip()
+                status_map = {
+                    "1": NodeStatus.ACTIVE,
+                    "2": NodeStatus.INACTIVE,
+                    "3": NodeStatus.FAILING,
+                    "4": NodeStatus.MAINTENANCE,
+                }
+                if status_choice in status_map:
+                    new_status = status_map[status_choice]
+                    manager.update_node_status(selected_node.id, new_status)
+                    log_success(f"✅ 已更新节点 {selected_node.id} 状态为 {new_status.value}")
+                else:
+                    log_error("❌ 无效的状态选择")
+            else:
+                log_error("❌ 无效的节点编号")
+        except ValueError:
+            log_error("❌ 无效输入")
+
+    elif choice == "3":
+        # 删除节点
+        node_choice = input(f"请选择要删除的节点编号 [1-{len(nodes)}]: ").strip()
+        try:
+            node_idx = int(node_choice)
+            if 1 <= node_idx <= len(nodes):
+                selected_node = nodes[node_idx - 1]
+                confirm = input(f"确认删除节点 {selected_node.id} ({selected_node.ip})? [y/N]: ").strip().lower()
+                if confirm in ("y", "yes"):
+                    if manager.config:
+                        if manager.config.remove_node(selected_node.id):
+                            manager.save()
+                            log_success(f"✅ 已删除节点 {selected_node.id}")
+                        else:
+                            log_error("❌ 删除节点失败")
+                    else:
+                        log_error("❌ 配置管理器未初始化")
+                else:
+                    log_info("已取消删除")
+            else:
+                log_error("❌ 无效的节点编号")
+        except ValueError:
+            log_error("❌ 无效输入")
+
+    elif choice == "q":
+        return
+
+
+def check_nodes_health() -> None:
+    """检查所有节点健康状态。Check all nodes health."""
+    from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
+    from core.tools.node_health_checker import NodeHealthChecker
+
+    log_section("🏥 节点健康检查")
+
+    use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+    if not use_multi_node:
+        log_warning("⚠️ 多节点模式未启用")
+        log_info("→ 提示：设置环境变量 PT_MULTI_NODE=true 启用多节点模式")
+        return
+
+    manager = MultiNodeManager()
+    nodes = manager.get_all_nodes()
+
+    if not nodes:
+        log_info("ℹ️ 当前没有配置任何节点")
+        return
+
+    log_info(f"→ 开始检查 {len(nodes)} 个节点...")
+
+    # 获取 WireGuard 端口
+    from core.port_config import resolve_listen_port
+    wg_port, _ = resolve_listen_port()
+
+    checker = NodeHealthChecker()
+    results = manager.check_all_nodes(wireguard_port=wg_port)
+
+    log_info("")
+    log_info("健康检查结果：")
+    log_info("=" * 60)
+
+    for node in nodes:
+        metrics = results.get(node.id)
+        if metrics:
+            status_icon = "✅" if metrics.overall_healthy else "❌"
+            latency_str = f"{metrics.latency_ms:.2f}ms" if metrics.latency_ms else "N/A"
+
+            log_info(f"{status_icon} {node.id} ({node.ip})")
+            log_info(f"   延迟：{latency_str}")
+            log_info(f"   ICMP: {'✅' if metrics.icmp_success else '❌'} | "
+                    f"TCP: {'✅' if metrics.tcp_success else '❌'} | "
+                    f"HTTPS: {'✅' if metrics.https_success else '❌'} | "
+                    f"DNS: {'✅' if metrics.dns_success else '❌'} | "
+                    f"WireGuard: {'✅' if metrics.wireguard_handshake else '❌'}")
+            log_info(f"   状态：{node.status.value}")
+            log_info("")
+
+    # 检查是否需要故障转移
+    default_node = manager.get_default_node()
+    if default_node:
+        default_metrics = results.get(default_node.id)
+        if default_metrics and not default_metrics.overall_healthy:
+            log_warning(f"⚠️ 默认节点 {default_node.id} 不健康")
+            backup = manager.switch_to_backup_node(default_node.id, wg_port)
+            if backup:
+                log_success(f"✅ 已自动切换到备用节点：{backup.id} ({backup.ip})")
+            else:
+                log_error("❌ 未找到可用的备用节点")
+    else:
+        log_error("❌ 无效选择")
+
+
+def smart_node_selection() -> None:
+    """智能节点选择。Smart node selection."""
+    from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
+    from core.tools.smart_routing import SmartRouter, RoutingStrategy, NodeScore
+
+    log_section("🧠 智能节点选择")
+
+    use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+    if not use_multi_node:
+        log_warning("⚠️ 多节点模式未启用")
+        log_info("→ 提示：设置环境变量 PT_MULTI_NODE=true 启用多节点模式")
+        return
+
+    manager = MultiNodeManager()
+    nodes = manager.get_all_nodes()
+
+    if not nodes:
+        log_info("ℹ️ 当前没有配置任何节点")
+        return
+
+    # 选择选路策略
+    log_info("请选择选路策略：")
+    log_info("  1) 延迟优先（latency_first）- 选择延迟最低的节点")
+    log_info("  2) 权重优先（weight_first）- 选择权重最高的节点")
+    log_info("  3) 优先级优先（priority_first）- 选择优先级最高的节点")
+    log_info("  4) 平衡模式（balanced）- 综合考虑多个因素")
+    log_info("  5) 混合模式（hybrid）- 智能混合策略")
+
+    strategy_map = {
+        "1": RoutingStrategy.LATENCY_FIRST,
+        "2": RoutingStrategy.WEIGHT_FIRST,
+        "3": RoutingStrategy.PRIORITY_FIRST,
+        "4": RoutingStrategy.BALANCED,
+        "5": RoutingStrategy.HYBRID,
+    }
+
+    choice = input("请选择策略 [1-5，默认 4]: ").strip() or "4"
+    strategy = strategy_map.get(choice, RoutingStrategy.BALANCED)
+
+    log_info(f"→ 使用策略：{strategy.value}")
+
+    # 获取 WireGuard 端口
+    from core.port_config import resolve_listen_port
+
+    wg_port, _ = resolve_listen_port()
+
+    # 执行智能选路
+    log_info("→ 正在分析节点...")
+    router = SmartRouter(strategy=strategy)
+    best_node, best_score, all_scores = router.select_best_node(nodes, wg_port)
+
+    if not best_node:
+        log_error("❌ 未找到可用节点")
+        return
+
+    # 显示结果
+    log_info("")
+    log_info("=" * 60)
+    log_info("智能选路结果：")
+    log_info("=" * 60)
+    log_info(f"✅ 推荐节点：{best_node.id} ({best_node.ip})")
+    log_info(f"   区域：{best_node.region}")
+    log_info(f"   优先级：{best_node.priority}，权重：{best_node.weight}")
+    if best_score:
+        log_info(f"   综合评分：{best_score.overall_score:.2f}/100")
+        log_info(f"   延迟评分：{best_score.latency_score:.2f}/100")
+        log_info(f"   权重评分：{best_score.weight_score:.2f}/100")
+        log_info(f"   优先级评分：{best_score.priority_score:.2f}/100")
+        log_info(f"   健康评分：{best_score.health_score:.2f}/100")
+
+    log_info("")
+    log_info("所有节点评分：")
+    for node in sorted(
+        nodes,
+        key=lambda n: all_scores.get(n.id, NodeScore(n.id)).overall_score,
+        reverse=True,
+    ):
+        score = all_scores.get(node.id)
+        if score:
+            log_info(
+                f"  {node.id}: {score.overall_score:.2f}分 "
+                f"(延迟:{score.latency_score:.1f} 权重:{score.weight_score:.1f} "
+                f"优先级:{score.priority_score:.1f} 健康:{score.health_score:.1f})"
+            )
+
+    # 询问是否设置为默认节点
+    confirm = input(f"\n是否将 {best_node.id} 设置为默认节点？[y/N]: ").strip().lower()
+    if confirm in ("y", "yes"):
+        manager.config.set_default_node(best_node.id)
+        manager.save()
+        log_success(f"✅ 已设置 {best_node.id} 为默认节点")
 
 
 def launch_gui() -> None:
@@ -2085,31 +2822,481 @@ def _default_private_key_prompt() -> str:
     return pick_default_key()
 
 
+def view_connection_report() -> None:
+    """查看连接质量报告。View connection quality report."""
+    from core.tools.connection_monitor import ConnectionMonitor
+    from core.tools.connection_stats import ConnectionSession
+
+    log_section("📊 连接质量报告")
+
+    stats_dir = ARTIFACTS_DIR / "connection_stats"
+
+    if not stats_dir.exists():
+        log_info("ℹ️ 暂无连接统计数据")
+        log_info("→ 提示：设置环境变量 PT_ENABLE_MONITORING=true 启用监控")
+        return
+
+    # 查找会话文件
+    session_files = list(stats_dir.glob("session-*.json"))
+
+    if not session_files:
+        log_info("ℹ️ 暂无会话记录")
+        return
+
+    # 按时间排序
+    session_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+    log_info(f"→ 找到 {len(session_files)} 个会话记录")
+    log_info("")
+    log_info("最近会话：")
+
+    for idx, session_file in enumerate(session_files[:10], 1):
+        try:
+            session_data = json.loads(session_file.read_text(encoding="utf-8"))
+            session_id = session_data.get("session_id", "unknown")
+            node_id = session_data.get("node_id", "unknown")
+            duration = session_data.get("duration", 0)
+            avg_latency = session_data.get("avg_latency_ms")
+
+            latency_str = f"{avg_latency:.2f}ms" if avg_latency else "N/A"
+            hours = duration // 3600
+            minutes = (duration % 3600) // 60
+            log_info(
+                f"  {idx}. {session_id[:8]}... | 节点:{node_id} | "
+                f"时长:{hours}h{minutes}m | 延迟:{latency_str}"
+            )
+        except Exception as exc:
+            log_warning(f"  {idx}. 读取失败：{exc}")
+
+    # 选择会话查看详情
+    if len(session_files) > 0:
+        choice = input(f"\n请选择会话查看详情 [1-{min(10, len(session_files))}, q退出]: ").strip()
+
+        if choice.lower() != "q":
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(session_files):
+                    session_file = session_files[idx]
+                    session_data = json.loads(session_file.read_text(encoding="utf-8"))
+
+                    # 生成报告
+                    session = ConnectionSession.from_dict(session_data)
+                    node_ip = "unknown"  # 可以从配置中获取
+
+                    monitor = ConnectionMonitor(
+                        node_id=session.node_id,
+                        node_ip=node_ip,
+                    )
+                    report = monitor.generate_report(session_id=session.session_id)
+
+                    if "error" in report:
+                        log_error(f"❌ {report['error']}")
+                        return
+
+                    # 显示报告
+                    log_info("")
+                    log_info("=" * 60)
+                    log_info("连接质量报告")
+                    log_info("=" * 60)
+                    log_info(f"会话 ID: {report['session_id']}")
+                    log_info(f"节点 ID: {report['node_id']}")
+                    duration = report["duration"]
+                    hours = duration // 3600
+                    minutes = (duration % 3600) // 60
+                    log_info(f"持续时间: {hours}h{minutes}m")
+                    log_info("")
+                    log_info("统计摘要：")
+                    summary = report["summary"]
+                    log_info(
+                        f"  平均延迟: {summary['avg_latency_ms']:.2f}ms"
+                        if summary["avg_latency_ms"]
+                        else "  平均延迟: N/A"
+                    )
+                    log_info(
+                        f"  最大延迟: {summary['max_latency_ms']:.2f}ms"
+                        if summary["max_latency_ms"]
+                        else "  最大延迟: N/A"
+                    )
+                    log_info(
+                        f"  最小延迟: {summary['min_latency_ms']:.2f}ms"
+                        if summary["min_latency_ms"]
+                        else "  最小延迟: N/A"
+                    )
+                    log_info(f"  平均丢包率: {summary['avg_packet_loss']*100:.2f}%")
+                    log_info(f"  最大丢包率: {summary['max_packet_loss']*100:.2f}%")
+                    log_info(f"  重连次数: {summary['total_reconnects']}")
+                    log_info(f"  发送字节: {summary['total_tx_bytes']:,}")
+                    log_info(f"  接收字节: {summary['total_rx_bytes']:,}")
+                    log_info("")
+                    log_info(f"质量评分: {report['quality_score']:.2f}/100")
+            except (ValueError, IndexError, KeyError) as exc:
+                log_error(f"❌ 读取报告失败：{exc}")
+
+
+def view_parameter_recommendations() -> None:
+    """查看参数调整建议。View parameter recommendations."""
+    from core.tools.adaptive_params import AdaptiveParameterTuner, ParameterSet
+    from core.tools.connection_stats import ConnectionSession
+
+    log_section("🔧 参数调整建议")
+
+    stats_dir = ARTIFACTS_DIR / "connection_stats"
+
+    if not stats_dir.exists():
+        log_info("ℹ️ 暂无连接统计数据")
+        log_info("→ 提示：设置环境变量 PT_ENABLE_MONITORING=true 启用监控")
+        return
+
+    # 查找最近的会话
+    session_files = list(stats_dir.glob("session-*.json"))
+    if not session_files:
+        log_info("ℹ️ 暂无会话记录")
+        return
+
+    session_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    latest_session_file = session_files[0]
+
+    try:
+        session_data = json.loads(latest_session_file.read_text(encoding="utf-8"))
+        session = ConnectionSession.from_dict(session_data)
+
+        # 确定节点 ID
+        node_id = session.node_id
+
+        # 获取建议
+        tuner = AdaptiveParameterTuner(node_id)
+        recommendations = tuner.get_recommendations(session)
+
+        # 显示建议
+        log_info("=" * 60)
+        log_info("当前参数：")
+        current = recommendations["current"]
+        log_info(f"  Keepalive: {current['keepalive']} 秒")
+        log_info(f"  MTU: {current['mtu']}")
+        log_info("")
+        log_info("建议参数：")
+        suggested = recommendations["suggested"]
+        log_info(f"  Keepalive: {suggested['keepalive']} 秒")
+        log_info(f"  MTU: {suggested['mtu']}")
+        log_info("")
+        log_info(f"调整原因：{recommendations['reason']}")
+        log_info("")
+
+        # 显示调整历史
+        if tuner.adjustment_history:
+            log_info("最近调整历史：")
+            for adj in tuner.adjustment_history[-5:]:  # 最近 5 次
+                success_icon = "✅" if adj.success else "❌"
+                log_info(f"  {success_icon} {adj.reason}")
+                log_info(f"    Keepalive: {adj.old_params.keepalive} → {adj.new_params.keepalive}")
+                log_info(f"    MTU: {adj.old_params.mtu} → {adj.new_params.mtu}")
+
+        # 询问是否应用
+        if recommendations["changes"]["keepalive"] or recommendations["changes"]["mtu"]:
+            confirm = input("\n是否应用建议的参数？[y/N]: ").strip().lower()
+            if confirm in ("y", "yes"):
+                new_params = ParameterSet.from_dict(suggested)
+                adjustment = tuner.apply_adjustment(new_params, recommendations["reason"])
+                log_success("✅ 参数已更新，请重新部署配置")
+                log_info(f"   调整 ID: {adjustment.adjustment_id[:8]}")
+    except Exception as exc:
+        log_error(f"❌ 获取建议失败：{exc}")
+
+
+def test_chatgpt_connection() -> None:
+    """测试 ChatGPT 连接。Test ChatGPT connection."""
+    from core.tools.chatgpt_optimizer import ChatGPTOptimizer
+    from core.tools.multi_node_manager import MultiNodeManager
+    
+    log_section("🧪 ChatGPT 连接测试")
+    
+    # 确定节点
+    use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+    
+    if use_multi_node:
+        manager = MultiNodeManager()
+        default_node = manager.get_default_node()
+        
+        if not default_node:
+            log_error("❌ 未找到默认节点")
+            return
+        
+        node_ip = default_node.ip
+        log_info(f"→ 使用节点：{default_node.id} ({node_ip})")
+    else:
+        # 单节点模式
+        inst_path = ARTIFACTS_DIR / "instance.json"
+        if not inst_path.exists():
+            log_error("❌ 未找到实例信息")
+            return
+        
+        try:
+            instance = json.loads(inst_path.read_text(encoding="utf-8"))
+            node_ip = instance.get("ip")
+            if not node_ip:
+                log_error("❌ 实例信息缺少 IP")
+                return
+        except Exception as exc:
+            log_error(f"❌ 读取实例信息失败：{exc}")
+            return
+    
+    # 获取 WireGuard 端口
+    from core.port_config import resolve_listen_port
+    wg_port, _ = resolve_listen_port()
+    
+    # 创建优化器
+    optimizer = ChatGPTOptimizer(
+        node_ip=node_ip,
+        wireguard_port=wg_port,
+    )
+    
+    # 1. 解析域名
+    log_info("→ 步骤 1: 解析 ChatGPT 域名...")
+    try:
+        domain_results = optimizer.resolve_chatgpt_domains()
+        
+        log_info(f"→ 解析结果：")
+        for domain, info in domain_results["domains"].items():
+            if info.get("resolved"):
+                ips = info.get("ips", [])
+                log_info(f"  ✅ {domain}: {', '.join(ips[:3])}{'...' if len(ips) > 3 else ''}")
+            else:
+                log_warning(f"  ❌ {domain}: 解析失败 - {info.get('error', 'Unknown')}")
+    except Exception as exc:
+        log_error(f"❌ 域名解析失败：{exc}")
+        return
+    
+    # 2. 测试连接
+    log_info("")
+    log_info("→ 步骤 2: 测试 ChatGPT API 连接...")
+    
+    test_urls = [
+        ("OpenAI API", "https://api.openai.com/v1/models"),
+        ("ChatGPT Web", "https://chat.openai.com"),
+    ]
+    
+    for name, url in test_urls:
+        log_info(f"→ 测试 {name} ({url})...")
+        try:
+            result = optimizer.test_chatgpt_connectivity(url)
+            
+            if result["success"]:
+                log_success(f"  ✅ 连接成功（延迟：{result['latency_ms']:.1f}ms，状态码：{result['status_code']}）")
+            else:
+                log_error(f"  ❌ 连接失败：{result.get('error', 'Unknown')}")
+        except Exception as exc:
+            log_error(f"  ❌ 测试失败：{exc}")
+    
+    # 3. 获取优化建议
+    log_info("")
+    log_info("→ 步骤 3: 获取优化建议...")
+    
+    # 获取当前参数
+    try:
+        keepalive = int(os.environ.get("PT_KEEPALIVE", "25"))
+        mtu = int(os.environ.get("PT_CLIENT_MTU", "1280"))
+        
+        recommendations = optimizer.optimize_for_chatgpt(keepalive, mtu)
+        
+        log_info("→ 优化建议：")
+        log_info(f"   Keepalive: {keepalive} → {recommendations['keepalive']}")
+        log_info(f"   MTU: {mtu} → {recommendations['mtu']}")
+        log_info(f"   原因: {recommendations['reason']}")
+    except Exception as exc:
+        log_warning(f"⚠️ 获取优化建议失败：{exc}")
+    
+    # 4. 生成分流配置
+    log_info("")
+    log_info("→ 步骤 4: 生成分流配置...")
+    try:
+        split_config = optimizer.generate_split_config()
+        log_success(f"✅ 分流配置已生成：{split_config}")
+    except Exception as exc:
+        log_error(f"❌ 生成分流配置失败：{exc}")
+
 
 def prepare_wireguard_access() -> None:
     """Configure WireGuard end-to-end, including client provisioning."""
 
-    inst_path = ARTIFACTS_DIR / "instance.json"
-    if not inst_path.exists():
-        log_section("🛡 Step 3: 准备本机接入 VPS 网络")
-        log_error(f"❌ 未找到 {inst_path}，请先创建 VPS。")
-        return
+    # 检查是否启用 ChatGPT 专用模式
+    enable_chatgpt_mode = os.environ.get("PT_CHATGPT_MODE", "").strip().lower() in ("true", "1", "yes")
 
-    try:
-        instance = json.loads(inst_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        log_section("🛡 Step 3: 准备本机接入 VPS 网络")
-        log_error(f"❌ 解析实例信息失败：{exc}")
-        return
+    # 检查是否启用多节点模式
+    use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
 
-    ip = instance.get("ip")
-    instance_id = instance.get("id", "")
-    if not ip:
-        log_section("🛡 Step 3: 准备本机接入 VPS 网络")
-        log_error(f"❌ 实例信息缺少 IP 字段，请重新创建或检查 {inst_path}。")
-        return
+    if use_multi_node:
+        from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
 
-    log_section("🛡 Step 3: 准备本机接入 VPS 网络")
+        if enable_chatgpt_mode:
+            log_section("🛡 Step 3: 准备本机接入 VPS 网络（多节点模式 + ChatGPT 专用）")
+        else:
+            log_section("🛡 Step 3: 准备本机接入 VPS 网络（多节点模式）")
+
+        manager = MultiNodeManager()
+        nodes = manager.get_all_nodes()
+
+        if not nodes:
+            log_error("❌ 未找到任何节点，请先创建 VPS。")
+            return
+
+        # 显示可用节点
+        log_info("→ 可用节点列表：")
+        for idx, node in enumerate(nodes, 1):
+            status_icon = "✅" if node.status == NodeStatus.ACTIVE else "⚠️"
+            log_info(f"  {idx}. {status_icon} {node.id} | {node.ip} | {node.region} | "
+                    f"优先级:{node.priority} 权重:{node.weight} | {node.status.value}")
+
+        # 选择节点
+        default_node = manager.get_default_node()
+
+        # 检查是否启用智能选路
+        use_smart_routing = os.environ.get("PT_SMART_ROUTING", "").strip().lower() in ("true", "1", "yes")
+        routing_strategy = os.environ.get("PT_ROUTING_STRATEGY", "balanced").strip().lower()
+        selected_node = None
+
+        if use_smart_routing:
+            log_info("→ 使用智能选路选择节点...")
+            from core.tools.smart_routing import SmartRouter, RoutingStrategy
+
+            try:
+                strategy = RoutingStrategy(routing_strategy)
+                router = SmartRouter(strategy=strategy)
+
+                from core.port_config import resolve_listen_port
+
+                wg_port, _ = resolve_listen_port()
+
+                best_node, best_score, all_scores = router.select_best_node(
+                    nodes,
+                    wireguard_port=wg_port,
+                )
+
+                if best_node:
+                    selected_node = best_node
+                    log_success(f"✅ 智能选路推荐：{selected_node.id} ({selected_node.ip})")
+                    if best_score:
+                        log_info(f"   综合评分：{best_score.overall_score:.2f}/100")
+                else:
+                    log_warning("⚠️ 智能选路未找到节点，使用手动选择")
+                    use_smart_routing = False
+            except (ImportError, ValueError) as exc:
+                log_warning(f"⚠️ 智能选路失败：{exc}，使用手动选择")
+                use_smart_routing = False
+
+        if not use_smart_routing or selected_node is None:
+            # 手动选择节点（原有逻辑）
+            if default_node:
+                default_idx = next((i for i, n in enumerate(nodes, 1) if n.id == default_node.id), 1)
+            else:
+                default_idx = 1
+
+            choice = input(f"请选择节点 [1-{len(nodes)}, 默认 {default_idx}]: ").strip()
+            if not choice:
+                selected_idx = default_idx
+            else:
+                try:
+                    selected_idx = int(choice)
+                    if not 1 <= selected_idx <= len(nodes):
+                        log_error("❌ 无效选择")
+                        return
+                except ValueError:
+                    log_error("❌ 无效输入")
+                    return
+
+            selected_node = nodes[selected_idx - 1]
+            log_info(f"→ 已选择节点：{selected_node.id} ({selected_node.ip})")
+
+        # 如果启用多节点，执行健康检查
+        from core.tools.node_health_checker import NodeHealthChecker
+
+        log_info(f"→ 检查节点 {selected_node.id} 健康状态…")
+        checker = NodeHealthChecker()
+
+        # 从节点信息中获取 WireGuard 端口
+        # 如果节点有 endpoint，提取端口；否则使用默认端口
+        wg_port = None
+        if selected_node.endpoint:
+            try:
+                _, port_str = selected_node.endpoint.rsplit(":", 1)
+                wg_port = int(port_str)
+            except (ValueError, AttributeError):
+                pass
+
+        if wg_port is None:
+            wg_port = LISTEN_PORT
+
+        metrics = checker.check_node(
+            ip=selected_node.ip,
+            wireguard_port=wg_port,
+        )
+
+        # 显示健康检查结果
+        log_info(f"→ 健康检查结果：")
+        log_info(f"   延迟：{metrics.latency_ms:.2f}ms" if metrics.latency_ms else "   延迟：N/A")
+        log_info(f"   ICMP：{'✅' if metrics.icmp_success else '❌'}")
+        log_info(f"   TCP (SSH)：{'✅' if metrics.tcp_success else '❌'}")
+        log_info(f"   HTTPS：{'✅' if metrics.https_success else '❌'}")
+        log_info(f"   DNS：{'✅' if metrics.dns_success else '❌'}")
+        log_info(f"   WireGuard：{'✅' if metrics.wireguard_handshake else '❌'}")
+        log_info(f"   整体状态：{'✅ 健康' if metrics.overall_healthy else '❌ 不健康'}")
+
+        # 更新节点状态
+        if metrics.overall_healthy:
+            manager.update_node_status(selected_node.id, NodeStatus.ACTIVE, metrics.latency_ms)
+        else:
+            manager.update_node_status(selected_node.id, NodeStatus.FAILING, metrics.latency_ms)
+
+            # 如果节点不健康，尝试故障转移
+            log_warning(f"⚠️ 节点 {selected_node.id} 健康检查失败")
+            backup = manager.switch_to_backup_node(selected_node.id, wg_port)
+
+            if backup:
+                log_info(f"→ 自动切换到备用节点：{backup.id} ({backup.ip})")
+                selected_node = backup
+            else:
+                log_warning("⚠️ 未找到可用的备用节点")
+                confirm = input("是否继续使用当前节点？[y/N]: ").strip().lower()
+                if confirm not in ("y", "yes"):
+                    return
+
+        # 使用选中节点的信息
+        ip = selected_node.ip
+        instance_id = selected_node.instance_id
+        selected_node_id = selected_node.id  # 保存节点 ID 供后续使用
+
+        # 检查节点状态
+        if selected_node.status != NodeStatus.ACTIVE:
+            log_warning(f"⚠️ 节点状态为 {selected_node.status.value}，可能无法正常连接")
+            confirm = input("是否继续？[y/N]: ").strip().lower()
+            if confirm not in ("y", "yes"):
+                return
+    else:
+        selected_node_id = None  # 单节点模式下没有 selected_node_id
+        # 单节点模式：保持原有逻辑
+        inst_path = ARTIFACTS_DIR / "instance.json"
+        if not inst_path.exists():
+            log_section("🛡 Step 3: 准备本机接入 VPS 网络")
+            log_error(f"❌ 未找到 {inst_path}，请先创建 VPS。")
+            return
+
+        try:
+            instance = json.loads(inst_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            log_section("🛡 Step 3: 准备本机接入 VPS 网络")
+            log_error(f"❌ 解析实例信息失败：{exc}")
+            return
+
+        ip = instance.get("ip")
+        instance_id = instance.get("id", "")
+        if not ip:
+            log_section("🛡 Step 3: 准备本机接入 VPS 网络")
+            log_error(f"❌ 实例信息缺少 IP 字段，请重新创建或检查 {inst_path}。")
+            return
+
+        if enable_chatgpt_mode:
+            log_section("🛡 Step 3: 准备本机接入 VPS 网络（ChatGPT 专用模式）")
+        else:
+            log_section("🛡 Step 3: 准备本机接入 VPS 网络")
     _log_selected_platform()
 
     deploy_log_path = _init_deploy_log()
@@ -2157,13 +3344,153 @@ def prepare_wireguard_access() -> None:
             )
         )
 
-    client_mtu_raw = os.environ.get("PT_CLIENT_MTU", "").strip()
-    if client_mtu_raw:
-        desktop_mtu = client_mtu_raw
-        log_info(f"→ 客户端 MTU：{desktop_mtu} （来自环境变量 PT_CLIENT_MTU）")
+    # 解析 PersistentKeepalive 参数
+    enable_adaptive = os.environ.get("PT_ENABLE_ADAPTIVE", "").strip().lower() in ("true", "1", "yes")
+
+    if enable_adaptive:
+        # 自适应模式：从历史记录加载参数
+        from core.tools.adaptive_params import AdaptiveParameterTuner
+
+        # 确定节点 ID
+        adaptive_node_id = None
+        if use_multi_node and 'selected_node_id' in locals() and selected_node_id:
+            adaptive_node_id = selected_node_id
+        else:
+            adaptive_node_id = instance_id[:8] if instance_id else "default"
+
+        tuner = AdaptiveParameterTuner(adaptive_node_id)
+        current_params = tuner.current_params
+
+        keepalive_value = str(current_params.keepalive)
+        desktop_mtu = str(current_params.mtu)
+
+        log_info(f"→ 自适应参数模式已启用")
+        log_info(f"→ 当前 Keepalive：{keepalive_value} 秒（自适应调整）")
+        log_info(f"→ 当前 MTU：{desktop_mtu}（自适应调整）")
     else:
-        desktop_mtu = "1280"
-        log_info("→ 客户端 MTU：1280（默认值，可通过环境变量 PT_CLIENT_MTU 覆盖）")
+        # 手动模式：从环境变量或默认值
+        keepalive_value, keepalive_source = _resolve_env_default("PT_KEEPALIVE", default="25")
+        if keepalive_source:
+            log_info(f"→ 客户端 Keepalive：{keepalive_value} 秒 （来自环境变量 {keepalive_source}）")
+        else:
+            log_info(f"→ 客户端 Keepalive：{keepalive_value} 秒（默认值，可通过环境变量 PT_KEEPALIVE 覆盖）")
+
+        # 验证 keepalive 值有效性
+        try:
+            keepalive_int = int(keepalive_value)
+            if not 0 <= keepalive_int <= 65535:
+                log_warning(f"⚠️ Keepalive 值 {keepalive_int} 超出有效范围 (0-65535)，将使用默认值 25")
+                keepalive_value = "25"
+        except ValueError:
+            log_warning(f"⚠️ Keepalive 值 '{keepalive_value}' 无效，将使用默认值 25")
+            keepalive_value = "25"
+
+        client_mtu_raw = os.environ.get("PT_CLIENT_MTU", "").strip()
+        if client_mtu_raw:
+            desktop_mtu = client_mtu_raw
+            log_info(f"→ 客户端 MTU：{desktop_mtu} （来自环境变量 PT_CLIENT_MTU）")
+        else:
+            desktop_mtu = "1280"
+            log_info("→ 客户端 MTU：1280（默认值，可通过环境变量 PT_CLIENT_MTU 覆盖）")
+
+    # V2Ray 配置参数
+    enable_v2ray_raw = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower()
+    enable_v2ray = enable_v2ray_raw in ("true", "1", "yes")
+    if enable_v2ray:
+        log_info(f"→ V2Ray 流量伪装：已启用")
+        
+        v2ray_port_raw = os.environ.get("PT_V2RAY_PORT", "").strip()
+        if v2ray_port_raw:
+            try:
+                v2ray_port = int(v2ray_port_raw)
+                log_info(f"→ V2Ray 端口：{v2ray_port} （来自环境变量 PT_V2RAY_PORT）")
+            except ValueError:
+                log_warning(f"⚠️ V2RAY_PORT 值 '{v2ray_port_raw}' 无效，将使用默认值 443")
+                v2ray_port = 443
+        else:
+            v2ray_port = 443
+            log_info("→ V2Ray 端口：443（默认值，可通过环境变量 PT_V2RAY_PORT 覆盖）")
+        
+        v2ray_uuid = os.environ.get("PT_V2RAY_UUID", "").strip()
+        if v2ray_uuid:
+            log_info(f"→ V2Ray UUID：已通过环境变量 PT_V2RAY_UUID 指定")
+        else:
+            v2ray_uuid = None  # 将在服务器端生成
+            log_info("→ V2Ray UUID：将在服务器端自动生成")
+    else:
+        log_info("→ V2Ray 流量伪装：未启用（可通过环境变量 PT_ENABLE_V2RAY=true 启用）")
+        v2ray_port = 443
+        v2ray_uuid = None
+
+    # 如果启用 ChatGPT 模式，进行优化
+    if enable_chatgpt_mode:
+        from core.tools.chatgpt_optimizer import ChatGPTOptimizer
+        
+        log_info("")
+        log_info("→ ChatGPT 专用模式已启用，正在优化连接...")
+        
+        optimizer = ChatGPTOptimizer(
+            node_ip=ip,
+            wireguard_port=LISTEN_PORT,
+        )
+        
+        # 解析 ChatGPT 域名
+        log_info("→ 解析 ChatGPT 域名...")
+        try:
+            domain_results = optimizer.resolve_chatgpt_domains()
+            resolved_count = sum(1 for d in domain_results["domains"].values() if d.get("resolved"))
+            log_info(f"→ 已解析 {resolved_count}/{len(domain_results['domains'])} 个域名")
+        except Exception as exc:
+            log_warning(f"⚠️ 域名解析失败：{exc}")
+        
+        # 测试连接
+        log_info("→ 测试 ChatGPT 连接性...")
+        try:
+            connectivity = optimizer.test_chatgpt_connectivity()
+            if connectivity["success"]:
+                log_success(f"✅ ChatGPT 连接正常（延迟：{connectivity['latency_ms']:.1f}ms）")
+            else:
+                log_warning(f"⚠️ ChatGPT 连接测试失败：{connectivity.get('error', 'Unknown')}")
+        except Exception as exc:
+            log_warning(f"⚠️ 连接测试失败：{exc}")
+        
+        # 获取优化建议
+        log_info("→ 获取参数优化建议...")
+        try:
+            current_keepalive = int(keepalive_value) if keepalive_value.isdigit() else 25
+            current_mtu = int(desktop_mtu) if desktop_mtu.isdigit() else 1280
+            
+            recommendations = optimizer.optimize_for_chatgpt(
+                current_keepalive=current_keepalive,
+                current_mtu=current_mtu,
+            )
+            
+            if recommendations["keepalive"] != current_keepalive or recommendations["mtu"] != current_mtu:
+                log_info(f"→ 建议调整参数：")
+                log_info(f"   Keepalive: {current_keepalive} → {recommendations['keepalive']}")
+                log_info(f"   MTU: {current_mtu} → {recommendations['mtu']}")
+                log_info(f"   原因: {recommendations['reason']}")
+                
+                confirm = input("是否应用 ChatGPT 优化参数？[Y/n]: ").strip().lower()
+                if confirm not in ("n", "no"):
+                    keepalive_value = str(recommendations["keepalive"])
+                    desktop_mtu = str(recommendations["mtu"])
+                    log_success("✅ 已应用 ChatGPT 优化参数")
+            else:
+                log_info("→ 当前参数已适合 ChatGPT，无需调整")
+        except Exception as exc:
+            log_warning(f"⚠️ 获取优化建议失败：{exc}")
+        
+        # 生成分流配置
+        log_info("→ 生成分流配置文件...")
+        try:
+            split_config = optimizer.generate_split_config()
+            log_success(f"✅ 分流配置已生成：{split_config}")
+            log_info("→ 提示：将此配置部署到服务器以启用 ChatGPT 分流")
+        except Exception as exc:
+            log_warning(f"⚠️ 生成分流配置失败：{exc}")
+        
+        log_info("")
 
     default_key_prompt = _default_private_key_prompt()
     key_path = Path(ask_key_path(default_key_prompt)).expanduser()
@@ -2196,22 +3523,34 @@ def prepare_wireguard_access() -> None:
             dns_value,
             allowed_ips,
             desktop_mtu,
+            keepalive_value,
+            enable_v2ray=enable_v2ray,
+            v2ray_port=v2ray_port,
+            v2ray_uuid=v2ray_uuid,
         )
         script_payload = (
             "cat <<'EOS' >/tmp/privatetunnel-wireguard.sh\n"
             f"{remote_script}\n"
             "EOS\n"
         )
+        env_dict = {
+            "WG_PORT": str(LISTEN_PORT),
+            "PT_DESKTOP_IP": desktop_ip,
+            "PT_IPHONE_IP": iphone_ip,
+            "PT_DNS": dns_value,
+            "PT_ALLOWED_IPS": allowed_ips,
+            "PT_CLIENT_MTU": desktop_mtu,
+            "PT_KEEPALIVE": keepalive_value,
+        }
+        if enable_v2ray:
+            env_dict["PT_ENABLE_V2RAY"] = "true"
+            env_dict["PT_V2RAY_PORT"] = str(v2ray_port)
+            if v2ray_uuid:
+                env_dict["PT_V2RAY_UUID"] = v2ray_uuid
+        
         env_parts = [
             f"{key}={shlex.quote(value)}"
-            for key, value in {
-                "WG_PORT": str(LISTEN_PORT),
-                "PT_DESKTOP_IP": desktop_ip,
-                "PT_IPHONE_IP": iphone_ip,
-                "PT_DNS": dns_value,
-                "PT_ALLOWED_IPS": allowed_ips,
-                "PT_CLIENT_MTU": desktop_mtu,
-            }.items()
+            for key, value in env_dict.items()
             if value
         ]
         env_prefix = " ".join(env_parts)
@@ -2413,7 +3752,7 @@ def prepare_wireguard_access() -> None:
             line = line.strip()
             if not line:
                 continue
-            prefixes = ("SERVER_", "DESKTOP_", "IPHONE_", "ENDPOINT=", "WAN_IF=")
+            prefixes = ("SERVER_", "DESKTOP_", "IPHONE_", "ENDPOINT=", "WAN_IF=", "V2RAY_")
             if any(line.startswith(prefix) for prefix in prefixes):
                 key, _, value = line.partition("=")
                 summary[key] = value.strip()
@@ -2423,6 +3762,11 @@ def prepare_wireguard_access() -> None:
         iphone_pub = summary.get("IPHONE_PUBLIC_KEY", "")
         endpoint = summary.get("ENDPOINT", f"{ip}:{LISTEN_PORT}")
         wan_if = summary.get("WAN_IF", "")
+        
+        # 从部署输出中提取 V2Ray 信息
+        v2ray_enabled = summary.get("V2RAY_ENABLED", "false").lower() == "true"
+        v2ray_port = summary.get("V2RAY_PORT", "")
+        v2ray_uuid = summary.get("V2RAY_UUID", "")
 
         log_success("✅ 远端 WireGuard 已成功部署并完成 NAT/转发配置。")
         if wan_if:
@@ -2471,6 +3815,44 @@ def prepare_wireguard_access() -> None:
 
         log_success(f"✅ 已下载 iPhone 二维码：{iphone_png_local}")
 
+        # 下载 V2Ray 客户端配置（如果启用）
+        enable_v2ray_check = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower() in ("true", "1", "yes")
+        if enable_v2ray_check:
+            log_info("→ 下载 V2Ray 客户端配置…")
+            
+            v2ray_client_dir = artifacts_dir / "v2ray"
+            v2ray_client_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 下载桌面端 V2Ray 配置
+            remote_v2ray_desktop = "/etc/wireguard/clients/v2ray/desktop.json"
+            v2ray_desktop_local = v2ray_client_dir / "desktop.json"
+            try:
+                _ensure_remote_artifact(remote_v2ray_desktop, "桌面端 V2Ray 配置")
+                _download_artifact(remote_v2ray_desktop, v2ray_desktop_local)
+                log_success(f"✅ 已下载桌面端 V2Ray 配置：{v2ray_desktop_local}")
+            except DeploymentError as exc:
+                log_warning(f"⚠️ 下载桌面端 V2Ray 配置失败：{exc}")
+            
+            # 下载 iPhone 端 V2Ray 配置
+            remote_v2ray_iphone = "/etc/wireguard/clients/v2ray/iphone.json"
+            v2ray_iphone_local = v2ray_client_dir / "iphone.json"
+            try:
+                _ensure_remote_artifact(remote_v2ray_iphone, "iPhone V2Ray 配置")
+                _download_artifact(remote_v2ray_iphone, v2ray_iphone_local)
+                log_success(f"✅ 已下载 iPhone V2Ray 配置：{v2ray_iphone_local}")
+            except DeploymentError as exc:
+                log_warning(f"⚠️ 下载 iPhone V2Ray 配置失败：{exc}")
+            
+            # 下载 VMess URL
+            remote_vmess_url = "/etc/wireguard/clients/v2ray/vmess-url.txt"
+            vmess_url_local = v2ray_client_dir / "vmess-url.txt"
+            try:
+                _ensure_remote_artifact(remote_vmess_url, "VMess URL")
+                _download_artifact(remote_vmess_url, vmess_url_local)
+                log_success(f"✅ 已下载 VMess URL：{vmess_url_local}")
+            except DeploymentError as exc:
+                log_warning(f"⚠️ 下载 VMess URL 失败：{exc}")
+
         for path in (desktop_conf_local, iphone_conf_local, iphone_png_local):
             if not path.exists():
                 raise DeploymentError(f"本地文件缺失：{path}")
@@ -2505,18 +3887,137 @@ def prepare_wireguard_access() -> None:
             "allowed_ips": allowed_ips,
             "dns": dns_value,
             "deploy_log": str(deploy_log_path),
+            "v2ray_enabled": v2ray_enabled,
         }
         if wan_if:
             server_info["wan_interface"] = wan_if
+        
+        if v2ray_enabled:
+            server_info["v2ray_port"] = v2ray_port
+            server_info["v2ray_uuid"] = v2ray_uuid
+            server_info["v2ray_ws_path"] = "/ray"
+            # V2Ray 配置文件路径
+            v2ray_client_dir = artifacts_dir / "v2ray"
+            if (v2ray_client_dir / "desktop.json").exists():
+                server_info["v2ray_desktop_config"] = str(v2ray_client_dir / "desktop.json")
+            if (v2ray_client_dir / "iphone.json").exists():
+                server_info["v2ray_iphone_config"] = str(v2ray_client_dir / "iphone.json")
+            if (v2ray_client_dir / "vmess-url.txt").exists():
+                server_info["v2ray_vmess_url"] = str(v2ray_client_dir / "vmess-url.txt")
         _update_server_info(server_info)
 
         log_info("验证指南：")
         log_info(f"  1. Windows 打开 WireGuard 导入 {_rel(desktop_conf_local)} 并连接。")
         log_info("  2. 连接后运行：curl -4 ifconfig.me / curl -6 ifconfig.me，应显示 VPS 公网地址。")
         log_info("  3. 若能获取公网 IP 但无法上网，请检查代理/安全软件；如丢包，可继续使用默认 MTU=1280。")
+        
+        # V2Ray 使用指南（如果启用）
+        if enable_v2ray_check:
+            v2ray_client_dir = artifacts_dir / "v2ray"
+            log_info("")
+            log_info("=" * 50)
+            log_info("V2Ray 客户端使用指南：")
+            log_info("=" * 50)
+            log_info("")
+            log_info("📱 Windows 客户端：")
+            log_info("  1. 下载 V2RayN 或 V2RayNG：")
+            log_info("     - V2RayN: https://github.com/2dust/v2rayN/releases")
+            log_info("     - V2RayNG: https://github.com/2dust/v2rayNG/releases")
+            log_info("  2. 导入配置文件：")
+            if (v2ray_client_dir / "desktop.json").exists():
+                log_info(f"     - 方式1：导入 JSON 文件 {_rel(v2ray_client_dir / 'desktop.json')}")
+            if (v2ray_client_dir / "vmess-url.txt").exists():
+                log_info(f"     - 方式2：导入 VMess URL（从 {_rel(v2ray_client_dir / 'vmess-url.txt')} 复制）")
+            log_info("  3. 启动 V2Ray 客户端，设置系统代理或浏览器代理")
+            log_info("  4. 测试连接：访问 https://www.google.com")
+            log_info("")
+            log_info("📱 iPhone 客户端：")
+            log_info("  1. 安装 Shadowrocket 或 Quantumult X（需要美区 App Store）")
+            log_info("  2. 导入配置：")
+            if (v2ray_client_dir / "iphone.json").exists():
+                log_info(f"     - 方式1：导入 JSON 文件 {_rel(v2ray_client_dir / 'iphone.json')}")
+            if (v2ray_client_dir / "vmess-url.txt").exists():
+                log_info(f"     - 方式2：扫描 VMess URL 二维码（从 {_rel(v2ray_client_dir / 'vmess-url.txt')} 生成）")
+            log_info("  3. 启用代理并测试连接")
+            log_info("")
+            log_info("⚠️  注意：")
+            log_info("  - V2Ray 和 WireGuard 是独立的代理方案")
+            log_info("  - V2Ray 用于流量伪装，WireGuard 用于 VPN 连接")
+            log_info("  - 可以同时使用，也可以单独使用 V2Ray")
+            log_info("  - 使用自签名证书，首次连接需要接受证书警告")
+            log_info("")
 
         _desktop_usage_tip()
         log_info(f"→ 部署日志已保存至 {deploy_log_path}")
+
+        # 如果启用连接监控，启动监控
+        enable_monitoring = os.environ.get("PT_ENABLE_MONITORING", "").strip().lower() in ("true", "1", "yes")
+
+        if enable_monitoring:
+            from core.tools.connection_monitor import ConnectionMonitor
+            from core.tools.connection_stats import ConnectionMetrics
+
+            log_info("")
+            log_section("📊 启动连接质量监控")
+
+            # 确定节点 ID
+            monitor_node_id = None
+            if use_multi_node and selected_node_id:
+                monitor_node_id = selected_node_id
+            else:
+                # 单节点模式，使用实例 ID
+                monitor_node_id = instance_id[:8] if instance_id else "default"
+
+            monitor = ConnectionMonitor(
+                node_id=monitor_node_id,
+                node_ip=ip,
+                wireguard_port=LISTEN_PORT,
+                check_interval=int(os.environ.get("PT_MONITOR_INTERVAL", "30")),
+                enable_adaptive=enable_adaptive,  # 启用自适应调整
+            )
+
+            # 设置回调
+            def on_metrics_update(metrics: ConnectionMetrics):
+                log_info(
+                    f"📊 连接指标更新：延迟={metrics.latency_ms:.2f}ms, "
+                    f"丢包率={metrics.packet_loss_rate*100:.2f}%"
+                    if metrics.latency_ms
+                    else f"📊 连接指标更新：延迟=N/A, 丢包率={metrics.packet_loss_rate*100:.2f}%"
+                )
+
+            def on_quality_degraded(metrics: ConnectionMetrics):
+                log_warning(
+                    f"⚠️ 连接质量下降：延迟={metrics.latency_ms:.2f}ms, "
+                    f"丢包率={metrics.packet_loss_rate*100:.2f}%"
+                    if metrics.latency_ms
+                    else f"⚠️ 连接质量下降：延迟=N/A, 丢包率={metrics.packet_loss_rate*100:.2f}%"
+                )
+
+            def on_params_adjusted(info: dict[str, Any]):
+                adjustment = info["adjustment"]
+                log_info(f"🔧 参数已自动调整：")
+                log_info(f"   Keepalive: {adjustment['old_params']['keepalive']} → {adjustment['new_params']['keepalive']}")
+                log_info(f"   MTU: {adjustment['old_params']['mtu']} → {adjustment['new_params']['mtu']}")
+                log_info(f"   原因: {adjustment['reason']}")
+                log_warning("⚠️ 请重新部署配置以应用新参数")
+
+            monitor.on_metrics_update = on_metrics_update
+            monitor.on_quality_degraded = on_quality_degraded
+            if enable_adaptive:
+                monitor.on_params_adjusted = on_params_adjusted
+
+            monitor.start_monitoring()
+
+            # 保存监控器引用（可选，用于后续停止）
+            # 可以保存到全局变量或配置中
+
+            log_success("✅ 连接质量监控已启动")
+            if enable_adaptive:
+                log_success("✅ 自适应参数调整已启用")
+            log_info("→ 提示：设置环境变量 PT_ENABLE_MONITORING=true 启用监控")
+            log_info("→ 提示：设置环境变量 PT_ENABLE_ADAPTIVE=true 启用自适应调整")
+            log_info(f"→ 监控间隔：{monitor.check_interval} 秒")
+            log_info(f"→ 统计数据目录：{monitor.data_dir}")
     except DeploymentError as exc:
         log_error(f"❌ 部署失败：{exc}")
         log_info(f"→ 详细日志：{deploy_log_path}")
@@ -2532,6 +4033,12 @@ MENU_ACTIONS: tuple[MenuAction, ...] = (
     MenuAction("3", "准备本机接入 VPS 网络", prepare_wireguard_access),
     MenuAction("4", "检查账户中的 Vultr 实例", inspect_vps_inventory),
     MenuAction("5", "打开图形界面", launch_gui),
+    MenuAction("6", "多节点管理", manage_nodes),
+    MenuAction("7", "节点健康检查", check_nodes_health),
+    MenuAction("8", "智能节点选择", smart_node_selection),
+    MenuAction("9", "连接质量报告", view_connection_report),
+    MenuAction("10", "参数调整建议", view_parameter_recommendations),
+    MenuAction("11", "ChatGPT 连接测试", test_chatgpt_connection),
 )
 
 EXIT_CHOICES = {"q", "quit", "exit"}

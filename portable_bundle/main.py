@@ -625,6 +625,17 @@ def deploy_wireguard_remote_script(
         sysctl -w net.ipv6.conf.all.forwarding=1
         echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-wireguard-forward.conf
         echo 'net.ipv6.conf.all.forwarding=1' > /etc/sysctl.d/99-wireguard-forward6.conf
+        
+        log "优化网络性能参数（UDP 缓冲区、BBR 拥塞控制）"
+        cat > /etc/sysctl.d/99-wireguard-optimize.conf <<EOF
+# WireGuard 网络优化参数
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+EOF
         sysctl --system || true
 
         WAN_IF=$(ip -o -4 route show to default | awk '{{print $5}}' | head -n1)
@@ -764,7 +775,7 @@ MTU = $DESKTOP_MTU
 PublicKey = $SERVER_PUBLIC_KEY
 AllowedIPs = $ALLOWED_IPS
 Endpoint = $ENDPOINT
-PersistentKeepalive = 25
+PersistentKeepalive = 15
 CFG
         chmod 600 "$DESKTOP_DIR/desktop.conf"
 
@@ -780,7 +791,7 @@ DNS = $DNS_SERVERS
 PublicKey = $SERVER_PUBLIC_KEY
 AllowedIPs = $ALLOWED_IPS
 Endpoint = $ENDPOINT
-PersistentKeepalive = 25
+PersistentKeepalive = 15
 CFG
         chmod 600 "$IPHONE_DIR/iphone.conf"
 

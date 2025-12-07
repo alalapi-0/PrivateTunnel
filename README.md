@@ -69,8 +69,12 @@ PrivateTunnel 起初是覆盖 iOS、macOS、服务器脚本与 CI 的一体化�
    - `3) 准备本机接入 VPS 网络`：执行核心自动化部署，完成服务器 WireGuard 安装、客户端配置生成及二维码导出。
    - `4) 下载客户端配置/二维码`：在无需重新部署的情况下重新导出 `desktop.conf`、`iphone.conf` 与 `iphone.png`。
    - `5) 网络诊断`：综合使用 `ping`、端口连通、SSH 测试等手段确认实例状态。
-   - `6) 生成项目概览文档`：调用 `core/project_overview.py` 扫描代码，输出最新功能说明。
-   - `7) 打开 GUI 配置生成器`：在 CLI 内直接唤起 PySimpleGUI 界面。
+   - `6) 多节点管理`：管理多个 VPS 节点，实现负载均衡和故障转移。
+   - `7) 节点健康检查`：检查所有节点的健康状态，包括延迟、丢包、连接性等指标。
+   - `8) 智能节点选择`：根据延迟、权重、优先级等因素自动选择最优节点。
+   - `9) 连接质量报告`：查看连接质量监控报告和历史数据。
+   - `10) 参数调整建议`：查看自适应参数调整建议。
+   - `11) ChatGPT 连接测试`：测试 ChatGPT/OpenAI 连接并查看优化建议。
    - `Q) 退出`：结束脚本并释放 SSH 连接。
 7. **自动部署阶段细节**
    - `main.py` 会根据 `core/port_config.py` 自动选择监听端口，若环境变量指定则优先使用。
@@ -135,6 +139,86 @@ python core/project_overview.py --output docs/PROJECT_OVERVIEW.md
 - 本地会自动下载 `artifacts/desktop.conf` 与 `artifacts/iphone.conf`，并基于后者生成 `artifacts/iphone.png` 二维码，便于手机扫码导入；
 - 所有默认值均可通过 `PT_DESKTOP_IP`、`PT_IPHONE_IP`、`PT_ALLOWED_IPS`、`PT_DNS`、`PT_CLIENT_MTU`、`PT_SSH_PRIVATE_KEY` 等环境变量覆盖，提示中会直接显示当前默认值，确保用户可一路回车完成部署。
 
+## 新功能说明
+
+### 多节点管理
+
+PrivateTunnel 现在支持管理多个 VPS 节点，实现负载均衡和故障转移：
+
+- **启用多节点模式**：设置环境变量 `PT_MULTI_NODE=true`
+- **创建多个节点**：重复执行"创建 Vultr 实例"步骤，系统会自动管理所有节点
+- **节点管理**：使用菜单选项 `6) 多节点管理` 查看和管理节点
+- **智能选路**：系统会根据延迟、权重、优先级自动选择最佳节点
+
+### 健康检查与故障转移
+
+系统会自动监控节点健康状态，并在节点故障时自动切换：
+
+- **健康检查**：使用菜单选项 `7) 节点健康检查` 查看所有节点状态
+- **自动故障转移**：当当前节点不健康时，系统会自动切换到备用节点
+- **连接监控**：设置 `PT_ENABLE_MONITORING=true` 启用连接质量监控
+
+### 智能选路
+
+系统提供多种选路策略，自动选择最优节点：
+
+- **延迟优先**：选择延迟最低的节点（适合实时应用）
+- **权重优先**：选择权重最高的节点（适合负载均衡）
+- **平衡模式**：综合考虑多个因素（推荐）
+- **使用方式**：设置 `PT_SMART_ROUTING=true` 和 `PT_ROUTING_STRATEGY=balanced`
+
+### 连接质量监控
+
+持续监控连接质量，记录性能指标：
+
+- **启用监控**：设置 `PT_ENABLE_MONITORING=true`
+- **查看报告**：使用菜单选项 `9) 连接质量报告` 查看历史数据
+- **监控间隔**：通过 `PT_MONITOR_INTERVAL=30` 设置检查间隔（秒）
+
+### 自适应参数调整
+
+系统会根据连接质量自动优化参数：
+
+- **启用自适应**：设置 `PT_ENABLE_ADAPTIVE=true`
+- **参数建议**：使用菜单选项 `10) 参数调整建议` 查看优化建议
+- **自动调整**：系统会自动调整 Keepalive 和 MTU 参数
+
+### ChatGPT 专用优化
+
+针对 ChatGPT/OpenAI 的特殊优化：
+
+- **ChatGPT 模式**：设置 `PT_CHATGPT_MODE=true` 启用专用优化
+- **连接测试**：使用菜单选项 `11) ChatGPT 连接测试` 测试连接
+- **参数优化**：系统会自动优化参数以确保 ChatGPT 访问稳定
+
+### V2Ray 流量伪装
+
+使用 V2Ray 伪装 WireGuard 流量，避免被 DPI 检测：
+
+- **启用 V2Ray**：设置 `PT_ENABLE_V2RAY=true`
+- **配置端口**：通过 `PT_V2RAY_PORT=443` 设置 V2Ray 端口（默认 443）
+- **UUID 配置**：通过 `PT_V2RAY_UUID` 设置 UUID，或让系统自动生成
+
+## 环境变量速查
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `PT_MULTI_NODE` | 启用多节点模式 | `false` |
+| `PT_NODE_PRIORITY` | 节点优先级（数字越小优先级越高） | `1` |
+| `PT_NODE_WEIGHT` | 节点权重（用于负载均衡） | `100` |
+| `PT_SMART_ROUTING` | 启用智能选路 | `false` |
+| `PT_ROUTING_STRATEGY` | 选路策略（latency_first/weight_first/balanced/hybrid） | `balanced` |
+| `PT_ENABLE_MONITORING` | 启用连接监控 | `false` |
+| `PT_MONITOR_INTERVAL` | 监控检查间隔（秒） | `30` |
+| `PT_ENABLE_ADAPTIVE` | 启用自适应参数调整 | `false` |
+| `PT_CHATGPT_MODE` | 启用 ChatGPT 专用模式 | `false` |
+| `PT_ENABLE_V2RAY` | 启用 V2Ray 流量伪装 | `false` |
+| `PT_V2RAY_PORT` | V2Ray 监听端口 | `443` |
+| `PT_V2RAY_UUID` | V2Ray UUID（自动生成） | 自动生成 |
+| `PT_KEEPALIVE` | WireGuard Keepalive（秒） | `25` |
+| `PT_CLIENT_MTU` | 客户端 MTU | `1280` |
+| `PT_WG_PORT` | WireGuard 监听端口 | `51820` 或 `443` |
+
 ## 🔐 如何确保 SSH 公钥自动注入及排错
 
 - 在创建 Vultr VPS 前于控制台配置 SSH Key，并将其名称写入环境变量 `VULTR_SSHKEY_NAME`，脚本会自动调用 `GET /v2/ssh-keys` 匹配并提取对应 ID；
@@ -189,6 +273,9 @@ PrivateTunnel 是一个面向个人/小团队自建的私有 VPN/隧道解决方
 
 - 入门与流程
   - [GETTING_STARTED.md](docs/GETTING_STARTED.md)：从零到真机调试
+  - [USER_GUIDE.md](docs/USER_GUIDE.md)：用户使用指南（新功能详解）
+  - [FEATURES.md](docs/FEATURES.md)：功能说明文档（所有新功能）
+  - [ENVIRONMENT_VARIABLES.md](docs/ENVIRONMENT_VARIABLES.md)：环境变量说明
   - [BUILD_IOS.md](docs/BUILD_IOS.md)：Xcode 构建与常见错误
   - [CODE_SIGNING.md](docs/CODE_SIGNING.md)：证书、描述文件与权限
   - [DISTRIBUTION_TESTFLIGHT.md](docs/DISTRIBUTION_TESTFLIGHT.md)：TestFlight 上传流程
@@ -204,7 +291,7 @@ PrivateTunnel 是一个面向个人/小团队自建的私有 VPN/隧道解决方
   - [BADGES.md](docs/BADGES.md)：徽标来源及更新方法
   - [CHANGELOG.md](docs/CHANGELOG.md)：版本发布记录模板
   - [ROADMAP.md](docs/ROADMAP.md)：阶段规划
-  - [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)：常见问题排查
+  - [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)：常见问题排查（包含新功能问题）
   - [TOY-TUN-END2END.md](docs/TOY-TUN-END2END.md)：Toy 通道说明（仅开发）
   - [VULTR_AUTOMATION.md](docs/VULTR_AUTOMATION.md)：Vultr API 自动化创建节点
 
