@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import os
 
+from core.config.defaults import DEFAULT_WG_PORT
+
 ENV_KEYS = (
     "PRIVATETUNNEL_WG_PORT",
     "PT_WG_PORT",
     "WG_PORT",
 )
-
-DEFAULT_WG_PORT = 51820
 
 
 def _parse_port(value: str, *, source: str) -> int:
@@ -40,8 +40,8 @@ def get_default_wg_port() -> int:
 
     The helper inspects ``PRIVATETUNNEL_WG_PORT`` (preferred), ``PT_WG_PORT`` and
     ``WG_PORT``. The first non-empty variable wins. Values must be integers within
-    the 1-65535 range. When no overrides are present the default ``443`` is
-    returned.
+    the 1-65535 range. When no overrides are present the default ``51820`` from
+    :mod:`core.config.defaults` is returned.
     """
 
     port, _ = resolve_listen_port()

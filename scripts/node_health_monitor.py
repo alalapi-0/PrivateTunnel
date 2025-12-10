@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """节点健康监控脚本。Node health monitoring script.
 
-可以设置为定时任务，定期检查所有节点健康状态。
+可以设置为定时任务，定期检查所有节点健康状态；保持为独立脚本以便在 CI/运维平台
+运行，但同样兼容由 ``python main.py`` 生成的节点配置。
 """
 
 import sys
@@ -12,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from core.config.defaults import DEFAULT_WG_PORT
 from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
 from core.tools.node_health_checker import NodeHealthChecker
 
@@ -24,8 +26,8 @@ def main():
     parser.add_argument(
         "--wireguard-port",
         type=int,
-        default=51820,
-        help="WireGuard 端口（默认 51820）",
+        default=DEFAULT_WG_PORT,
+        help=f"WireGuard 端口（默认 {DEFAULT_WG_PORT}）",
     )
     parser.add_argument(
         "--update-status",

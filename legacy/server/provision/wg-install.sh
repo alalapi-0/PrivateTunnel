@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# LEGACY: This script is kept for historical reference and is not invoked by the
+# current ``main.py`` Windows client flow. Use it only for manual server-side
+# troubleshooting; automated deployment now embeds an equivalent inline script.
 # WireGuard server provisioning helper for PrivateTunnel.
 #
 # This script is designed to be idempotent: you can run it multiple times to
