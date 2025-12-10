@@ -30,7 +30,14 @@
   - `DEFAULT_CLIENT_MTU`, `DEFAULT_KEEPALIVE_SECONDS`
   - `DEFAULT_SUBNET_CIDR`, `DEFAULT_SERVER_ADDRESS`
   - `DEFAULT_IPHONE_ADDRESS`, `DEFAULT_DESKTOP_ADDRESS`, `DEFAULT_ALLOWED_IPS`
+  - V2Ray/TLS 默认：`DEFAULT_V2RAY_ENABLED`, `DEFAULT_V2RAY_PORT`, `DEFAULT_V2RAY_WS_PATH`, `DEFAULT_TLS_USE_SELF_SIGNED`, `DEFAULT_TLS_CERT_DIR`
 - 未来的环境配置可在 `core/config/env_profiles.py` 中扩展。当前仅提供 `DEFAULT_PROFILE`，与现有默认行为一致。
+
+## V2Ray 伪装默认化（R4）
+
+- 部署流程默认尝试开启基于域名的 V2Ray WebSocket+TLS 伪装，如未提供域名或证书失败，则自动回退到纯 WireGuard。
+- 新增 `core/tools/v2ray_manager.py` 与 `core/tools/tls_cert_manager.py`，负责远端安装、证书生成与服务重启/健康检查。
+- 生成的客户端配置（含 VMess 链接）保存在 `artifacts/`，便于导入 V2RayN/V2RayNG 等客户端。
 
 ## 针对中国大陆环境的低成本优化（R3）
 

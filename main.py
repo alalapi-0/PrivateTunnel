@@ -32,6 +32,11 @@ from core.config.defaults import (
     DEFAULT_KEEPALIVE_SECONDS,
     DEFAULT_SERVER_ADDRESS,
     DEFAULT_SUBNET_CIDR,
+    DEFAULT_TLS_CERT_DIR,
+    DEFAULT_TLS_USE_SELF_SIGNED,
+    DEFAULT_V2RAY_ENABLED,
+    DEFAULT_V2RAY_PORT,
+    DEFAULT_V2RAY_WS_PATH,
 )
 from core.project_overview import generate_project_overview
 from dataclasses import dataclass
@@ -41,6 +46,15 @@ from typing import Any, Callable
 
 from core.logging_utils import setup_logging
 from core.tools.network_params import decide_client_mtu, generate_keepalive_value
+from core.tools.tls_cert_manager import TLSCertManager
+from core.tools.network_diagnostics import run_network_diagnostics
+from core.tools.v2ray_client_config import (
+    generate_v2ray_client_config,
+    generate_vmess_url,
+    save_v2ray_config,
+)
+from core.tools.v2ray_config import generate_v2ray_uuid
+from core.tools.v2ray_manager import V2RayManager, V2RayServerConfigParams
 
 if sys.version_info < (3, 8):
     raise SystemExit(
@@ -3407,6 +3421,76 @@ def diagnose_current_connection() -> None:
         log_warning("DNS 解析存在问题，可尝试更换 DNS 或检查本地网络。")
 
 
+def view_v2ray_status() -> None:
+    """显示 V2Ray 元数据并允许重新生成客户端配置。"""
+
+    log_section("🌐 V2Ray 状态与配置")
+    metadata_path = ARTIFACTS_DIR / "v2ray_server.json"
+    client_path = ARTIFACTS_DIR / "v2ray_client.json"
+    vmess_path = ARTIFACTS_DIR / "v2ray_vmess.txt"
+
+    if not metadata_path.exists():
+        log_warning("⚠️ 未找到 V2Ray 部署记录，请先执行部署流程。")
+        return
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log_warning("⚠️ 无法解析 V2Ray 元数据，请重新部署。")
+        return
+
+    enabled = metadata.get("enabled", False)
+    log_info(f"→ 是否启用：{'是' if enabled else '否'}")
+    if not enabled:
+        return
+
+    domain = metadata.get("domain", "")
+    port = metadata.get("port")
+    ws_path = metadata.get("ws_path", DEFAULT_V2RAY_WS_PATH)
+    uuid = metadata.get("uuid")
+    log_info(f"→ 域名/SNI：{domain}")
+    log_info(f"→ 端口：{port}")
+    log_info(f"→ WebSocket 路径：{ws_path}")
+    if metadata.get("cert_path"):
+        log_info(f"→ 证书路径：{metadata.get('cert_path')}")
+    if metadata.get("key_path"):
+        log_info(f"→ 私钥路径：{metadata.get('key_path')}")
+
+    if client_path.exists():
+        log_info(f"→ 客户端配置文件：{client_path}")
+    else:
+        log_warning("⚠️ 未找到客户端配置文件，可选择重新生成。")
+
+    if vmess_path.exists():
+        log_info(f"→ VMess 导入链接文件：{vmess_path}")
+
+    regenerate = input("是否重新生成客户端配置文件？[y/N]: ").strip().lower()
+    if regenerate not in ("y", "yes"):
+        return
+
+    if not (domain and port and uuid):
+        log_error("❌ 元数据缺少域名/端口/UUID，无法重新生成。请重新部署。")
+        return
+
+    new_config = generate_v2ray_client_config(
+        server_domain=domain,
+        server_port=int(port),
+        ws_path=ws_path,
+        uuid=uuid,
+    )
+    save_v2ray_config(new_config, str(client_path))
+    vmess_url = generate_vmess_url(
+        server_domain=domain,
+        server_port=int(port),
+        ws_path=ws_path,
+        uuid=uuid,
+    )
+    vmess_path.write_text(vmess_url, encoding="utf-8")
+    log_success("✅ 已重新生成客户端配置和 VMess 导入链接")
+    log_info(f"→ 客户端配置：{client_path}")
+    log_info(f"→ VMess 链接文件：{vmess_path}")
+
+
 def _check_and_auto_configure_instances() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """检查账户中的实例，返回已配置和未配置的实例列表。
     
@@ -3535,13 +3619,28 @@ def _deploy_wireguard_to_instance(
     
     # V2Ray 配置
     enable_v2ray = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower() in ("true", "1", "yes")
-    if enable_v2ray:
-        v2ray_port_raw = os.environ.get("PT_V2RAY_PORT", "").strip()
-        v2ray_port = int(v2ray_port_raw) if v2ray_port_raw and v2ray_port_raw.isdigit() else 443
-        v2ray_uuid = os.environ.get("PT_V2RAY_UUID", "").strip() or None
-    else:
-        v2ray_port = 443
-        v2ray_uuid = None
+    if not os.environ.get("PT_ENABLE_V2RAY"):
+        enable_v2ray = DEFAULT_V2RAY_ENABLED
+
+    v2ray_domain = os.environ.get("PT_V2RAY_DOMAIN", "").strip()
+    v2ray_port_raw = os.environ.get("PT_V2RAY_PORT", "").strip()
+    v2ray_port = int(v2ray_port_raw) if v2ray_port_raw and v2ray_port_raw.isdigit() else DEFAULT_V2RAY_PORT
+    v2ray_uuid = os.environ.get("PT_V2RAY_UUID", "").strip() or None
+    v2ray_ws_path = os.environ.get("PT_V2RAY_WS_PATH", DEFAULT_V2RAY_WS_PATH)
+    tls_use_self_signed = os.environ.get("PT_TLS_USE_SELF_SIGNED", "").strip().lower()
+    tls_use_self_signed = (
+        DEFAULT_TLS_USE_SELF_SIGNED
+        if not tls_use_self_signed
+        else tls_use_self_signed in ("true", "1", "yes")
+    )
+    tls_cert_dir = os.environ.get("PT_TLS_CERT_DIR", DEFAULT_TLS_CERT_DIR)
+
+    if enable_v2ray and not v2ray_domain:
+        log_info("→ 默认启用 V2Ray WebSocket + TLS，需要提供域名以作为 SNI/Host")
+        v2ray_domain = input("请输入解析到服务器 IP 的域名（留空则跳过 V2Ray）：").strip()
+    if enable_v2ray and not v2ray_domain:
+        log_warning("⚠️ 未提供域名，回退到纯 WireGuard 模式")
+        enable_v2ray = False
     
     # 如果启用 ChatGPT 模式，进行优化（简化版，不进行交互式提示）
     if enable_chatgpt_mode:
@@ -3593,7 +3692,7 @@ def _deploy_wireguard_to_instance(
         allowed_ips,
         desktop_mtu,
         keepalive_value,
-        enable_v2ray=enable_v2ray,
+        enable_v2ray=False,
         v2ray_port=v2ray_port,
         v2ray_uuid=v2ray_uuid,
     )
@@ -3613,12 +3712,6 @@ def _deploy_wireguard_to_instance(
         "PT_CLIENT_MTU": desktop_mtu,
         "PT_KEEPALIVE": keepalive_value,
     }
-    if enable_v2ray:
-        env_dict["PT_ENABLE_V2RAY"] = "true"
-        env_dict["PT_V2RAY_PORT"] = str(v2ray_port)
-        if v2ray_uuid:
-            env_dict["PT_V2RAY_UUID"] = v2ray_uuid
-    
     env_parts = [
         f"{key}={shlex.quote(value)}"
         for key, value in env_dict.items()
@@ -3716,6 +3809,99 @@ def _deploy_wireguard_to_instance(
         log_success("✅ 服务器信息已更新")
     except Exception as exc:
         log_warning(f"⚠️ 更新服务器信息失败: {exc}")
+
+    v2ray_success = False
+    cert_info = None
+    if enable_v2ray:
+        log_section("🔐 配置 V2Ray WebSocket + TLS")
+        try:
+            ssh_client = _ensure_paramiko_client()
+            tls_manager = TLSCertManager(ssh_client, tls_cert_dir)
+            cert_info = tls_manager.ensure_cert_for_domain(
+                v2ray_domain, use_self_signed=tls_use_self_signed
+            )
+            log_info(
+                f"→ 证书路径：{cert_info.cert_path} | 密钥路径：{cert_info.key_path}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_error(f"❌ 证书获取失败，回退到纯 WireGuard：{exc}")
+            enable_v2ray = False
+        else:
+            v2_manager = V2RayManager(ssh_client)
+            if not v2_manager.ensure_installed():
+                log_error("❌ V2Ray 安装失败，回退到纯 WireGuard 模式")
+                enable_v2ray = False
+            else:
+                if v2ray_uuid is None:
+                    v2ray_uuid = generate_v2ray_uuid()
+
+                params = V2RayServerConfigParams(
+                    listen_port=v2ray_port,
+                    domain=v2ray_domain,
+                    tls_cert_path=cert_info.cert_path,
+                    tls_key_path=cert_info.key_path,
+                    ws_path=v2ray_ws_path,
+                    uuid=v2ray_uuid,
+                )
+
+                try:
+                    config_json = v2_manager.generate_server_config(params)
+                    v2_manager.write_server_config(config_json)
+                except Exception as exc:  # noqa: BLE001
+                    log_error(f"❌ 写入 V2Ray 配置失败：{exc}")
+                    enable_v2ray = False
+                else:
+                    if not v2_manager.restart_service():
+                        log_error("❌ V2Ray 重启失败，回退到纯 WireGuard 模式")
+                        enable_v2ray = False
+                    elif not v2_manager.check_health():
+                        log_error("❌ V2Ray 健康检查失败，回退到纯 WireGuard 模式")
+                        enable_v2ray = False
+                    else:
+                        v2ray_success = True
+
+    if v2ray_success and v2ray_uuid:
+        ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        client_path = ARTIFACTS_DIR / "v2ray_client.json"
+        vmess_path = ARTIFACTS_DIR / "v2ray_vmess.txt"
+        metadata_path = ARTIFACTS_DIR / "v2ray_server.json"
+
+        client_config = generate_v2ray_client_config(
+            server_domain=v2ray_domain,
+            server_port=v2ray_port,
+            ws_path=v2ray_ws_path,
+            uuid=v2ray_uuid,
+        )
+        save_v2ray_config(client_config, str(client_path))
+        vmess_url = generate_vmess_url(
+            server_domain=v2ray_domain,
+            server_port=v2ray_port,
+            ws_path=v2ray_ws_path,
+            uuid=v2ray_uuid,
+        )
+        vmess_path.write_text(vmess_url, encoding="utf-8")
+
+        if cert_info:
+            metadata = {
+                "enabled": True,
+                "domain": v2ray_domain,
+                "port": v2ray_port,
+                "ws_path": v2ray_ws_path,
+                "uuid": v2ray_uuid,
+                "cert_path": str(cert_info.cert_path),
+                "key_path": str(cert_info.key_path),
+            }
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        log_success("✅ V2Ray 已启用：WebSocket + TLS 伪装生效")
+        log_info(f"→ 域名：{v2ray_domain} | 端口：{v2ray_port} | 路径：{v2ray_ws_path}")
+        log_info(f"→ 客户端配置文件：{client_path}")
+        log_info(f"→ VMess 导入链接已保存至：{vmess_path}")
+    elif not enable_v2ray:
+        log_warning("⚠️ V2Ray 未启用或已回退，仅部署 WireGuard")
 
 
 def prepare_wireguard_access() -> None:
@@ -4183,31 +4369,34 @@ def prepare_wireguard_access() -> None:
     # V2Ray 配置参数
     enable_v2ray_raw = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower()
     enable_v2ray = enable_v2ray_raw in ("true", "1", "yes")
+    if not enable_v2ray_raw:
+        enable_v2ray = DEFAULT_V2RAY_ENABLED
+
+    v2ray_port_raw = os.environ.get("PT_V2RAY_PORT", "").strip()
+    v2ray_port = int(v2ray_port_raw) if v2ray_port_raw.isdigit() else DEFAULT_V2RAY_PORT
+    v2ray_uuid = os.environ.get("PT_V2RAY_UUID", "").strip() or None
+    v2ray_domain = os.environ.get("PT_V2RAY_DOMAIN", "").strip()
+    v2ray_ws_path = os.environ.get("PT_V2RAY_WS_PATH", DEFAULT_V2RAY_WS_PATH)
+
     if enable_v2ray:
-        log_info(f"→ V2Ray 流量伪装：已启用")
-        
-        v2ray_port_raw = os.environ.get("PT_V2RAY_PORT", "").strip()
+        log_info("→ V2Ray 流量伪装：已启用（默认推荐）")
+        if v2ray_domain:
+            log_info(f"→ V2Ray 域名/SNI：{v2ray_domain} （可通过环境变量 PT_V2RAY_DOMAIN 覆盖）")
+        else:
+            log_warning("⚠️ 未提供域名，部署时将要求输入或回退到纯 WireGuard")
+
         if v2ray_port_raw:
-            try:
-                v2ray_port = int(v2ray_port_raw)
-                log_info(f"→ V2Ray 端口：{v2ray_port} （来自环境变量 PT_V2RAY_PORT）")
-            except ValueError:
-                log_warning(f"⚠️ V2RAY_PORT 值 '{v2ray_port_raw}' 无效，将使用默认值 443")
-                v2ray_port = 443
+            log_info(f"→ V2Ray 端口：{v2ray_port} （来自环境变量 PT_V2RAY_PORT）")
         else:
-            v2ray_port = 443
-            log_info("→ V2Ray 端口：443（默认值，可通过环境变量 PT_V2RAY_PORT 覆盖）")
-        
-        v2ray_uuid = os.environ.get("PT_V2RAY_UUID", "").strip()
+            log_info(f"→ V2Ray 端口：{v2ray_port}（默认值，可通过环境变量 PT_V2RAY_PORT 覆盖）")
+
         if v2ray_uuid:
-            log_info(f"→ V2Ray UUID：已通过环境变量 PT_V2RAY_UUID 指定")
+            log_info("→ V2Ray UUID：已通过环境变量 PT_V2RAY_UUID 指定")
         else:
-            v2ray_uuid = None  # 将在服务器端生成
-            log_info("→ V2Ray UUID：将在服务器端自动生成")
+            log_info("→ V2Ray UUID：将在部署阶段自动生成")
+        log_info(f"→ V2Ray WebSocket 路径：{v2ray_ws_path}")
     else:
         log_info("→ V2Ray 流量伪装：未启用（可通过环境变量 PT_ENABLE_V2RAY=true 启用）")
-        v2ray_port = 443
-        v2ray_uuid = None
 
     # 如果启用 ChatGPT 模式，进行优化
     if enable_chatgpt_mode:
@@ -4835,6 +5024,7 @@ MENU_ACTIONS: tuple[MenuAction, ...] = (
     MenuAction("10", "参数调整建议", view_parameter_recommendations),
     MenuAction("11", "ChatGPT 连接测试", test_chatgpt_connection),
     MenuAction("12", "诊断当前连接状态", diagnose_current_connection),
+    MenuAction("13", "查看 / 重新生成 V2Ray 配置", view_v2ray_status),
 )
 
 EXIT_CHOICES = {"q", "quit", "exit"}
