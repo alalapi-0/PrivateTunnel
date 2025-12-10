@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import os
-import pytest
+import sys
+from pathlib import Path
 from unittest.mock import patch
-from typing import Optional
+
+# 添加项目根目录到路径，以便导入 core 模块
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from core.proxy_utils import (
     get_proxy_config,

@@ -223,6 +223,63 @@ env | grep -E "PT_|VULTR_"
 4. 收集节点配置和健康检查结果；
 5. 在仓库提交 Issue 或 PR，并附上上述信息。
 
+## 代理相关问题
+
+### 无法通过代理访问外网
+
+| 现象 | 检查项 | 解决方案 |
+| --- | --- | --- |
+| 设置了 `ALL_PROXY` 但程序仍无法访问外网 | 代理服务未运行 | 1. 检查代理软件（Clash、V2RayN 等）是否正在运行；2. 检查代理端口是否正确（Clash 默认 7890，V2RayN 默认 10809）；3. 使用 `scripts/setup_proxy.ps1` 或 `scripts/setup_proxy.sh` 自动检测代理 |
+| 代理连接超时 | 代理地址或端口错误 | 1. 确认代理地址为 `127.0.0.1` 或 `localhost`；2. 确认端口号正确；3. 检查代理软件是否允许本地连接 |
+| 部分请求失败 | 代理协议不匹配 | 1. 确认代理协议正确（HTTP 代理使用 `http://`，SOCKS5 使用 `socks5://`）；2. 注意 `urllib` 不支持 SOCKS 代理，如果使用 `urllib` 请使用 HTTP 代理 |
+| 环境变量设置后不生效 | 环境变量作用域问题 | 1. Windows: 确保在同一个 PowerShell 会话中设置和运行；2. Linux/macOS: 确保在同一个 Shell 会话中设置和运行；3. 或使用 `setup_proxy.ps1`/`setup_proxy.sh` 脚本自动配置 |
+
+### 代理检测失败
+
+如果自动检测代理功能无法检测到本地代理服务：
+
+1. **检查代理服务是否运行**：
+
+   - Windows: 查看任务管理器，确认 Clash/V2RayN 进程存在
+
+   - Linux/macOS: 使用 `ps aux | grep clash` 或类似命令检查
+
+2. **检查代理端口**：
+
+   - 使用 `netstat -an | grep 7890`（Linux/macOS）或 `netstat -an | findstr 7890`（Windows）检查端口是否监听
+
+   - 确认端口号与代理软件配置一致
+
+3. **手动指定端口**：
+
+   ```python
+   from core.proxy_utils import detect_local_proxy
+
+   # 检测自定义端口
+   detected = detect_local_proxy(custom_ports=[8080, 8888])
+   ```
+
+### 代理配置验证
+
+使用以下代码验证代理配置是否正确：
+
+```python
+from core.proxy_utils import get_proxy_config, log_proxy_status
+
+# 查看当前代理配置
+config = get_proxy_config()
+print(f"代理配置: {config}")
+
+# 查看代理状态
+log_proxy_status()
+```
+
+### 常见错误
+
+- **`Connection refused`**: 代理服务未运行或端口错误
+- **`Timeout`**: 代理服务器响应慢或网络问题
+- **`Proxy authentication required`**: 代理需要认证（当前版本不支持，需要手动配置带认证的代理 URL）
+
 ## 相关文档
 
 - [功能说明](FEATURES.md) - 了解所有功能特性

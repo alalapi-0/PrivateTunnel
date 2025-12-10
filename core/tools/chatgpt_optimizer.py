@@ -15,6 +15,7 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+from core.proxy_utils import get_proxy_config_with_fallback
 from core.tools.chatgpt_domains import get_chatgpt_domains, is_chatgpt_domain
 from core.tools.node_health_checker import NodeHealthChecker
 
@@ -117,16 +118,38 @@ class ChatGPTOptimizer:
             return result
         
         try:
-            start_time = time.time()
-            response = requests.get(
-                test_url,
-                timeout=timeout,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                },
-            )
-            elapsed_ms = (time.time() - start_time) * 1000
+            # 获取代理配置（如果已配置）
+            proxies = get_proxy_config_with_fallback(fallback_to_direct=True, validate=False)
             
+            start_time = time.time()
+            try:
+                response = requests.get(
+                    test_url,
+                    timeout=timeout,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    },
+                    proxies=proxies,
+                )
+            except requests.exceptions.ProxyError as exc:
+                # 代理错误，尝试降级到直连
+                if proxies:
+                    try:
+                        response = requests.get(
+                            test_url,
+                            timeout=timeout,
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            },
+                            proxies=None,  # 直连
+                        )
+                    except requests.RequestException as retry_exc:
+                        result["error"] = f"代理错误且直连也失败: {exc}。直连错误: {retry_exc}"
+                        return result
+                else:
+                    raise
+            
+            elapsed_ms = (time.time() - start_time) * 1000
             result["success"] = response.status_code in (200, 401, 403)  # 401/403 表示服务器可达
             result["latency_ms"] = elapsed_ms
             result["status_code"] = response.status_code

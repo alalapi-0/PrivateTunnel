@@ -45,6 +45,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+# 添加项目根目录到路径，以便导入 core 模块
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from core.proxy_utils import get_proxy_for_urllib
+
 
 API_BASE = "https://api.vultr.com/v2"
 
@@ -102,10 +109,50 @@ def _api_request(
 
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
 
+    # 配置代理（如果已配置）
+    proxies = get_proxy_for_urllib()
+    use_proxy = bool(proxies)
+    
+    if use_proxy:
+        # 创建 ProxyHandler
+        proxy_handler = urllib.request.ProxyHandler(proxies)
+        opener = urllib.request.build_opener(proxy_handler)
+    else:
+        # 没有代理时使用默认 opener
+        opener = urllib.request.build_opener()
+
     try:
-        with urllib.request.urlopen(request) as response:
+        # 使用 opener 打开 URL（而不是直接使用 urlopen）
+        with opener.open(request) as response:
             content = response.read().decode("utf-8")
             return json.loads(content) if content else {}
+    except (urllib.error.URLError, OSError) as exc:
+        # 代理错误，尝试降级到直连
+        if use_proxy:
+            # 清除代理配置，重试一次（直连）
+            opener = urllib.request.build_opener()
+            try:
+                with opener.open(request) as response:
+                    content = response.read().decode("utf-8")
+                    return json.loads(content) if content else {}
+            except urllib.error.HTTPError as retry_exc:
+                error_payload: Any
+                try:
+                    error_payload = json.loads(retry_exc.read().decode("utf-8"))
+                except Exception:  # pragma: no cover - defensive fallback
+                    error_payload = retry_exc.reason
+                raise VultrAPIError(
+                    retry_exc.code,
+                    f"代理错误且直连也失败: {exc}。直连错误: {error_payload}",
+                ) from exc
+            except Exception as retry_exc:
+                raise VultrAPIError(
+                    0,
+                    f"代理错误且直连也失败: {exc}。直连错误: {retry_exc}",
+                ) from exc
+        else:
+            # 没有代理配置，直接抛出错误
+            raise VultrAPIError(0, f"请求失败: {exc}") from exc
     except urllib.error.HTTPError as exc:
         error_payload: Any
         try:

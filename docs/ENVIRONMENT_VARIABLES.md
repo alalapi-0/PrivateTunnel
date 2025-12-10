@@ -14,6 +14,7 @@
 - [V2Ray 配置](#v2ray-配置)
 - [WireGuard 配置](#wireguard-配置)
 - [客户端配置](#客户端配置)
+- [代理配置](#代理配置)
 - [其他配置](#其他配置)
 
 ## 必需变量
@@ -434,6 +435,91 @@ export PT_CLIENT_MTU=1420
 
 **说明**：MTU 值影响数据包大小，较小的 MTU 可以减少分片和丢包
 
+## 代理配置
+
+### ALL_PROXY
+
+**说明**：全局代理设置，同时应用于 HTTP 和 HTTPS 请求
+
+**类型**：字符串（URL格式）
+
+**默认值**：无
+
+**示例**：
+
+```powershell
+# Windows PowerShell
+$env:ALL_PROXY = "http://127.0.0.1:7890"
+```
+
+```bash
+# Linux/macOS
+export ALL_PROXY="http://127.0.0.1:7890"
+```
+
+**支持的协议**：
+
+- `http://` - HTTP 代理
+- `https://` - HTTPS 代理
+- `socks5://` - SOCKS5 代理
+- `socks4://` - SOCKS4 代理
+
+**优先级**：最高（如果设置了 `ALL_PROXY`，会忽略 `HTTP_PROXY` 和 `HTTPS_PROXY`）
+
+**用途**：当你的网络环境无法直接访问外网（如在国内访问 GitHub、Vultr API 等）时，可以通过设置此环境变量使程序通过代理访问。
+
+### HTTP_PROXY
+
+**说明**：HTTP 请求的代理设置
+
+**类型**：字符串（URL格式）
+
+**默认值**：无
+
+**示例**：
+
+```bash
+export HTTP_PROXY="http://127.0.0.1:7890"
+```
+
+**注意**：如果同时设置了 `ALL_PROXY`，`HTTP_PROXY` 会被忽略
+
+### HTTPS_PROXY
+
+**说明**：HTTPS 请求的代理设置
+
+**类型**：字符串（URL格式）
+
+**默认值**：无
+
+**示例**：
+
+```bash
+export HTTPS_PROXY="http://127.0.0.1:7890"
+```
+
+**注意**：如果同时设置了 `ALL_PROXY`，`HTTPS_PROXY` 会被忽略
+
+### 自动检测本地代理
+
+程序支持自动检测本地代理服务（如 Clash、V2RayN 等），可以通过以下方式使用：
+
+```python
+from core.proxy_utils import auto_configure_proxy
+
+# 自动检测并配置代理（不设置环境变量）
+proxy_url = auto_configure_proxy()
+
+# 自动检测并设置环境变量
+proxy_url = auto_configure_proxy(set_environment=True)
+```
+
+**常见代理端口**：
+
+- Clash for Windows: `7890` (HTTP), `7891` (SOCKS5)
+- V2RayN: `10809` (HTTP), `10808` (SOCKS5)
+- Shadowsocks: `1080` (SOCKS5)
+
 ## 其他配置
 
 ### PT_SSH_PRIVATE_KEY
@@ -569,5 +655,7 @@ export PT_ENABLE_MONITORING=true
 - [功能说明](FEATURES.md)
 - [用户使用指南](USER_GUIDE.md)
 - [快速开始指南](GETTING_STARTED.md)
+
+
 
 

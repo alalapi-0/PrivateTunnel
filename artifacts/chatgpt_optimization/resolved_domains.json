@@ -1,0 +1,106 @@
+{
+  "domains": {
+    "api.openai.com": {
+      "ips": [
+        "104.244.46.93"
+      ],
+      "resolved": true
+    },
+    "chat.openai.com": {
+      "ips": [
+        "31.13.73.9"
+      ],
+      "resolved": true
+    },
+    "platform.openai.com": {
+      "ips": [
+        "104.18.33.45",
+        "172.64.154.211"
+      ],
+      "resolved": true
+    },
+    "auth0.openai.com": {
+      "ips": [
+        "172.65.90.20",
+        "172.65.90.21",
+        "172.65.90.22",
+        "172.65.90.23"
+      ],
+      "resolved": true
+    },
+    "oauth.openai.com": {
+      "ips": [
+        "108.160.167.158"
+      ],
+      "resolved": true
+    },
+    "login.openai.com": {
+      "ips": [],
+      "resolved": false,
+      "error": "[Errno 11001] getaddrinfo failed"
+    },
+    "cdn.openai.com": {
+      "ips": [
+        "13.107.213.74",
+        "13.107.246.74"
+      ],
+      "resolved": true
+    },
+    "openaiapi-site.azureedge.net": {
+      "ips": [
+        "13.107.213.74",
+        "13.107.246.74"
+      ],
+      "resolved": true
+    },
+    "chatgpt.com": {
+      "ips": [
+        "128.242.240.85"
+      ],
+      "resolved": true
+    },
+    "www.chatgpt.com": {
+      "ips": [
+        "93.179.102.140"
+      ],
+      "resolved": true
+    },
+    "api2.openai.com": {
+      "ips": [],
+      "resolved": false,
+      "error": "[Errno 11001] getaddrinfo failed"
+    },
+    "help.openai.com": {
+      "ips": [
+        "172.64.154.211",
+        "104.18.33.45"
+      ],
+      "resolved": true
+    },
+    "status.openai.com": {
+      "ips": [
+        "76.76.21.123",
+        "66.33.60.35"
+      ],
+      "resolved": true
+    }
+  },
+  "ips": [
+    "13.107.246.74",
+    "172.65.90.21",
+    "93.179.102.140",
+    "31.13.73.9",
+    "104.244.46.93",
+    "76.76.21.123",
+    "104.18.33.45",
+    "108.160.167.158",
+    "13.107.213.74",
+    "66.33.60.35",
+    "172.65.90.22",
+    "128.242.240.85",
+    "172.65.90.20",
+    "172.64.154.211",
+    "172.65.90.23"
+  ],
+  "timestamp": 1765111939
+}

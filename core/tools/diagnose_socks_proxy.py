@@ -16,6 +16,11 @@ import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
+# 添加项目根目录到路径，以便导入core模块
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 # 颜色输出
 if sys.platform == "win32":
     try:
@@ -521,7 +526,7 @@ def main() -> int:
     print()
 
     # 2. 检查VPS连接
-    vps_ok, vps_msg = test_vps_connection(args.vps_ip, args.ssh_port, args.ssh_key)
+    vps_ok, vps_msg = test_vps_connection(vps_ip, args.ssh_port, args.ssh_key)
     if not vps_ok:
         issues.append(f"VPS连接失败: {vps_msg}")
     print()
@@ -568,7 +573,7 @@ def main() -> int:
             print_warning("建议操作:")
             print("  1. 启动SSH隧道:")
             ssh_cmd = generate_ssh_command(
-                args.vps_ip, args.local_port, args.ssh_key, args.ssh_user
+                vps_ip, args.local_port, args.ssh_key, args.ssh_user
             )
             print(f"     {ssh_cmd}")
             print()

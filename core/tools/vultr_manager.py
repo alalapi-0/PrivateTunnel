@@ -13,6 +13,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import PoolManager
 
+from core.proxy_utils import get_proxy_config_with_fallback
+
 API = "https://api.vultr.com/v2"
 UBUNTU_22_04_OSID = 1743  # 如有差异，请在 Vultr 控制台或官方文档中查询实际 OSID
 
@@ -55,6 +57,12 @@ def _session(api_key: str, force_ipv4: bool = False) -> requests.Session:
         s.mount("https://", adapter)
         s.mount("http://", adapter)
     s.headers.update(_hdr(api_key))
+    
+    # 配置代理（如果已配置，支持降级）
+    proxies = get_proxy_config_with_fallback(fallback_to_direct=True, validate=False)
+    if proxies:
+        s.proxies.update(proxies)
+    
     return s
 
 
@@ -87,6 +95,15 @@ def list_ssh_keys(api_key: str) -> list[Dict[str, Any]]:
         try:
             response = session.get(f"{API}/ssh-keys", params=params, timeout=30)
             response.raise_for_status()
+        except requests.exceptions.ProxyError as exc:
+            # 代理错误，尝试降级到直连
+            session.proxies.clear()
+            try:
+                response = session.get(f"{API}/ssh-keys", params=params, timeout=30)
+                response.raise_for_status()
+            except requests.RequestException as retry_exc:
+                message = _friendly_error_message(exc)
+                raise VultrError(f"List SSH keys failed (proxy error and direct connection also failed): {message}. Direct connection error: {retry_exc}") from exc
         except requests.RequestException as exc:  # pragma: no cover - network
             message = _friendly_error_message(exc)
             raise VultrError(f"List SSH keys failed: {message}") from exc
@@ -113,6 +130,15 @@ def list_instances(api_key: str) -> list[Dict[str, Any]]:
         try:
             response = session.get(f"{API}/instances", params=params, timeout=30)
             response.raise_for_status()
+        except requests.exceptions.ProxyError as exc:
+            # 代理错误，尝试降级到直连
+            session.proxies.clear()
+            try:
+                response = session.get(f"{API}/instances", params=params, timeout=30)
+                response.raise_for_status()
+            except requests.RequestException as retry_exc:
+                message = _friendly_error_message(exc)
+                raise VultrError(f"List instances failed (proxy error and direct connection also failed): {message}. Direct connection error: {retry_exc}") from exc
         except requests.RequestException as exc:  # pragma: no cover - network
             message = _friendly_error_message(exc)
             raise VultrError(f"List instances failed: {message}") from exc
@@ -139,6 +165,15 @@ def list_snapshots(api_key: str) -> list[Dict[str, Any]]:
         try:
             response = session.get(f"{API}/snapshots", params=params, timeout=30)
             response.raise_for_status()
+        except requests.exceptions.ProxyError as exc:
+            # 代理错误，尝试降级到直连
+            session.proxies.clear()
+            try:
+                response = session.get(f"{API}/snapshots", params=params, timeout=30)
+                response.raise_for_status()
+            except requests.RequestException as retry_exc:
+                message = _friendly_error_message(exc)
+                raise VultrError(f"List snapshots failed (proxy error and direct connection also failed): {message}. Direct connection error: {retry_exc}") from exc
         except requests.RequestException as exc:  # pragma: no cover - network
             message = _friendly_error_message(exc)
             raise VultrError(f"List snapshots failed: {message}") from exc
@@ -159,6 +194,15 @@ def create_ssh_key(api_key: str, name: str, key_text: str) -> Dict[str, Any]:
     try:
         response = session.post(f"{API}/ssh-keys", json=body, timeout=30)
         response.raise_for_status()
+    except requests.exceptions.ProxyError as exc:
+        # 代理错误，尝试降级到直连
+        session.proxies.clear()
+        try:
+            response = session.post(f"{API}/ssh-keys", json=body, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as retry_exc:
+            message = _friendly_error_message(exc)
+            raise VultrError(f"Create SSH key failed (proxy error and direct connection also failed): {message}. Direct connection error: {retry_exc}") from exc
     except requests.RequestException as exc:  # pragma: no cover - network
         message = _friendly_error_message(exc)
         raise VultrError(f"Create SSH key failed: {message}") from exc
@@ -207,6 +251,19 @@ def create_instance(
             timeout=30,
         )
         response.raise_for_status()
+    except requests.exceptions.ProxyError as exc:
+        # 代理错误，尝试降级到直连
+        session.proxies.clear()
+        try:
+            response = session.post(
+                f"{API}/instances",
+                json=body,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.RequestException as retry_exc:
+            message = _friendly_error_message(exc)
+            raise VultrError(f"Create instance failed (proxy error and direct connection also failed): {message}. Direct connection error: {retry_exc}") from exc
     except requests.RequestException as exc:
         message = _friendly_error_message(exc)
         raise VultrError(f"Create instance failed: {message}") from exc
@@ -238,6 +295,19 @@ def wait_instance_active(
                 timeout=15,
             )
             response.raise_for_status()
+        except requests.exceptions.ProxyError as exc:
+            # 代理错误，尝试降级到直连
+            session.proxies.clear()
+            try:
+                response = session.get(
+                    f"{API}/instances/{instance_id}",
+                    timeout=15,
+                )
+                response.raise_for_status()
+            except requests.RequestException as retry_exc:
+                last_state = {"error": f"Proxy error and direct connection also failed: {_friendly_error_message(exc)}. Direct connection error: {retry_exc}"}
+                time.sleep(interval)
+                continue
         except requests.RequestException as exc:
             last_state = {"error": _friendly_error_message(exc)}
             time.sleep(interval)
@@ -266,6 +336,19 @@ def destroy_instance(api_key: str, instance_id: str) -> None:
         )
         if response.status_code not in (200, 204):
             response.raise_for_status()
+    except requests.exceptions.ProxyError as exc:
+        # 代理错误，尝试降级到直连
+        session.proxies.clear()
+        try:
+            response = session.delete(
+                f"{API}/instances/{instance_id}",
+                timeout=30,
+            )
+            if response.status_code not in (200, 204):
+                response.raise_for_status()
+        except requests.RequestException as retry_exc:
+            message = _friendly_error_message(exc)
+            raise VultrError(f"Destroy failed (proxy error and direct connection also failed): {message}. Direct connection error: {retry_exc}") from exc
     except requests.RequestException as exc:
         message = _friendly_error_message(exc)
         raise VultrError(f"Destroy failed: {message}") from exc
@@ -301,6 +384,19 @@ def reinstall_with_ssh_keys(
             timeout=30,
         )
         response.raise_for_status()
+    except requests.exceptions.ProxyError as exc:
+        # 代理错误，尝试降级到直连
+        session.proxies.clear()
+        try:
+            response = session.post(
+                f"{API}/instances/{instance_id}/reinstall",
+                json=body,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.RequestException as retry_exc:
+            message = _friendly_error_message(exc)
+            raise VultrError(f"Reinstall failed (proxy error and direct connection also failed): {message}. Direct connection error: {retry_exc}") from exc
     except requests.RequestException as exc:  # pragma: no cover - network
         message = _friendly_error_message(exc)
         raise VultrError(f"Reinstall failed: {message}") from exc

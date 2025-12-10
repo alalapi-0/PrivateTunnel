@@ -27,6 +27,66 @@ PrivateTunnel 起初是覆盖 iOS、macOS、服务器脚本与 CI 的一体化�
 
 > 提示：如果你在公司或校园网络内，请确认对外 443/22 端口未被阻断，以免部署阶段失败。
 
+## 代理配置（可选）
+
+如果你的网络环境无法直接访问外网（如在国内），可以通过配置代理来使用本程序：
+
+### 方法1：手动设置环境变量
+
+**Windows PowerShell**：
+
+```powershell
+# 使用 Clash 代理
+$env:ALL_PROXY = "http://127.0.0.1:7890"
+
+# 使用 V2RayN 代理
+$env:ALL_PROXY = "http://127.0.0.1:10809"
+
+# 使用 SOCKS5 代理
+$env:ALL_PROXY = "socks5://127.0.0.1:1080"
+```
+
+**Linux/macOS**：
+
+```bash
+export ALL_PROXY="http://127.0.0.1:7890"
+```
+
+### 方法2：使用自动检测脚本
+
+**Windows**：
+
+运行代理配置脚本（Windows）：
+
+```powershell
+.\scripts\setup_proxy.ps1
+```
+
+**Linux/macOS**：
+
+运行代理配置脚本（Linux/macOS）：
+
+```bash
+bash scripts/setup_proxy.sh
+```
+
+**注意**：创建脚本后，需要添加执行权限：
+
+```bash
+chmod +x scripts/setup_proxy.sh
+```
+
+### 方法3：在代码中使用自动检测
+
+```python
+from core.proxy_utils import auto_configure_proxy
+
+# 自动检测本地代理并设置环境变量
+auto_configure_proxy(set_environment=True)
+```
+
+**注意**：代理配置后，所有 HTTP/HTTPS 请求（包括 Vultr API 调用、ChatGPT 连接测试等）都会通过代理进行。
+
 ## 技术栈一览
 
 - **语言与运行时**：Python 3.8+、Shell（服务器侧 `wg-install.sh`）、批处理脚本（Windows 安装器）。

@@ -1,0 +1,26 @@
+{
+  "version": "1",
+  "nodes": [
+    {
+      "id": "node-ce6d381a",
+      "instance_id": "ce6d381a-117e-448f-b779-470968da6e1b",
+      "ip": "45.76.96.63",
+      "region": "nrt",
+      "plan": "vc2-4c-8gb",
+      "priority": 1,
+      "weight": 100,
+      "status": "active",
+      "last_check": 1765200745,
+      "latency_ms": 0.5104541778564453,
+      "bandwidth_mbps": null,
+      "load_average": null,
+      "connection_count": 0,
+      "server_pub": null,
+      "endpoint": null,
+      "created_at": 1765200677,
+      "metadata": null
+    }
+  ],
+  "default_node_id": "node-ce6d381a",
+  "updated_at": 1765200745
+}

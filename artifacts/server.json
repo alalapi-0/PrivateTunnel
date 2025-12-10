@@ -1,18 +1,19 @@
 {
-  "id": "d558a305-3533-45ab-a94c-178def206a7d",
-  "ip": "45.76.51.145",
-  "server_pub": "Cu6hkSxgOfexpz3mD7ywzyI4nqtOSPHURHE5xvs+kHQ=",
+  "id": "aec6c59e-3603-4add-b75e-b1898fb7cdd3",
+  "ip": "45.32.46.97",
+  "server_pub": "xPRC4KLnmPo0j634VH2ZOMabgwUBImAiLvR4zjY8oy4=",
   "platform": "windows",
-  "endpoint": "45.76.51.145:443",
+  "endpoint": "45.32.46.97:51820",
   "desktop_ip": "10.6.0.3/32",
   "iphone_ip": "10.6.0.2/32",
-  "desktop_public_key": "vXq2H8yHIhlvhRG3V0qEIVWK4Ri4N4ZTJEWdKNQLggg=",
-  "iphone_public_key": "bGDjpS8Z6h8zMaiCc6jtAIpSdDwGoppe9NfJol0F9Fk=",
+  "desktop_public_key": "CWntxkMXb65C6/peXdZIZXe39kerwz6+29WlyLlY1zE=",
+  "iphone_public_key": "lwKR/Mt49cOfPHpB2M1eYLeQbCFVat7WaFeKzT6Q2BM=",
   "desktop_config": "E:\\PrivateTunnel\\PrivateTunnel\\artifacts\\desktop.conf",
   "iphone_config": "E:\\PrivateTunnel\\PrivateTunnel\\artifacts\\iphone.conf",
   "iphone_qr": "E:\\PrivateTunnel\\PrivateTunnel\\artifacts\\iphone.png",
   "allowed_ips": "0.0.0.0/0, ::/0",
   "dns": "1.1.1.1, 8.8.8.8",
-  "deploy_log": "E:\\PrivateTunnel\\PrivateTunnel\\artifacts\\deploy-20251206-145707.log",
-  "wan_interface": "enp1s0"
+  "deploy_log": "E:\\PrivateTunnel\\PrivateTunnel\\artifacts\\deploy-20251207-214643.log",
+  "wan_interface": "enp1s0",
+  "v2ray_enabled": false
 }

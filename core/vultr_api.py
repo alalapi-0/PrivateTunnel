@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
+from core.proxy_utils import get_proxy_config_with_fallback
+
 BASE_URL = "https://api.vultr.com/v2"
 UBUNTU_22_04_OSID = 1743
 
@@ -36,14 +38,36 @@ def _format_http_error(status: int, text: str, reason: str = "") -> str:
 
 def _request(method: str, path: str, api_key: str, **kwargs: Any) -> requests.Response:
     url = f"{BASE_URL}{path}"
+    
+    # 获取代理配置（如果已配置）
+    proxies = get_proxy_config_with_fallback(fallback_to_direct=True, validate=False)
+    if proxies:
+        kwargs.setdefault("proxies", proxies)
+    
     try:
         resp = requests.request(method, url, headers=_headers(api_key), timeout=30, **kwargs)
+    except requests.exceptions.ProxyError as exc:
+        # 代理错误，尝试降级到直连
+        if proxies:
+            # 清除代理配置，重试一次
+            kwargs.pop("proxies", None)
+            try:
+                resp = requests.request(method, url, headers=_headers(api_key), timeout=30, **kwargs)
+            except requests.RequestException as retry_exc:
+                # 降级后仍然失败，抛出原始代理错误
+                raise VultrAPIError(
+                    f"请求 {method} {url} 失败（代理错误且直连也失败）：{exc}。直连错误：{retry_exc}"
+                ) from exc
+        else:
+            # 没有代理配置，直接抛出错误
+            raise VultrAPIError(f"请求 {method} {url} 失败：{exc}") from exc
     except requests.RequestException as exc:  # pragma: no cover - network errors
         response = getattr(exc, "response", None)
         if response is not None:
             message = _format_http_error(response.status_code, getattr(response, "text", ""), response.reason)
             raise VultrAPIError(f"请求 {method} {url} 失败：{message}") from exc
         raise VultrAPIError(f"请求 {method} {url} 失败：{exc}") from exc
+    
     if resp.status_code >= 400:
         message = _format_http_error(resp.status_code, resp.text, resp.reason)
         raise VultrAPIError(f"请求 {method} {url} 失败：{message}")

@@ -1,0 +1,28 @@
+{
+  "groups": {
+    "chatgpt": [
+      "api.openai.com",
+      "chat.openai.com",
+      "platform.openai.com",
+      "auth0.openai.com",
+      "oauth.openai.com",
+      "login.openai.com",
+      "cdn.openai.com",
+      "openaiapi-site.azureedge.net",
+      "chatgpt.com",
+      "www.chatgpt.com",
+      "api2.openai.com",
+      "help.openai.com",
+      "status.openai.com"
+    ]
+  },
+  "options": {
+    "resolve_ipv6": false,
+    "resolvers": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "min_ttl_sec": 300,
+    "max_workers": 4
+  }
+}

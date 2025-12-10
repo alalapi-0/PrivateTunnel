@@ -80,3 +80,8 @@ class TestSmartRouter:
         assert score.overall_score <= 100
 
 
+
+
+
+
+

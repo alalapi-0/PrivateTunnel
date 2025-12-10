@@ -12,6 +12,8 @@ from typing import Any
 from dataclasses import dataclass
 from enum import Enum
 
+from core.proxy_utils import get_proxy_config
+
 try:
     import requests
     from requests.adapters import HTTPAdapter
@@ -94,6 +96,11 @@ class NodeHealthChecker:
             adapter = HTTPAdapter(max_retries=retry_strategy)
             self.session.mount("http://", adapter)
             self.session.mount("https://", adapter)
+            
+            # 配置代理（如果已配置）
+            proxies = get_proxy_config()
+            if proxies:
+                self.session.proxies.update(proxies)
         else:
             self.session = None
 

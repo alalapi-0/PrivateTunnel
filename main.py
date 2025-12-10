@@ -2705,12 +2705,31 @@ def _check_vultr_instances() -> None:
     try:
         instances = list_instances(api_key)
     except VultrError as exc:
-        log_warning(f"⚠️ 查询Vultr实例失败：{exc}")
-        log_info("→ 提示：请检查 VULTR_API_KEY 是否正确，或稍后重试。")
+        error_msg = str(exc)
+        # 检查是否是网络超时或连接问题
+        if any(keyword in error_msg.lower() for keyword in ["timeout", "timed out", "connection", "read timed out"]):
+            log_warning("⚠️ 无法连接到Vultr API（网络超时或连接失败）")
+            log_info("→ 可能的原因：")
+            log_info("  1. 网络连接不稳定或被限制")
+            log_info("  2. 需要配置代理才能访问外网")
+            log_info("→ 解决方案：")
+            log_info("  1. 设置代理环境变量（如：$env:ALL_PROXY='http://127.0.0.1:7890'）")
+            log_info("  2. 使用代理后重新运行程序")
+            log_info("  3. 或稍后网络恢复时重试")
+            # 检查是否已配置代理
+            from core.proxy_utils import is_proxy_configured  # pylint: disable=import-outside-toplevel
+            if not is_proxy_configured():
+                log_info("→ 提示：当前未配置代理，如果无法直连外网，建议配置代理。")
+        elif "401" in error_msg or "unauthorized" in error_msg.lower():
+            log_warning("⚠️ Vultr API 认证失败")
+            log_info("→ 提示：请检查 VULTR_API_KEY 是否正确，或确认API Key是否有查询实例的权限。")
+        else:
+            log_warning(f"⚠️ 查询Vultr实例失败：{error_msg}")
+            log_info("→ 提示：请检查 VULTR_API_KEY 是否正确，或稍后重试。")
         return
 
     if not instances:
-        log_info("ℹ️ 当前Vultr账户中没有任何实例。")
+        log_success("ℹ️ 当前Vultr账户中没有任何实例。")
         log_info("→ 建议：请执行第2步「创建 VPS（Vultr）」来创建新的VPS实例。")
     else:
         log_success(f"✅ 检测到 {len(instances)} 个Vultr实例。")
@@ -3130,6 +3149,320 @@ def test_chatgpt_connection() -> None:
         log_error(f"❌ 生成分流配置失败：{exc}")
 
 
+def _check_and_auto_configure_instances() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """检查账户中的实例，返回已配置和未配置的实例列表。
+    
+    Returns:
+        (configured_instances, unconfigured_instances): 已配置和未配置的实例列表
+    """
+    from core.tools.vultr_manager import list_instances, VultrError
+    from core.tools.multi_node_manager import MultiNodeManager
+    
+    api_key = os.environ.get("VULTR_API_KEY", "").strip()
+    if not api_key:
+        log_warning("⚠️ 未检测到环境变量 VULTR_API_KEY，无法自动检查实例")
+        return [], []
+    
+    try:
+        log_info("→ 正在检查 Vultr 账户中的实例...")
+        instances = list_instances(api_key)
+        if not instances:
+            log_info("ℹ️ 账户中没有任何实例")
+            return [], []
+        
+        # 过滤出活跃实例
+        active_instances = [
+            inst for inst in instances
+            if inst.get("main_ip") and inst.get("status") == "active"
+        ]
+        
+        if not active_instances:
+            log_info("ℹ️ 账户中没有活跃的实例")
+            return [], []
+        
+        log_info(f"→ 找到 {len(active_instances)} 个活跃实例")
+        
+        # 检查多节点配置
+        use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+        configured_instance_ids = set()
+        
+        if use_multi_node:
+            manager = MultiNodeManager()
+            nodes = manager.get_all_nodes()
+            configured_instance_ids = {node.instance_id for node in nodes if node.instance_id}
+        
+        # 检查每个实例是否已部署 WireGuard
+        configured_instances = []
+        unconfigured_instances = []
+        
+        for inst in active_instances:
+            instance_id = inst.get("id", "")
+            ip = inst.get("main_ip", "")
+            
+            if not instance_id or not ip:
+                continue
+            
+            # 检查是否已在节点配置中
+            is_in_node_config = instance_id in configured_instance_ids
+            
+            # 检查是否已部署 WireGuard（通过 SSH 检查）
+            is_wireguard_deployed = False
+            if is_in_node_config:
+                # 如果在节点配置中，尝试检查 WireGuard 状态
+                try:
+                    # 尝试使用默认路径，如果不存在则跳过检查
+                    default_key_path = Path.home() / ".ssh" / "id_ed25519"
+                    if not default_key_path.exists():
+                        default_key_path = Path.home() / ".ssh" / "id_rsa"
+                    if default_key_path.exists():
+                        # 尝试 SSH 检查 WireGuard 服务
+                        try:
+                            _set_ssh_context(ip, default_key_path)
+                            wg_check_cmd = "systemctl is-active wg-quick@wg0 2>/dev/null || echo 'inactive'"
+                            wg_result = _ssh_run(wg_check_cmd, timeout=10, description="检查WireGuard服务", max_retries=1)
+                            is_wireguard_deployed = wg_result.stdout.strip() == "active"
+                        except Exception:
+                            # SSH 检查失败，假设未部署
+                            is_wireguard_deployed = False
+                except Exception:
+                    pass
+            
+            if is_in_node_config and is_wireguard_deployed:
+                configured_instances.append(inst)
+                log_info(f"  ✅ {instance_id[:8]}... ({ip}) - 已配置节点且已部署 WireGuard")
+            else:
+                unconfigured_instances.append(inst)
+                if is_in_node_config:
+                    log_info(f"  ⚠️ {instance_id[:8]}... ({ip}) - 已配置节点但未部署 WireGuard")
+                else:
+                    log_info(f"  ⚠️ {instance_id[:8]}... ({ip}) - 未配置节点")
+        
+        return configured_instances, unconfigured_instances
+        
+    except VultrError as exc:
+        log_warning(f"⚠️ 无法从 Vultr API 获取实例：{exc}")
+        return [], []
+    except Exception as exc:
+        log_warning(f"⚠️ 检查实例时出错：{exc}")
+        return [], []
+def _deploy_wireguard_to_instance(
+    ip: str,
+    instance_id: str,
+    region: str,
+    plan: str,
+    enable_chatgpt_mode: bool,
+    use_multi_node: bool,
+) -> None:
+    """为单个实例部署 WireGuard。
+    
+    Args:
+        ip: 实例 IP 地址
+        instance_id: 实例 ID
+        region: 区域
+        plan: 配置方案
+        enable_chatgpt_mode: 是否启用 ChatGPT 模式
+        use_multi_node: 是否使用多节点模式
+    """
+    # 获取配置参数（使用环境变量或默认值）
+    desktop_ip, _ = _resolve_env_default("PT_DESKTOP_IP", default="10.6.0.3/32")
+    iphone_ip, _ = _resolve_env_default("PT_IPHONE_IP", default="10.6.0.2/32")
+    dns_value, _ = _resolve_env_default("PT_DNS", default="1.1.1.1, 8.8.8.8")
+    allowed_ips, _ = _resolve_env_default("PT_ALLOWED_IPS", default="0.0.0.0/0, ::/0")
+    
+    # 解析 Keepalive 和 MTU
+    enable_adaptive = os.environ.get("PT_ENABLE_ADAPTIVE", "").strip().lower() in ("true", "1", "yes")
+    if enable_adaptive:
+        from core.tools.adaptive_params import AdaptiveParameterTuner
+        adaptive_node_id = instance_id[:8] if instance_id else "default"
+        tuner = AdaptiveParameterTuner(adaptive_node_id)
+        current_params = tuner.current_params
+        keepalive_value = str(current_params.keepalive)
+        desktop_mtu = str(current_params.mtu)
+    else:
+        keepalive_value, _ = _resolve_env_default("PT_KEEPALIVE", default="25")
+        desktop_mtu = os.environ.get("PT_CLIENT_MTU", "").strip() or "1280"
+    
+    # V2Ray 配置
+    enable_v2ray = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower() in ("true", "1", "yes")
+    if enable_v2ray:
+        v2ray_port_raw = os.environ.get("PT_V2RAY_PORT", "").strip()
+        v2ray_port = int(v2ray_port_raw) if v2ray_port_raw and v2ray_port_raw.isdigit() else 443
+        v2ray_uuid = os.environ.get("PT_V2RAY_UUID", "").strip() or None
+    else:
+        v2ray_port = 443
+        v2ray_uuid = None
+    
+    # 如果启用 ChatGPT 模式，进行优化（简化版，不进行交互式提示）
+    if enable_chatgpt_mode:
+        from core.tools.chatgpt_optimizer import ChatGPTOptimizer
+        optimizer = ChatGPTOptimizer(node_ip=ip, wireguard_port=LISTEN_PORT)
+        try:
+            current_keepalive = int(keepalive_value) if keepalive_value.isdigit() else 25
+            current_mtu = int(desktop_mtu) if desktop_mtu.isdigit() else 1280
+            recommendations = optimizer.optimize_for_chatgpt(
+                current_keepalive=current_keepalive,
+                current_mtu=current_mtu,
+            )
+            keepalive_value = str(recommendations["keepalive"])
+            desktop_mtu = str(recommendations["mtu"])
+        except Exception:
+            pass  # 优化失败时使用原值
+    
+    # 获取 SSH 私钥
+    default_key_prompt = _default_private_key_prompt()
+    key_path = Path(ask_key_path(default_key_prompt)).expanduser()
+    
+    # 检查 SSH 连接
+    try:
+        _clean_known_host(ip)
+    except Exception:
+        pass
+    
+    log_info(f"→ 检查 SSH 连接...")
+    if not _wait_for_port_22(ip, interval=20):
+        raise DeploymentError(f"未检测到 VPS SSH 端口开放: {ip}")
+    
+    if not _wait_for_passwordless_ssh(ip, key_path):
+        raise DeploymentError(f"免密 SSH 校验失败: {ip}")
+    
+    log_success(f"✅ SSH 连接正常")
+    
+    # 部署 WireGuard
+    _set_ssh_context(ip, key_path)
+    remote_script = deploy_wireguard_remote_script(
+        LISTEN_PORT,
+        desktop_ip,
+        iphone_ip,
+        ip,
+        dns_value,
+        allowed_ips,
+        desktop_mtu,
+        keepalive_value,
+        enable_v2ray=enable_v2ray,
+        v2ray_port=v2ray_port,
+        v2ray_uuid=v2ray_uuid,
+    )
+    
+    script_payload = (
+        "cat <<'EOS' >/tmp/privatetunnel-wireguard.sh\n"
+        f"{remote_script}\n"
+        "EOS\n"
+    )
+    
+    env_dict = {
+        "WG_PORT": str(LISTEN_PORT),
+        "PT_DESKTOP_IP": desktop_ip,
+        "PT_IPHONE_IP": iphone_ip,
+        "PT_DNS": dns_value,
+        "PT_ALLOWED_IPS": allowed_ips,
+        "PT_CLIENT_MTU": desktop_mtu,
+        "PT_KEEPALIVE": keepalive_value,
+    }
+    if enable_v2ray:
+        env_dict["PT_ENABLE_V2RAY"] = "true"
+        env_dict["PT_V2RAY_PORT"] = str(v2ray_port)
+        if v2ray_uuid:
+            env_dict["PT_V2RAY_UUID"] = v2ray_uuid
+    
+    env_parts = [
+        f"{key}={shlex.quote(value)}"
+        for key, value in env_dict.items()
+        if value
+    ]
+    env_prefix = " ".join(env_parts)
+    
+    log_file = "/tmp/privatetunnel-wireguard.log"
+    pid_file = "/tmp/privatetunnel-wireguard.pid"
+    
+    # 上传脚本
+    _ssh_run(script_payload, timeout=60, description="上传部署脚本", max_retries=3)
+    
+    # 启动脚本
+    start_cmd = (
+        f"{env_prefix + ' ' if env_prefix else ''}nohup bash /tmp/privatetunnel-wireguard.sh "
+        f"> {log_file} 2>&1 & echo $! > {pid_file}"
+    )
+    log_info("→ 开始部署 WireGuard...")
+    _ssh_run(start_cmd, timeout=60, description="启动部署脚本", max_retries=3)
+    
+    time.sleep(2)
+    
+    # 等待部署完成（简化版，不显示详细进度）
+    max_wait_time = 3600
+    check_interval = 15
+    start_time = time.time()
+    
+    while time.time() - start_time < max_wait_time:
+        elapsed = int(time.time() - start_time)
+        
+        # 检查 WireGuard 服务状态
+        try:
+            wg_check_cmd = "systemctl is-active wg-quick@wg0 2>/dev/null || echo 'inactive'"
+            wg_result = _ssh_run(wg_check_cmd, timeout=20, description="检查WireGuard服务", max_retries=1)
+            if wg_result.stdout.strip() == "active":
+                log_success(f"✅ WireGuard 部署完成（耗时 {elapsed} 秒）")
+                break
+        except Exception:
+            pass
+        
+        if elapsed % 60 == 0:  # 每分钟显示一次进度
+            log_info(f"  ⏱️ 部署中... ({elapsed}秒)")
+        
+        time.sleep(check_interval)
+    else:
+        raise DeploymentError(f"部署超时（{max_wait_time}秒）")
+    
+    # 下载配置文件并更新服务器信息
+    log_info("→ 获取服务器配置信息...")
+    try:
+        server_info_cmd = (
+            "SERVER_PUB=$(wg show wg0 public-key 2>/dev/null || echo '') && "
+            "ENDPOINT_IP=$(curl -4 -s ifconfig.me 2>/dev/null || echo '') && "
+            "WAN_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -n1) && "
+            "echo \"SERVER_PUB=$SERVER_PUB|ENDPOINT_IP=$ENDPOINT_IP|WAN_IF=$WAN_IF\""
+        )
+        info_result = _ssh_run(server_info_cmd, timeout=30, description="获取服务器信息", max_retries=2)
+        
+        server_info = {}
+        for item in info_result.stdout.strip().split("|"):
+            if "=" in item:
+                key, value = item.split("=", 1)
+                server_info[key.lower()] = value
+        
+        server_pub = server_info.get("server_pub", "")
+        endpoint_ip = server_info.get("endpoint_ip", ip)
+        wan_interface = server_info.get("wan_if", "")
+        
+        endpoint = f"{endpoint_ip}:{LISTEN_PORT}" if endpoint_ip else None
+        
+        # 更新服务器信息
+        server_data = {
+            "id": instance_id,
+            "ip": ip,
+            "server_pub": server_pub,
+            "endpoint": endpoint,
+            "wan_interface": wan_interface,
+        }
+        
+        if use_multi_node:
+            from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
+            manager = MultiNodeManager()
+            node_id = f"node-{instance_id[:8]}"
+            
+            manager.update_node_info(
+                node_id=node_id,
+                server_pub=server_pub,
+                endpoint=endpoint,
+            )
+            manager.update_node_status(node_id, NodeStatus.ACTIVE)
+        else:
+            _update_server_info(server_data)
+        
+        log_success("✅ 服务器信息已更新")
+    except Exception as exc:
+        log_warning(f"⚠️ 更新服务器信息失败: {exc}")
+
+
 def prepare_wireguard_access() -> None:
     """Configure WireGuard end-to-end, including client provisioning."""
 
@@ -3138,6 +3471,73 @@ def prepare_wireguard_access() -> None:
 
     # 检查是否启用多节点模式
     use_multi_node = os.environ.get("PT_MULTI_NODE", "").strip().lower() in ("true", "1", "yes")
+    
+    # 首先检查账户中的实例
+    log_section("🔍 检查 Vultr 账户实例状态")
+    configured_instances, unconfigured_instances = _check_and_auto_configure_instances()
+    
+    if configured_instances:
+        log_success(f"✅ {len(configured_instances)} 个实例已配置完成")
+    
+    if unconfigured_instances:
+        log_info(f"→ 发现 {len(unconfigured_instances)} 个未配置的实例，将自动进行配置...")
+        
+        # 根据实例数量决定配置方式
+        if len(unconfigured_instances) == 1:
+            log_info("→ 单个实例模式：将配置单个节点")
+            # 如果只有一个实例且未启用多节点，使用单节点模式
+            if not use_multi_node:
+                log_info("→ 提示：当前未启用多节点模式，将使用单节点模式")
+        else:
+            log_info(f"→ 多实例模式：将为 {len(unconfigured_instances)} 个实例分别配置节点")
+            # 如果有多个实例，自动启用多节点模式
+            if not use_multi_node:
+                log_info("→ 自动启用多节点模式（检测到多个实例）")
+                use_multi_node = True
+                os.environ["PT_MULTI_NODE"] = "true"
+        
+        # 为每个未配置的实例自动部署
+        for idx, inst in enumerate(unconfigured_instances, 1):
+            instance_id = inst.get("id", "")
+            ip = inst.get("main_ip", "")
+            region_obj = inst.get("region", {})
+            if isinstance(region_obj, dict):
+                region = region_obj.get("code") or region_obj.get("id") or "unknown"
+            else:
+                region = str(region_obj or "unknown")
+            plan = inst.get("plan", "unknown")
+            
+            log_info("")
+            log_section(f"📦 配置实例 {idx}/{len(unconfigured_instances)}: {instance_id[:8]}... ({ip})")
+            
+            # 如果启用多节点，先创建节点
+            if use_multi_node:
+                from core.tools.multi_node_manager import MultiNodeManager
+                manager = MultiNodeManager()
+                node_priority = int(os.environ.get("PT_NODE_PRIORITY", str(idx)))
+                node_weight = int(os.environ.get("PT_NODE_WEIGHT", "100"))
+                
+                node = manager.add_node_from_instance(
+                    instance_id=instance_id,
+                    ip=ip,
+                    region=region,
+                    plan=plan,
+                    priority=node_priority,
+                    weight=node_weight,
+                )
+                log_success(f"✅ 已创建节点: {node.id}")
+            
+            # 部署 WireGuard（调用原有的部署逻辑，但针对当前实例）
+            try:
+                _deploy_wireguard_to_instance(ip, instance_id, region, plan, enable_chatgpt_mode, use_multi_node)
+                log_success(f"✅ 实例 {instance_id[:8]}... 配置完成")
+            except Exception as exc:
+                log_error(f"❌ 实例 {instance_id[:8]}... 配置失败: {exc}")
+                log_info("→ 将继续配置其他实例...")
+        
+        log_info("")
+        log_success("✅ 所有实例配置完成！")
+        return
 
     if use_multi_node:
         from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
@@ -3151,8 +3551,88 @@ def prepare_wireguard_access() -> None:
         nodes = manager.get_all_nodes()
 
         if not nodes:
-            log_error("❌ 未找到任何节点，请先创建 VPS。")
-            return
+            # 尝试从 instance.json 或 Vultr API 自动创建节点
+            log_info("→ 未找到节点配置，尝试从已有实例自动创建节点...")
+            
+            # 方法1：从本地 instance.json 创建节点
+            instance_file = ARTIFACTS_DIR / "instance.json"
+            if instance_file.exists():
+                try:
+                    instance_data = json.loads(instance_file.read_text(encoding="utf-8"))
+                    instance_id = instance_data.get("id", "")
+                    ip = instance_data.get("ip", "")
+                    region = instance_data.get("region", "unknown")
+                    plan = instance_data.get("plan", "unknown")
+                    priority = int(instance_data.get("priority", 1))
+                    weight = int(instance_data.get("weight", 100))
+                    
+                    if instance_id and ip:
+                        node = manager.add_node_from_instance(
+                            instance_id=instance_id,
+                            ip=ip,
+                            region=region,
+                            plan=plan,
+                            priority=priority,
+                            weight=weight,
+                        )
+                        log_success(f"✅ 已从本地记录自动创建节点: {node.id} ({ip})")
+                        nodes = manager.get_all_nodes()
+                except (json.JSONDecodeError, KeyError, ValueError) as exc:
+                    log_warning(f"⚠️ 读取 instance.json 失败: {exc}")
+            
+            # 方法2：如果仍然没有节点，尝试从 Vultr API 获取实例
+            if not nodes:
+                api_key = os.environ.get("VULTR_API_KEY", "").strip()
+                if api_key:
+                    try:
+                        from core.tools.vultr_manager import list_instances, VultrError
+                        log_info("→ 尝试从 Vultr API 获取实例...")
+                        instances = list_instances(api_key)
+                        if instances:
+                            # 使用第一个活跃实例
+                            active_instances = [
+                                inst for inst in instances
+                                if inst.get("main_ip") and inst.get("status") == "active"
+                            ]
+                            if active_instances:
+                                inst = active_instances[0]
+                                instance_id = inst.get("id", "")
+                                ip = inst.get("main_ip", "")
+                                region_obj = inst.get("region", {})
+                                if isinstance(region_obj, dict):
+                                    region = region_obj.get("code") or region_obj.get("id") or "unknown"
+                                else:
+                                    region = str(region_obj or "unknown")
+                                plan = inst.get("plan", "unknown")
+                                
+                                if instance_id and ip:
+                                    node = manager.add_node_from_instance(
+                                        instance_id=instance_id,
+                                        ip=ip,
+                                        region=region,
+                                        plan=plan,
+                                        priority=1,
+                                        weight=100,
+                                    )
+                                    log_success(f"✅ 已从 Vultr API 自动创建节点: {node.id} ({ip})")
+                                    nodes = manager.get_all_nodes()
+                            else:
+                                log_warning("⚠️ Vultr账户中没有活跃的实例")
+                        else:
+                            log_warning("⚠️ Vultr账户中没有任何实例")
+                    except VultrError as exc:
+                        log_warning(f"⚠️ 无法从 Vultr API 获取实例: {exc}")
+                    except Exception as exc:
+                        log_warning(f"⚠️ 获取实例时出错: {exc}")
+            
+            # 如果仍然没有节点，显示友好的提示
+            if not nodes:
+                log_error("❌ 未找到任何节点配置。")
+                log_info("→ 解决方案：")
+                log_info("  1. 如果已创建VPS但未启用多节点模式，请先执行第2步「创建 VPS（Vultr）」并启用多节点模式")
+                log_info("  2. 或者手动添加节点到 artifacts/multi-node.json")
+                log_info("  3. 或者设置环境变量 PT_MULTI_NODE=false 使用单节点模式")
+                return
 
         # 显示可用节点
         log_info("→ 可用节点列表：")
@@ -3289,16 +3769,66 @@ def prepare_wireguard_access() -> None:
         selected_node_id = None  # 单节点模式下没有 selected_node_id
         # 单节点模式：保持原有逻辑
         inst_path = ARTIFACTS_DIR / "instance.json"
-        if not inst_path.exists():
+        instance = None
+        
+        # 尝试从本地文件加载
+        if inst_path.exists():
+            try:
+                instance = json.loads(inst_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                log_warning(f"⚠️ 解析 {inst_path} 失败：{exc}，将尝试从 Vultr API 获取实例")
+                instance = None
+        
+        # 如果本地文件不存在或解析失败，尝试从 Vultr API 获取
+        if not instance:
+            api_key = os.environ.get("VULTR_API_KEY", "").strip()
+            if api_key:
+                try:
+                    from core.tools.vultr_manager import list_instances, VultrError
+                    log_info("→ 本地记录不存在，尝试从 Vultr API 获取实例...")
+                    instances = list_instances(api_key)
+                    if instances:
+                        # 使用第一个活跃实例
+                        active_instances = [
+                            inst for inst in instances
+                            if inst.get("main_ip") and inst.get("status") == "active"
+                        ]
+                        if active_instances:
+                            inst = active_instances[0]
+                            instance = {
+                                "id": inst.get("id", ""),
+                                "ip": inst.get("main_ip", ""),
+                                "region": inst.get("region", {}).get("code") if isinstance(inst.get("region"), dict) else str(inst.get("region", "")),
+                                "plan": inst.get("plan", ""),
+                            }
+                            log_success(f"✅ 已从 Vultr API 获取实例：{instance['ip']}")
+                            # 保存到本地文件以便后续使用
+                            inst_path.parent.mkdir(parents=True, exist_ok=True)
+                            inst_path.write_text(
+                                json.dumps(instance, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+                            log_info(f"→ 已保存实例信息到 {inst_path}")
+                        else:
+                            log_warning("⚠️ Vultr账户中没有活跃的实例")
+                    else:
+                        log_warning("⚠️ Vultr账户中没有任何实例")
+                except VultrError as exc:
+                    log_warning(f"⚠️ 无法从 Vultr API 获取实例：{exc}")
+                except Exception as exc:
+                    log_warning(f"⚠️ 获取实例时出错：{exc}")
+        
+        # 如果仍然没有实例信息，显示错误
+        if not instance:
             log_section("🛡 Step 3: 准备本机接入 VPS 网络")
-            log_error(f"❌ 未找到 {inst_path}，请先创建 VPS。")
-            return
-
-        try:
-            instance = json.loads(inst_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            log_section("🛡 Step 3: 准备本机接入 VPS 网络")
-            log_error(f"❌ 解析实例信息失败：{exc}")
+            log_error(f"❌ 未找到实例信息。")
+            log_info("→ 可能的原因：")
+            log_info("  1. 本地记录文件不存在或已损坏")
+            log_info("  2. Vultr账户中没有实例")
+            log_info("  3. 无法连接到 Vultr API（可能需要配置代理）")
+            log_info("→ 解决方案：")
+            log_info("  1. 执行第2步「创建 VPS（Vultr）」创建新实例")
+            log_info("  2. 或手动创建 artifacts/instance.json 文件")
             return
 
         ip = instance.get("ip")
