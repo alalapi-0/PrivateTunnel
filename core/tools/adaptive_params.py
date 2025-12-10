@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.config.defaults import DEFAULT_CLIENT_MTU, DEFAULT_KEEPALIVE_SECONDS
 from core.tools.connection_stats import ConnectionMetrics, ConnectionSession
 
 
@@ -15,8 +16,8 @@ from core.tools.connection_stats import ConnectionMetrics, ConnectionSession
 class ParameterSet:
     """参数集合。Parameter set."""
 
-    keepalive: int = 25  # PersistentKeepalive（秒）
-    mtu: int = 1280  # MTU
+    keepalive: int = DEFAULT_KEEPALIVE_SECONDS  # PersistentKeepalive（秒）
+    mtu: int = DEFAULT_CLIENT_MTU  # MTU
     timestamp: int = 0  # 应用时间戳
 
     def __post_init__(self):

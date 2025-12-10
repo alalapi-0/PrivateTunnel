@@ -15,6 +15,7 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+from core.config.defaults import DEFAULT_CLIENT_MTU, DEFAULT_KEEPALIVE_SECONDS
 from core.proxy_utils import get_proxy_config_with_fallback
 from core.tools.chatgpt_domains import get_chatgpt_domains, is_chatgpt_domain
 from core.tools.node_health_checker import NodeHealthChecker
@@ -164,8 +165,8 @@ class ChatGPTOptimizer:
     
     def optimize_for_chatgpt(
         self,
-        current_keepalive: int = 25,
-        current_mtu: int = 1280,
+        current_keepalive: int = DEFAULT_KEEPALIVE_SECONDS,
+        current_mtu: int = DEFAULT_CLIENT_MTU,
     ) -> dict[str, Any]:
         """为 ChatGPT 优化参数。Optimize parameters for ChatGPT.
         

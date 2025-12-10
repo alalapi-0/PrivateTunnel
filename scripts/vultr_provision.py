@@ -6,6 +6,9 @@
 2. 封装等待实例就绪、同步部署脚本等操作，确保 Windows 一键流程可复用。
 3. 保持对 Python 标准库的依赖，避免额外安装要求，适合零基础用户按示例执行。
 
+本脚本仍可直接调用以满足纯命令行/自动化场景；在桌面端推荐使用 ``python main.py``
+ 的交互式菜单触发相同流程。
+
 Utility helpers for provisioning a Vultr instance and preparing it for
 PrivateTunnel's WireGuard automation.
 

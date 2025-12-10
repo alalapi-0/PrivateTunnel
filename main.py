@@ -6,6 +6,8 @@
 3. 提供部署日志记录、网络诊断、实例销毁等辅助功能，确保在一台 Windows 机器上即可完成端到端操作。
 """
 
+# 主线入口：Windows 端一键部署与菜单式操作的统一入口点。
+
 from __future__ import annotations
 
 import json
@@ -19,6 +21,16 @@ import shutil
 import textwrap
 import threading
 
+from core.config.defaults import (
+    DEFAULT_ALLOWED_IPS,
+    DEFAULT_CLIENT_MTU,
+    DEFAULT_DESKTOP_ADDRESS,
+    DEFAULT_DNS_STRING,
+    DEFAULT_IPHONE_ADDRESS,
+    DEFAULT_KEEPALIVE_SECONDS,
+    DEFAULT_SERVER_ADDRESS,
+    DEFAULT_SUBNET_CIDR,
+)
 from core.project_overview import generate_project_overview
 from dataclasses import dataclass
 from datetime import datetime
@@ -1093,9 +1105,9 @@ PYTHON_EOF
         log "检测到默认路由接口: $WAN_IF"
 
         log "刷新并写入 NAT/FORWARD/INPUT 规则"
-        iptables -t nat -D POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
-        iptables -t nat -C POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
-        iptables -t nat -A POSTROUTING -s 10.6.0.0/24 -o "$WAN_IF" -j MASQUERADE
+        iptables -t nat -D POSTROUTING -s {subnet_cidr} -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
+        iptables -t nat -C POSTROUTING -s {subnet_cidr} -o "$WAN_IF" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s {subnet_cidr} -o "$WAN_IF" -j MASQUERADE
         iptables -D FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
         iptables -C FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT 2>/dev/null || \
         iptables -A FORWARD -i wg0 -o "$WAN_IF" -j ACCEPT
@@ -1130,7 +1142,7 @@ PYTHON_EOF
 
         cat >"$SERVER_CONF" <<CFG
 [Interface]
-Address = 10.6.0.1/24
+Address = {server_address}
 ListenPort = $WG_PORT
 PrivateKey = $SERVER_PRIVATE
 SaveConfig = true
@@ -1495,6 +1507,8 @@ PYTHON_EOF
         enable_v2ray="true" if enable_v2ray else "false",
         v2ray_port=v2ray_port,
         v2ray_uuid=v2ray_uuid or "",
+        subnet_cidr=DEFAULT_SUBNET_CIDR,
+        server_address=DEFAULT_SERVER_ADDRESS,
     ).strip()
 
 def _wait_for_port_22(ip: str, *, timeout: int = 1200, interval: int = 20) -> bool:
@@ -3127,8 +3141,8 @@ def test_chatgpt_connection() -> None:
     
     # 获取当前参数
     try:
-        keepalive = int(os.environ.get("PT_KEEPALIVE", "25"))
-        mtu = int(os.environ.get("PT_CLIENT_MTU", "1280"))
+        keepalive = int(os.environ.get("PT_KEEPALIVE", str(DEFAULT_KEEPALIVE_SECONDS)))
+        mtu = int(os.environ.get("PT_CLIENT_MTU", str(DEFAULT_CLIENT_MTU)))
         
         recommendations = optimizer.optimize_for_chatgpt(keepalive, mtu)
         
@@ -3264,10 +3278,10 @@ def _deploy_wireguard_to_instance(
         use_multi_node: 是否使用多节点模式
     """
     # 获取配置参数（使用环境变量或默认值）
-    desktop_ip, _ = _resolve_env_default("PT_DESKTOP_IP", default="10.6.0.3/32")
-    iphone_ip, _ = _resolve_env_default("PT_IPHONE_IP", default="10.6.0.2/32")
-    dns_value, _ = _resolve_env_default("PT_DNS", default="1.1.1.1, 8.8.8.8")
-    allowed_ips, _ = _resolve_env_default("PT_ALLOWED_IPS", default="0.0.0.0/0, ::/0")
+    desktop_ip, _ = _resolve_env_default("PT_DESKTOP_IP", default=DEFAULT_DESKTOP_ADDRESS)
+    iphone_ip, _ = _resolve_env_default("PT_IPHONE_IP", default=DEFAULT_IPHONE_ADDRESS)
+    dns_value, _ = _resolve_env_default("PT_DNS", default=DEFAULT_DNS_STRING)
+    allowed_ips, _ = _resolve_env_default("PT_ALLOWED_IPS", default=DEFAULT_ALLOWED_IPS)
     
     # 解析 Keepalive 和 MTU
     enable_adaptive = os.environ.get("PT_ENABLE_ADAPTIVE", "").strip().lower() in ("true", "1", "yes")
@@ -3279,8 +3293,10 @@ def _deploy_wireguard_to_instance(
         keepalive_value = str(current_params.keepalive)
         desktop_mtu = str(current_params.mtu)
     else:
-        keepalive_value, _ = _resolve_env_default("PT_KEEPALIVE", default="25")
-        desktop_mtu = os.environ.get("PT_CLIENT_MTU", "").strip() or "1280"
+        keepalive_value, _ = _resolve_env_default(
+            "PT_KEEPALIVE", default=str(DEFAULT_KEEPALIVE_SECONDS)
+        )
+        desktop_mtu = os.environ.get("PT_CLIENT_MTU", "").strip() or str(DEFAULT_CLIENT_MTU)
     
     # V2Ray 配置
     enable_v2ray = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower() in ("true", "1", "yes")
@@ -3297,8 +3313,12 @@ def _deploy_wireguard_to_instance(
         from core.tools.chatgpt_optimizer import ChatGPTOptimizer
         optimizer = ChatGPTOptimizer(node_ip=ip, wireguard_port=LISTEN_PORT)
         try:
-            current_keepalive = int(keepalive_value) if keepalive_value.isdigit() else 25
-            current_mtu = int(desktop_mtu) if desktop_mtu.isdigit() else 1280
+            current_keepalive = (
+                int(keepalive_value)
+                if keepalive_value.isdigit()
+                else DEFAULT_KEEPALIVE_SECONDS
+            )
+            current_mtu = int(desktop_mtu) if desktop_mtu.isdigit() else DEFAULT_CLIENT_MTU
             recommendations = optimizer.optimize_for_chatgpt(
                 current_keepalive=current_keepalive,
                 current_mtu=current_mtu,
@@ -3855,7 +3875,7 @@ def prepare_wireguard_access() -> None:
             f"→ WireGuard 监听端口：{LISTEN_PORT} （默认值，可通过环境变量 PRIVATETUNNEL_WG_PORT/PT_WG_PORT 覆盖）"
         )
 
-    desktop_ip, desktop_source = _resolve_env_default("PT_DESKTOP_IP", default="10.6.0.3/32")
+    desktop_ip, desktop_source = _resolve_env_default("PT_DESKTOP_IP", default=DEFAULT_DESKTOP_ADDRESS)
     if desktop_source:
         log_info(f"→ 桌面客户端 IP：{desktop_ip} （来自环境变量 {desktop_source}）")
     else:
@@ -3863,7 +3883,7 @@ def prepare_wireguard_access() -> None:
             "→ 桌面客户端 IP：{value} （默认值，可通过环境变量 PT_DESKTOP_IP 覆盖）".format(value=desktop_ip)
         )
 
-    iphone_ip, iphone_source = _resolve_env_default("PT_IPHONE_IP", default="10.6.0.2/32")
+    iphone_ip, iphone_source = _resolve_env_default("PT_IPHONE_IP", default=DEFAULT_IPHONE_ADDRESS)
     if iphone_source:
         log_info(f"→ iPhone 客户端 IP：{iphone_ip} （来自环境变量 {iphone_source}）")
     else:
@@ -3871,7 +3891,7 @@ def prepare_wireguard_access() -> None:
             "→ iPhone 客户端 IP：{value} （默认值，可通过环境变量 PT_IPHONE_IP 覆盖）".format(value=iphone_ip)
         )
 
-    dns_value, dns_source = _resolve_env_default("PT_DNS", default="1.1.1.1, 8.8.8.8")
+    dns_value, dns_source = _resolve_env_default("PT_DNS", default=DEFAULT_DNS_STRING)
     if dns_source:
         log_info(f"→ 客户端 DNS：{dns_value} （来自环境变量 {dns_source}）")
     else:
@@ -3879,7 +3899,7 @@ def prepare_wireguard_access() -> None:
             "→ 客户端 DNS：{value} （默认值，可通过环境变量 PT_DNS 覆盖）".format(value=dns_value)
         )
 
-    allowed_ips, allowed_source = _resolve_env_default("PT_ALLOWED_IPS", default="0.0.0.0/0, ::/0")
+    allowed_ips, allowed_source = _resolve_env_default("PT_ALLOWED_IPS", default=DEFAULT_ALLOWED_IPS)
     if allowed_source:
         log_info(f"→ 客户端 AllowedIPs：{allowed_ips} （来自环境变量 {allowed_source}）")
     else:
@@ -3914,7 +3934,9 @@ def prepare_wireguard_access() -> None:
         log_info(f"→ 当前 MTU：{desktop_mtu}（自适应调整）")
     else:
         # 手动模式：从环境变量或默认值
-        keepalive_value, keepalive_source = _resolve_env_default("PT_KEEPALIVE", default="25")
+        keepalive_value, keepalive_source = _resolve_env_default(
+            "PT_KEEPALIVE", default=str(DEFAULT_KEEPALIVE_SECONDS)
+        )
         if keepalive_source:
             log_info(f"→ 客户端 Keepalive：{keepalive_value} 秒 （来自环境变量 {keepalive_source}）")
         else:
@@ -3924,19 +3946,31 @@ def prepare_wireguard_access() -> None:
         try:
             keepalive_int = int(keepalive_value)
             if not 0 <= keepalive_int <= 65535:
-                log_warning(f"⚠️ Keepalive 值 {keepalive_int} 超出有效范围 (0-65535)，将使用默认值 25")
-                keepalive_value = "25"
+                log_warning(
+                    "⚠️ Keepalive 值 {value} 超出有效范围 (0-65535)，将使用默认值 {default}".format(
+                        value=keepalive_int, default=DEFAULT_KEEPALIVE_SECONDS
+                    )
+                )
+                keepalive_value = str(DEFAULT_KEEPALIVE_SECONDS)
         except ValueError:
-            log_warning(f"⚠️ Keepalive 值 '{keepalive_value}' 无效，将使用默认值 25")
-            keepalive_value = "25"
+            log_warning(
+                "⚠️ Keepalive 值 '{value}' 无效，将使用默认值 {default}".format(
+                    value=keepalive_value, default=DEFAULT_KEEPALIVE_SECONDS
+                )
+            )
+            keepalive_value = str(DEFAULT_KEEPALIVE_SECONDS)
 
         client_mtu_raw = os.environ.get("PT_CLIENT_MTU", "").strip()
         if client_mtu_raw:
             desktop_mtu = client_mtu_raw
             log_info(f"→ 客户端 MTU：{desktop_mtu} （来自环境变量 PT_CLIENT_MTU）")
         else:
-            desktop_mtu = "1280"
-            log_info("→ 客户端 MTU：1280（默认值，可通过环境变量 PT_CLIENT_MTU 覆盖）")
+            desktop_mtu = str(DEFAULT_CLIENT_MTU)
+            log_info(
+                "→ 客户端 MTU：{value}（默认值，可通过环境变量 PT_CLIENT_MTU 覆盖）".format(
+                    value=desktop_mtu
+                )
+            )
 
     # V2Ray 配置参数
     enable_v2ray_raw = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower()
@@ -4002,8 +4036,12 @@ def prepare_wireguard_access() -> None:
         # 获取优化建议
         log_info("→ 获取参数优化建议...")
         try:
-            current_keepalive = int(keepalive_value) if keepalive_value.isdigit() else 25
-            current_mtu = int(desktop_mtu) if desktop_mtu.isdigit() else 1280
+            current_keepalive = (
+                int(keepalive_value)
+                if keepalive_value.isdigit()
+                else DEFAULT_KEEPALIVE_SECONDS
+            )
+            current_mtu = int(desktop_mtu) if desktop_mtu.isdigit() else DEFAULT_CLIENT_MTU
             
             recommendations = optimizer.optimize_for_chatgpt(
                 current_keepalive=current_keepalive,
@@ -4454,7 +4492,11 @@ def prepare_wireguard_access() -> None:
         log_info("验证指南：")
         log_info(f"  1. Windows 打开 WireGuard 导入 {_rel(desktop_conf_local)} 并连接。")
         log_info("  2. 连接后运行：curl -4 ifconfig.me / curl -6 ifconfig.me，应显示 VPS 公网地址。")
-        log_info("  3. 若能获取公网 IP 但无法上网，请检查代理/安全软件；如丢包，可继续使用默认 MTU=1280。")
+        log_info(
+            "  3. 若能获取公网 IP 但无法上网，请检查代理/安全软件；如丢包，可继续使用默认 MTU={value}。".format(
+                value=DEFAULT_CLIENT_MTU
+            )
+        )
         
         # V2Ray 使用指南（如果启用）
         if enable_v2ray_check:

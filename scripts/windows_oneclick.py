@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Windows 环境下一键部署 PrivateTunnel 的流程封装。Windows-friendly one-click provisioning workflow for PrivateTunnel.
 
+推荐在交互式 Windows 终端直接运行（或通过 ``python main.py`` 的菜单入口触发），便于复用
+图形化提示与日志输出；本脚本保留作为独立调用的替代路径，仅依赖 Python 标准库与 Vultr API key。
+
 脚本流程概览：
 1. 交互式询问区域、套餐、公钥等关键信息，可读取默认值快速回车。
 2. 调用 Vultr API 创建实例，并等待实例通电、注入 SSH Key。
