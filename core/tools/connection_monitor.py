@@ -13,6 +13,9 @@ from threading import Thread, Event
 
 from core.tools.connection_stats import ConnectionMetrics, ConnectionSession
 from core.tools.node_health_checker import NodeHealthChecker
+from core.logging_utils import get_logger
+
+LOGGER = get_logger(__name__)
 
 
 class ConnectionMonitor:
@@ -90,6 +93,15 @@ class ConnectionMonitor:
         if self.is_monitoring:
             return
 
+        LOGGER.info(
+            "Starting connection monitoring",
+            extra={
+                "node_id": self.node_id,
+                "node_ip": self.node_ip,
+                "interval": self.check_interval,
+                "adaptive": self.enable_adaptive,
+            },
+        )
         # 创建新会话
         session_id = str(uuid.uuid4())
         self.current_session = ConnectionSession(
@@ -111,6 +123,11 @@ class ConnectionMonitor:
 
         self.is_monitoring = False
         self.stop_event.set()
+
+        LOGGER.info(
+            "Stopping connection monitoring",
+            extra={"node_id": self.node_id, "node_ip": self.node_ip},
+        )
 
         if self.monitor_thread:
             self.monitor_thread.join(timeout=5)
@@ -146,10 +163,31 @@ class ConnectionMonitor:
                     if self.on_metrics_update:
                         self.on_metrics_update(metrics)
 
+                    LOGGER.info(
+                        "Connection health check",
+                        extra={
+                            "node_id": self.node_id,
+                            "node_ip": self.node_ip,
+                            "latency_ms": metrics.latency_ms,
+                            "packet_loss": metrics.packet_loss_rate,
+                            "jitter_ms": metrics.jitter_ms,
+                            "uptime": metrics.connection_uptime,
+                        },
+                    )
+
                     # 检查质量下降
                     if self._check_quality_degraded(metrics):
                         if self.on_quality_degraded:
                             self.on_quality_degraded(metrics)
+                        LOGGER.warning(
+                            "Connection quality degraded",
+                            extra={
+                                "node_id": self.node_id,
+                                "latency_ms": metrics.latency_ms,
+                                "packet_loss": metrics.packet_loss_rate,
+                                "jitter_ms": metrics.jitter_ms,
+                            },
+                        )
 
                     # 自适应参数调整（每 10 次检查评估一次）
                     if self.enable_adaptive and self.param_tuner and self.current_session:
@@ -164,9 +202,11 @@ class ConnectionMonitor:
                 self.stop_event.wait(self.check_interval)
             except Exception as exc:
                 # 监控错误不应中断监控
-                import traceback
-
-                traceback.print_exc()
+                LOGGER.exception(
+                    "Error occurred during connection monitoring loop",
+                    exc_info=exc,
+                    extra={"node_id": self.node_id, "node_ip": self.node_ip},
+                )
                 time.sleep(self.check_interval)
 
     def _collect_metrics(self, last_metrics: ConnectionMetrics | None = None) -> ConnectionMetrics | None:

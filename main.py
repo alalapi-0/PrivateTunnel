@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -37,6 +38,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from core.logging_utils import setup_logging
+
 if sys.version_info < (3, 8):
     raise SystemExit(
         "当前 Python 解释器版本过低。本工具至少需要 Python 3.8，请改用 python3 运行。"
@@ -58,6 +61,7 @@ RESET = "\033[0m"
 
 ROOT = Path(__file__).resolve().parent
 ARTIFACTS_DIR = ROOT / "artifacts"
+LOGGER = setup_logging(ARTIFACTS_DIR / "logs", "privatetunnel")
 try:
     LISTEN_PORT, LISTEN_PORT_SOURCE = resolve_listen_port()
 except ValueError as exc:
@@ -128,36 +132,43 @@ def _log_to_file(message: str) -> None:
         pass
 
 
-def logwrite(message: str, *, color: str | None = None) -> None:
+def logwrite(
+    message: str, *, color: str | None = None, level: int = logging.INFO
+) -> None:
     """打印信息（可选颜色）并写入日志。Print ``message`` (optionally colorized) and persist to the log file."""
 
     text = _colorize(message, color) if color else message
     print(text)
     _log_to_file(message)
+    try:
+        LOGGER.log(level, message)
+    except Exception:
+        # Logging failures must not interrupt user output.
+        pass
 
 
 def log_info(message: str) -> None:
     """以蓝色输出一般信息。Print an informational message in blue."""
 
-    logwrite(message, color=BLUE)
+    logwrite(message, color=BLUE, level=logging.INFO)
 
 
 def log_success(message: str) -> None:
     """以绿色输出成功提示。Print a success message in green."""
 
-    logwrite(message, color=GREEN)
+    logwrite(message, color=GREEN, level=logging.INFO)
 
 
 def log_warning(message: str) -> None:
     """以黄色输出警告信息。Print a warning message in yellow."""
 
-    logwrite(message, color=YELLOW)
+    logwrite(message, color=YELLOW, level=logging.WARNING)
 
 
 def log_error(message: str) -> None:
     """以红色输出错误信息。Print an error message in red."""
 
-    logwrite(message, color=RED)
+    logwrite(message, color=RED, level=logging.ERROR)
 
 
 def log_section(title: str) -> None:
@@ -242,6 +253,10 @@ def _run_remote_script(
 ) -> bool:
     """Execute ``script`` on ``client`` using ``bash`` and report errors."""
 
+    LOGGER.info(
+        "Executing remote script",
+        extra={"description": description, "timeout": timeout, "preview": script[:120]},
+    )
     try:
         stdin, stdout, stderr = client.exec_command("bash -s", get_pty=False, timeout=timeout)
         if not script.endswith("\n"):
@@ -253,12 +268,21 @@ def _run_remote_script(
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001 - we want to surface any Paramiko errors
         log_error(f"❌ {description}失败：{exc}")
+        LOGGER.error("Remote script execution failed", exc_info=exc)
         return False
 
     if exit_code != 0:
         details = stderr_data or stdout_data or f"退出码 {exit_code}"
         log_error(f"❌ {description}失败：{details}")
+        LOGGER.error(
+            "Remote script returned non-zero",
+            extra={"description": description, "exit_code": exit_code, "stderr": stderr_data[:500]},
+        )
         return False
+    LOGGER.info(
+        "Remote script succeeded",
+        extra={"description": description, "stdout_summary": stdout_data[:500]},
+    )
     return True
 
 
@@ -272,18 +296,31 @@ def _run_remote_command(
 ) -> bool:
     """Run a single command via Paramiko with unified error handling."""
 
+    LOGGER.info(
+        "Executing remote command",
+        extra={"description": description, "command": command, "timeout": timeout},
+    )
     try:
         stdin, stdout, stderr = client.exec_command(command, get_pty=False, timeout=timeout)
         stdin.channel.shutdown_write()
         exit_code, stdout_data, stderr_data = _stream_command_output(stdout, stderr, show_output)
     except Exception as exc:  # noqa: BLE001
         log_error(f"❌ {description}失败：{exc}")
+        LOGGER.error("Remote command execution failed", exc_info=exc)
         return False
 
     if exit_code != 0:
         details = stderr_data or stdout_data or f"退出码 {exit_code}"
         log_error(f"❌ {description}失败：{details}")
+        LOGGER.error(
+            "Remote command returned non-zero",
+            extra={"description": description, "exit_code": exit_code, "stderr": stderr_data[:500]},
+        )
         return False
+    LOGGER.info(
+        "Remote command succeeded",
+        extra={"description": description, "stdout_summary": stdout_data[:500]},
+    )
     return True
 
 
@@ -374,6 +411,14 @@ def _ensure_paramiko_client() -> paramiko.SSHClient:
         if client.get_transport():
             client.get_transport().set_keepalive(30)
     except Exception as exc:  # noqa: BLE001
+        log_error(
+            "❌ SSH 连接失败，请检查 IP、端口、防火墙或私钥是否可用。",
+        )
+        LOGGER.error(
+            "SSH connection failed",
+            exc_info=exc,
+            extra={"hostname": ctx.hostname, "port": 22},
+        )
         raise DeploymentError(f"Paramiko 连接 {ctx.hostname} 失败：{exc}") from exc
 
     _PARAMIKO_CLIENT = client
@@ -3152,7 +3197,7 @@ def test_chatgpt_connection() -> None:
         log_info(f"   原因: {recommendations['reason']}")
     except Exception as exc:
         log_warning(f"⚠️ 获取优化建议失败：{exc}")
-    
+
     # 4. 生成分流配置
     log_info("")
     log_info("→ 步骤 4: 生成分流配置...")
@@ -3161,6 +3206,137 @@ def test_chatgpt_connection() -> None:
         log_success(f"✅ 分流配置已生成：{split_config}")
     except Exception as exc:
         log_error(f"❌ 生成分流配置失败：{exc}")
+
+
+def diagnose_current_connection() -> None:
+    """一键诊断当前 WireGuard 连接状态并记录日志。"""
+
+    log_section("🩺 诊断当前连接状态")
+    summary: list[str] = []
+
+    def run_command(command: list[str], description: str, timeout: int = 20) -> subprocess.CompletedProcess[str] | None:
+        LOGGER.info("Running diagnostic command", extra={"description": description, "command": " ".join(command)})
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=timeout,
+                **_SUBPROCESS_TEXT_KWARGS,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            log_warning(f"⚠️ {description}：命令不存在（{exc}），请确保已安装相关工具。")
+            LOGGER.warning("Diagnostic command missing", extra={"description": description, "command": command})
+            return None
+        except subprocess.SubprocessError as exc:
+            log_error(f"❌ {description}执行失败：{exc}")
+            LOGGER.error("Diagnostic command failed", exc_info=exc, extra={"description": description, "command": command})
+            return None
+
+        LOGGER.info(
+            "Diagnostic command completed",
+            extra={
+                "description": description,
+                "return_code": result.returncode,
+                "stdout": result.stdout[:500],
+                "stderr": result.stderr[:500],
+            },
+        )
+        return result
+
+    # 1. WireGuard 服务状态
+    log_info("→ 检查 WireGuard 服务状态…")
+    service_result = run_command(["systemctl", "status", "wg-quick@wg0", "--no-pager"], "检查 WireGuard 服务")
+    service_status = "未知"
+    if service_result is not None:
+        if "Active: active" in service_result.stdout:
+            service_status = "active"
+            log_success("✅ WireGuard 服务正在运行")
+        else:
+            service_status = "inactive"
+            log_warning("⚠️ WireGuard 服务未在运行，建议重启或重新部署。")
+        LOGGER.info("WireGuard service state", extra={"state": service_status})
+    else:
+        log_warning("⚠️ 无法确认 WireGuard 服务状态")
+    summary.append(f"服务状态：{service_status}")
+
+    # 2. 最近握手状态
+    log_info("→ 检查最近握手…")
+    handshake_result = run_command(["wg", "show", "wg0", "latest-handshakes"], "读取握手状态", timeout=15)
+    recent_handshake_found = False
+    if handshake_result and handshake_result.stdout.strip():
+        now = int(time.time())
+        for line in handshake_result.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            peer, ts_raw = parts[0], parts[-1]
+            try:
+                ts_int = int(ts_raw)
+            except ValueError:
+                LOGGER.warning("Unrecognized handshake line", extra={"line": line})
+                continue
+            if ts_int == 0:
+                log_warning(f"⚠️ {peer} 暂无握手记录，可能是客户端未启动或端口被阻断。")
+                summary.append(f"握手：{peer} 无握手")
+                LOGGER.warning("Peer has no handshake", extra={"peer": peer})
+                continue
+            delta = now - ts_int
+            human_time = datetime.fromtimestamp(ts_int).strftime("%Y-%m-%d %H:%M:%S")
+            if delta > 600:
+                log_warning(f"⚠️ {peer} 最近握手时间：{human_time}，可能存在连通性问题。")
+                summary.append(f"握手：{peer} {human_time}（超 10 分钟）")
+            else:
+                log_success(f"✅ {peer} 最近握手时间：{human_time}（{delta//60} 分钟内）")
+                summary.append(f"握手：{peer} 正常")
+                recent_handshake_found = True
+            LOGGER.info("Peer handshake status", extra={"peer": peer, "last_handshake": human_time, "age_seconds": delta})
+    else:
+        log_warning("⚠️ 未获取到握手信息，可能 wg 未运行或接口名称不同。")
+        summary.append("握手：未知")
+
+    # 3. 出口 IP 检测
+    log_info("→ 检测出口 IP…")
+    ip_result = run_command(["curl", "-4", "-s", "ifconfig.me"], "检测出口 IP", timeout=20)
+    exit_ip = ip_result.stdout.strip() if ip_result else ""
+    if exit_ip:
+        log_info(f"当前出口 IP：{exit_ip}")
+        summary.append(f"出口 IP：{exit_ip}")
+        LOGGER.info("Exit IP detected", extra={"ip": exit_ip})
+    else:
+        log_warning("⚠️ 无法获取出口 IP，可能未联网或 curl 不可用。")
+        summary.append("出口 IP：未知")
+
+    # 4. DNS 测试
+    log_info("→ 测试 DNS 解析…")
+    dns_domain = "github.com"
+    dns_start = time.perf_counter()
+    try:
+        infos = socket.getaddrinfo(dns_domain, 80)
+        duration_ms = (time.perf_counter() - dns_start) * 1000
+        first_ip = infos[0][4][0] if infos else ""
+        log_success(f"✅ DNS 解析成功：{dns_domain} → {first_ip}（{duration_ms:.1f} ms）")
+        LOGGER.info(
+            "DNS lookup succeeded",
+            extra={"domain": dns_domain, "ip": first_ip, "duration_ms": round(duration_ms, 1)},
+        )
+        summary.append("DNS：正常")
+    except socket.gaierror as exc:
+        log_error(f"❌ DNS 解析失败（{dns_domain}）：{exc}. 建议检查本地网络或更换 DNS。")
+        LOGGER.error("DNS lookup failed", exc_info=exc, extra={"domain": dns_domain})
+        summary.append("DNS：失败")
+
+    # 5. 诊断总结
+    log_info("\n诊断总结：")
+    for item in summary:
+        log_info(f"- {item}")
+
+    if service_status != "active":
+        log_warning("服务未运行，建议尝试重启：systemctl restart wg-quick@wg0 或重新部署。")
+    if not recent_handshake_found:
+        log_warning("未检测到近期握手，可能是 IP/端口被封、客户端配置错误或服务器未监听。")
+    if summary and "DNS：失败" in summary:
+        log_warning("DNS 解析存在问题，可尝试更换 DNS 或检查本地网络。")
 
 
 def _check_and_auto_configure_instances() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -4626,6 +4802,7 @@ MENU_ACTIONS: tuple[MenuAction, ...] = (
     MenuAction("9", "连接质量报告", view_connection_report),
     MenuAction("10", "参数调整建议", view_parameter_recommendations),
     MenuAction("11", "ChatGPT 连接测试", test_chatgpt_connection),
+    MenuAction("12", "诊断当前连接状态", diagnose_current_connection),
 )
 
 EXIT_CHOICES = {"q", "quit", "exit"}
