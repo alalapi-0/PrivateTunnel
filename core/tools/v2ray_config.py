@@ -2,107 +2,101 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
 import uuid
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+def _warn_if_ip(value: str) -> None:
+    """Log a warning when an IP is used where a domain is expected."""
+
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return
+    logger.warning("V2Ray SNI/Host 建议使用域名，但收到 IP：%s", value)
 
 
 def generate_v2ray_uuid() -> str:
     """生成 V2Ray UUID。Generate a V2Ray UUID."""
+
     return str(uuid.uuid4())
 
 
 def generate_v2ray_server_config(
-    port: int = 443,
+    listen_port: int,
+    domain: str,
+    tls_cert_path: str,
+    tls_key_path: str,
+    ws_path: str = "/ws",
     uuid: str | None = None,
-    ws_path: str = "/ray",
-    tls_cert_path: str = "/etc/v2ray/cert.pem",
-    tls_key_path: str = "/etc/v2ray/key.pem",
 ) -> dict[str, Any]:
-    """生成 V2Ray 服务器端配置。
-    
-    Generate V2Ray server configuration with WebSocket + TLS transport.
-    
-    Args:
-        port: V2Ray 监听端口（默认 443，伪装 HTTPS）
-        uuid: VMess UUID，如果为 None 则自动生成
-        ws_path: WebSocket 路径
-        tls_cert_path: TLS 证书路径
-        tls_key_path: TLS 私钥路径
-    
-    Returns:
-        V2Ray 配置字典
-    """
+    """生成 V2Ray 服务器端配置（WebSocket + TLS）。"""
+
+    _warn_if_ip(domain)
+
     if uuid is None:
         uuid = generate_v2ray_uuid()
-    
+
     config = {
         "log": {
             "loglevel": "warning",
             "access": "/var/log/v2ray/access.log",
-            "error": "/var/log/v2ray/error.log"
+            "error": "/var/log/v2ray/error.log",
         },
         "inbounds": [
             {
-                "port": port,
+                "port": listen_port,
                 "protocol": "vmess",
                 "settings": {
                     "clients": [
                         {
                             "id": uuid,
                             "alterId": 0,
-                            "security": "auto"
+                            "security": "auto",
                         }
                     ],
-                    "disableInsecureEncryption": True
+                    "disableInsecureEncryption": True,
                 },
                 "streamSettings": {
                     "network": "ws",
                     "security": "tls",
                     "wsSettings": {
                         "path": ws_path,
-                        "headers": {}
+                        "headers": {"Host": domain},
                     },
                     "tlsSettings": {
+                        "serverName": domain,
                         "certificates": [
                             {
                                 "certificateFile": tls_cert_path,
-                                "keyFile": tls_key_path
+                                "keyFile": tls_key_path,
                             }
                         ],
                         "minVersion": "1.2",
                         "maxVersion": "1.3",
-                        "cipherSuites": ""
-                    }
-                }
+                        "cipherSuites": "",
+                    },
+                },
             }
         ],
         "outbounds": [
             {
                 "protocol": "freedom",
-                "settings": {}
+                "settings": {},
             }
         ],
-        "routing": {
-            "domainStrategy": "AsIs",
-            "rules": []
-        }
+        "routing": {"domainStrategy": "AsIs", "rules": []},
     }
-    
+
     return config
 
 
 def generate_v2ray_config_json(config: dict[str, Any], indent: int = 2) -> str:
-    """将 V2Ray 配置转换为 JSON 字符串。
-    
-    Convert V2Ray configuration dictionary to JSON string.
-    
-    Args:
-        config: V2Ray 配置字典
-        indent: JSON 缩进（默认 2）
-    
-    Returns:
-        JSON 字符串
-    """
-    return json.dumps(config, indent=indent, ensure_ascii=False)
+    """将 V2Ray 配置转换为 JSON 字符串。"""
 
+    return json.dumps(config, indent=indent, ensure_ascii=False)
