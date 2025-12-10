@@ -47,3 +47,14 @@
 2. 执行诊断，检查终端与 `artifacts/logs/privatetunnel.log` 是否同时记录步骤与结果。
 3. 启动连接监控后观察日志是否定期记录延迟/丢包；触发异常时日志是否包含 WARNING/ERROR。
 4. 重新跑一次部署流程，确认新的日志文件生成且旧功能（如配置下载）不受影响。
+
+## R3：面向大陆的低成本连通性补丁
+- **端口选择**：默认优先尝试 `443`，如本机检测到被占用则在 `20000–45000` 间随机挑选可用端口并写日志（尝试/最终值）。客户端与服务端配置统一使用选出的端口。
+- **DNS 策略**：默认 DNS 顺序为 `223.5.5.5, 114.114.114.114, 1.1.1.1, 8.8.8.8`，用户设置 `PT_DNS` 时优先生效。生成配置时会在日志中打印实际使用列表。
+- **Keepalive / MTU**：Keepalive 默认在 20 秒基础上加入随机扰动（约 15–30s，用户显式指定时关闭随机）；MTU 采用“用户 > 探测 > 默认 1420”优先级，决策来源会写入日志。
+- **连接监控自恢复**：监控采集失败会按指数退避重试，连续多次健康检查失败（默认 3 次）会触发一次 WireGuard 重启（带 5 分钟节流），重启前后均记录日志并追加一次健康检测。
+
+### 日志查阅指引
+- 端口选择：在 `privatetunnel.log` 搜索 `WireGuard port` 或 `fallback` 关键字。
+- DNS/Keepalive/MTU：部署阶段会记录 `客户端 DNS`、`Keepalive`、`MTU` 等行，随机扰动的基准和偏移会以 `Keepalive chosen with jitter` 的 extra 字段出现。
+- 监控重试：连接采集失败会输出 `Connection metrics failed` WARNING，自动重启时会出现 `Attempting WireGuard restart for node`、`WireGuard restart triggered/failed` 等日志，事后验证记录为 `Post-recovery health check`。

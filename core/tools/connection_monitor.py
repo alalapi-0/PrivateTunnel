@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import statistics
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -83,6 +84,11 @@ class ConnectionMonitor:
         else:
             self.param_tuner = None
 
+        self.failure_streak = 0
+        self.max_failures_before_recovery = 3
+        self.recovery_cooldown_seconds = 300
+        self.last_recovery_time: float | None = None
+
         # 回调函数
         self.on_metrics_update: Callable[[ConnectionMetrics], None] | None = None
         self.on_quality_degraded: Callable[[ConnectionMetrics], None] | None = None
@@ -138,6 +144,37 @@ class ConnectionMonitor:
             self._save_session(self.current_session)
             self.current_session = None
 
+    def _collect_metrics_with_retry(
+        self, last_metrics: ConnectionMetrics | None = None, max_retries: int = 3, base_delay: float = 2.0
+    ) -> ConnectionMetrics:
+        """Wrap :meth:`_collect_metrics_once` with bounded retries."""
+
+        last_exception: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                return self._collect_metrics_once(last_metrics)
+            except Exception as exc:  # noqa: BLE001
+                last_exception = exc
+                delay = base_delay * (2**attempt)
+                LOGGER.warning(
+                    "Connection metrics failed",
+                    extra={
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "delay_seconds": round(delay, 1),
+                        "node_id": self.node_id,
+                        "error": str(exc),
+                    },
+                )
+                time.sleep(delay)
+
+        LOGGER.error(
+            "Connection metrics failed after retries", extra={"node_id": self.node_id, "error": str(last_exception)}
+        )
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("Connection metrics retry exhausted")
+
     def _monitor_loop(self) -> None:
         """监控循环。Monitor loop."""
         last_metrics: ConnectionMetrics | None = None
@@ -146,9 +183,31 @@ class ConnectionMonitor:
         while not self.stop_event.is_set():
             try:
                 # 收集指标
-                metrics = self._collect_metrics(last_metrics)
+                metrics = self._collect_metrics_with_retry(last_metrics)
 
                 if metrics:
+                    if metrics.connection_healthy is False:
+                        self.failure_streak += 1
+                        LOGGER.warning(
+                            "Connection health degraded",
+                            extra={
+                                "node_id": self.node_id,
+                                "node_ip": self.node_ip,
+                                "failure_streak": self.failure_streak,
+                            },
+                        )
+                    else:
+                        if self.failure_streak:
+                            LOGGER.info(
+                                "Connection recovered",
+                                extra={
+                                    "node_id": self.node_id,
+                                    "node_ip": self.node_ip,
+                                    "previous_failures": self.failure_streak,
+                                },
+                            )
+                        self.failure_streak = 0
+
                     # 更新历史
                     if metrics.latency_ms:
                         self.latency_history.append(metrics.latency_ms)
@@ -196,6 +255,26 @@ class ConnectionMonitor:
                             check_count = 0
                             self._evaluate_and_adjust_params()
 
+                    if metrics.connection_healthy is False and self.failure_streak >= self.max_failures_before_recovery:
+                        recovered = self._attempt_recovery()
+                        if recovered:
+                            self.failure_streak = 0
+                            try:
+                                post_metrics = self._collect_metrics_with_retry(None)
+                                LOGGER.info(
+                                    "Post-recovery health check",
+                                    extra={
+                                        "node_id": self.node_id,
+                                        "latency_ms": post_metrics.latency_ms,
+                                        "healthy": post_metrics.connection_healthy,
+                                    },
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                LOGGER.warning(
+                                    "Post-recovery verification failed",
+                                    extra={"node_id": self.node_id, "error": str(exc)},
+                                )
+
                     last_metrics = metrics
 
                 # 等待下次检查
@@ -209,8 +288,8 @@ class ConnectionMonitor:
                 )
                 time.sleep(self.check_interval)
 
-    def _collect_metrics(self, last_metrics: ConnectionMetrics | None = None) -> ConnectionMetrics | None:
-        """收集指标。Collect metrics."""
+    def _collect_metrics_once(self, last_metrics: ConnectionMetrics | None = None) -> ConnectionMetrics:
+        """收集一次指标。Collect metrics once."""
         metrics = ConnectionMetrics()
 
         # 1. 延迟检测
@@ -218,6 +297,7 @@ class ConnectionMonitor:
             self.node_ip,
             self.wireguard_port,
         )
+        metrics.connection_healthy = health_metrics.overall_healthy
 
         if health_metrics.latency_ms:
             metrics.latency_ms = health_metrics.latency_ms
@@ -251,6 +331,67 @@ class ConnectionMonitor:
         # 这里暂时设为 0，后续可以通过 wg show 命令获取
 
         return metrics
+
+    def _attempt_recovery(self) -> bool:
+        """Attempt lightweight self-recovery for the current node."""
+
+        now = time.time()
+        if self.last_recovery_time and now - self.last_recovery_time < self.recovery_cooldown_seconds:
+            LOGGER.warning(
+                "Skipping recovery due to cooldown",
+                extra={"node_id": self.node_id, "cooldown": self.recovery_cooldown_seconds},
+            )
+            return False
+
+        self.last_recovery_time = now
+        LOGGER.warning(
+            "Attempting WireGuard restart for node", extra={"node_id": self.node_id, "node_ip": self.node_ip}
+        )
+
+        success = self._restart_wireguard()
+        if success:
+            LOGGER.info(
+                "WireGuard restart triggered",
+                extra={"node_id": self.node_id, "node_ip": self.node_ip},
+            )
+        else:
+            LOGGER.error("WireGuard restart failed", extra={"node_id": self.node_id, "node_ip": self.node_ip})
+        return success
+
+    def _restart_wireguard(self) -> bool:
+        restart_cmd = ["systemctl", "restart", "wg-quick@wg0"]
+        if self._run_recovery_command(restart_cmd):
+            return True
+
+        down_up_commands = (["wg-quick", "down", "wg0"], ["wg-quick", "up", "wg0"])
+        down_ok = self._run_recovery_command(down_up_commands[0])
+        up_ok = self._run_recovery_command(down_up_commands[1]) if down_ok else False
+        return down_ok and up_ok
+
+    def _run_recovery_command(self, command: tuple[str, ...] | list[str]) -> bool:
+        try:
+            result = subprocess.run(command, check=False, capture_output=True, text=True)
+        except FileNotFoundError:
+            LOGGER.error("Recovery command not found", extra={"command": " ".join(command)})
+            return False
+
+        if result.returncode == 0:
+            LOGGER.info(
+                "Recovery command succeeded",
+                extra={"command": " ".join(command), "node_id": self.node_id},
+            )
+            return True
+
+        LOGGER.warning(
+            "Recovery command failed",
+            extra={
+                "command": " ".join(command),
+                "returncode": result.returncode,
+                "stderr": (result.stderr or "").strip(),
+                "node_id": self.node_id,
+            },
+        )
+        return False
 
     def _check_quality_degraded(self, metrics: ConnectionMetrics) -> bool:
         """检查质量是否下降。Check if quality degraded."""

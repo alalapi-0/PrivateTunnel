@@ -23,6 +23,7 @@ class ConnectionMetrics:
     rx_bytes: int = 0  # 接收字节数
     tx_packets: int = 0  # 发送包数
     rx_packets: int = 0  # 接收包数
+    connection_healthy: bool | None = None  # 健康状态
 
     def __post_init__(self):
         if self.timestamp == 0:
@@ -42,6 +43,7 @@ class ConnectionMetrics:
             "rx_bytes": self.rx_bytes,
             "tx_packets": self.tx_packets,
             "rx_packets": self.rx_packets,
+            "connection_healthy": self.connection_healthy,
         }
 
     @classmethod
