@@ -32,6 +32,13 @@
   - `DEFAULT_IPHONE_ADDRESS`, `DEFAULT_DESKTOP_ADDRESS`, `DEFAULT_ALLOWED_IPS`
 - 未来的环境配置可在 `core/config/env_profiles.py` 中扩展。当前仅提供 `DEFAULT_PROFILE`，与现有默认行为一致。
 
+## 针对中国大陆环境的低成本优化（R3）
+
+- **端口策略**：`core/port_config.py` 默认优先使用 `443`，如被占用则在 `20000–45000` 间挑选可用端口并记录日志，确保服务端与客户端配置一致。
+- **DNS 默认**：`core/config/defaults.py` 中的 `DEFAULT_DNS_LIST` 采用“国内优先 + 海外备选”的顺序，`main.py` 生成配置时会使用该列表并允许 `PT_DNS` 覆盖。
+- **Keepalive/MTU 决策**：`core/tools/network_params.py` 负责生成带随机扰动的 Keepalive（可被用户指定覆盖）和“用户 > 探测 > 默认 1420”优先级的 MTU，决策细节通过统一日志输出。
+- **连接监控自恢复**：`core/tools/connection_monitor.py` 增加采集重试与节流的 WireGuard 重启自恢复流程，避免短时异常导致监控退出。
+
 ## Legacy 标注
 
 - `legacy/server/provision/wg-install.sh` 已在文件头标记为 LEGACY，现行 Windows 部署流程不再直接调用，仅供手工运维排障参考。

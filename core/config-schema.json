@@ -89,7 +89,7 @@
           "minimum": 0,
           "maximum": 65535,
           "default": 25,
-          "description": "PersistentKeepalive 秒数，未指定时工具会采用默认值 25。"
+          "description": "PersistentKeepalive 秒数，未指定时工具会在 20±jitter 区间内自动选择。"
         }
       }
     },

@@ -26,6 +26,7 @@ from core.config.defaults import (
     DEFAULT_ALLOWED_IPS,
     DEFAULT_CLIENT_MTU,
     DEFAULT_DESKTOP_ADDRESS,
+    DEFAULT_DNS_LIST,
     DEFAULT_DNS_STRING,
     DEFAULT_IPHONE_ADDRESS,
     DEFAULT_KEEPALIVE_SECONDS,
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.logging_utils import setup_logging
+from core.tools.network_params import decide_client_mtu, generate_keepalive_value
 
 if sys.version_info < (3, 8):
     raise SystemExit(
@@ -2903,6 +2905,72 @@ def _resolve_env_default(
     return default, None
 
 
+def _resolve_dns_servers() -> tuple[str, list[str], str | None]:
+    """Resolve DNS servers with domestic-first defaults and logging."""
+
+    raw_dns = os.environ.get("PT_DNS", "").strip()
+    source: str | None = None
+    if raw_dns:
+        source = "PT_DNS"
+        dns_list = [item.strip() for item in raw_dns.split(",") if item.strip()]
+    else:
+        dns_list = DEFAULT_DNS_LIST
+
+    dns_value = ", ".join(dns_list)
+    LOGGER.info("Using DNS servers", extra={"dns": dns_list, "source": source or "default"})
+    return dns_value, dns_list, source
+
+
+def _resolve_keepalive(enable_adaptive: bool, adaptive_node_id: str | None = None) -> tuple[str, str | None]:
+    """Resolve keepalive value with jitter unless user overrides."""
+
+    if enable_adaptive:
+        from core.tools.adaptive_params import AdaptiveParameterTuner
+
+        tuner = AdaptiveParameterTuner(adaptive_node_id or "default")
+        current_params = tuner.current_params
+        LOGGER.info(
+            "Using adaptive keepalive",
+            extra={"keepalive": current_params.keepalive, "node": adaptive_node_id or "default"},
+        )
+        return str(current_params.keepalive), "adaptive"
+
+    keepalive_raw = os.environ.get("PT_KEEPALIVE", "").strip()
+    if keepalive_raw and not keepalive_raw.isdigit():
+        LOGGER.warning(
+            "Invalid keepalive override; falling back to jitter",
+            extra={"value": keepalive_raw},
+        )
+    keepalive_override = int(keepalive_raw) if keepalive_raw.isdigit() else None
+    keepalive_value = generate_keepalive_value(keepalive_override)
+    return str(keepalive_value), ("PT_KEEPALIVE" if keepalive_override is not None else None)
+
+
+def _resolve_client_mtu(enable_adaptive: bool, adaptive_node_id: str | None = None) -> tuple[str, str | None]:
+    """Resolve client MTU honoring overrides and adaptive params."""
+
+    if enable_adaptive:
+        from core.tools.adaptive_params import AdaptiveParameterTuner
+
+        tuner = AdaptiveParameterTuner(adaptive_node_id or "default")
+        current_params = tuner.current_params
+        LOGGER.info(
+            "Using adaptive MTU",
+            extra={"mtu": current_params.mtu, "node": adaptive_node_id or "default"},
+        )
+        return str(current_params.mtu), "adaptive"
+
+    client_mtu_raw = os.environ.get("PT_CLIENT_MTU", "").strip()
+    if client_mtu_raw and not client_mtu_raw.isdigit():
+        LOGGER.warning(
+            "Invalid MTU override; falling back to probe/default",
+            extra={"value": client_mtu_raw},
+        )
+    client_mtu = int(client_mtu_raw) if client_mtu_raw.isdigit() else None
+    mtu_value = decide_client_mtu(client_mtu)
+    return str(mtu_value), ("PT_CLIENT_MTU" if client_mtu is not None else None)
+
+
 def _default_private_key_prompt() -> str:
     """Return the default SSH private key path prompt for Step 3."""
 
@@ -3456,23 +3524,14 @@ def _deploy_wireguard_to_instance(
     # 获取配置参数（使用环境变量或默认值）
     desktop_ip, _ = _resolve_env_default("PT_DESKTOP_IP", default=DEFAULT_DESKTOP_ADDRESS)
     iphone_ip, _ = _resolve_env_default("PT_IPHONE_IP", default=DEFAULT_IPHONE_ADDRESS)
-    dns_value, _ = _resolve_env_default("PT_DNS", default=DEFAULT_DNS_STRING)
+    dns_value, _, _ = _resolve_dns_servers()
     allowed_ips, _ = _resolve_env_default("PT_ALLOWED_IPS", default=DEFAULT_ALLOWED_IPS)
-    
+
     # 解析 Keepalive 和 MTU
     enable_adaptive = os.environ.get("PT_ENABLE_ADAPTIVE", "").strip().lower() in ("true", "1", "yes")
-    if enable_adaptive:
-        from core.tools.adaptive_params import AdaptiveParameterTuner
-        adaptive_node_id = instance_id[:8] if instance_id else "default"
-        tuner = AdaptiveParameterTuner(adaptive_node_id)
-        current_params = tuner.current_params
-        keepalive_value = str(current_params.keepalive)
-        desktop_mtu = str(current_params.mtu)
-    else:
-        keepalive_value, _ = _resolve_env_default(
-            "PT_KEEPALIVE", default=str(DEFAULT_KEEPALIVE_SECONDS)
-        )
-        desktop_mtu = os.environ.get("PT_CLIENT_MTU", "").strip() or str(DEFAULT_CLIENT_MTU)
+    adaptive_node_id = instance_id[:8] if instance_id else "default"
+    keepalive_value, _ = _resolve_keepalive(enable_adaptive, adaptive_node_id)
+    desktop_mtu, _ = _resolve_client_mtu(enable_adaptive, adaptive_node_id)
     
     # V2Ray 配置
     enable_v2ray = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower() in ("true", "1", "yes")
@@ -4067,12 +4126,14 @@ def prepare_wireguard_access() -> None:
             "→ iPhone 客户端 IP：{value} （默认值，可通过环境变量 PT_IPHONE_IP 覆盖）".format(value=iphone_ip)
         )
 
-    dns_value, dns_source = _resolve_env_default("PT_DNS", default=DEFAULT_DNS_STRING)
+    dns_value, dns_list, dns_source = _resolve_dns_servers()
     if dns_source:
         log_info(f"→ 客户端 DNS：{dns_value} （来自环境变量 {dns_source}）")
     else:
         log_info(
-            "→ 客户端 DNS：{value} （默认值，可通过环境变量 PT_DNS 覆盖）".format(value=dns_value)
+            "→ 客户端 DNS：{value} （国内优先默认，可通过环境变量 PT_DNS 覆盖）".format(
+                value=dns_value
+            )
         )
 
     allowed_ips, allowed_source = _resolve_env_default("PT_ALLOWED_IPS", default=DEFAULT_ALLOWED_IPS)
@@ -4088,65 +4149,36 @@ def prepare_wireguard_access() -> None:
     # 解析 PersistentKeepalive 参数
     enable_adaptive = os.environ.get("PT_ENABLE_ADAPTIVE", "").strip().lower() in ("true", "1", "yes")
 
+    adaptive_node_id = None
     if enable_adaptive:
-        # 自适应模式：从历史记录加载参数
-        from core.tools.adaptive_params import AdaptiveParameterTuner
-
-        # 确定节点 ID
-        adaptive_node_id = None
         if use_multi_node and 'selected_node_id' in locals() and selected_node_id:
             adaptive_node_id = selected_node_id
         else:
             adaptive_node_id = instance_id[:8] if instance_id else "default"
 
-        tuner = AdaptiveParameterTuner(adaptive_node_id)
-        current_params = tuner.current_params
-
-        keepalive_value = str(current_params.keepalive)
-        desktop_mtu = str(current_params.mtu)
-
-        log_info(f"→ 自适应参数模式已启用")
-        log_info(f"→ 当前 Keepalive：{keepalive_value} 秒（自适应调整）")
-        log_info(f"→ 当前 MTU：{desktop_mtu}（自适应调整）")
+    keepalive_value, keepalive_source = _resolve_keepalive(enable_adaptive, adaptive_node_id)
+    if keepalive_source == "adaptive":
+        log_info(f"→ 自适应参数模式已启用，Keepalive：{keepalive_value} 秒")
+    elif keepalive_source:
+        log_info(f"→ 客户端 Keepalive：{keepalive_value} 秒 （来自环境变量 {keepalive_source}）")
     else:
-        # 手动模式：从环境变量或默认值
-        keepalive_value, keepalive_source = _resolve_env_default(
-            "PT_KEEPALIVE", default=str(DEFAULT_KEEPALIVE_SECONDS)
+        log_info(
+            "→ 客户端 Keepalive：{value} 秒（默认使用基准+随机扰动，可通过环境变量 PT_KEEPALIVE 覆盖）".format(
+                value=keepalive_value
+            )
         )
-        if keepalive_source:
-            log_info(f"→ 客户端 Keepalive：{keepalive_value} 秒 （来自环境变量 {keepalive_source}）")
-        else:
-            log_info(f"→ 客户端 Keepalive：{keepalive_value} 秒（默认值，可通过环境变量 PT_KEEPALIVE 覆盖）")
 
-        # 验证 keepalive 值有效性
-        try:
-            keepalive_int = int(keepalive_value)
-            if not 0 <= keepalive_int <= 65535:
-                log_warning(
-                    "⚠️ Keepalive 值 {value} 超出有效范围 (0-65535)，将使用默认值 {default}".format(
-                        value=keepalive_int, default=DEFAULT_KEEPALIVE_SECONDS
-                    )
-                )
-                keepalive_value = str(DEFAULT_KEEPALIVE_SECONDS)
-        except ValueError:
-            log_warning(
-                "⚠️ Keepalive 值 '{value}' 无效，将使用默认值 {default}".format(
-                    value=keepalive_value, default=DEFAULT_KEEPALIVE_SECONDS
-                )
+    desktop_mtu, mtu_source = _resolve_client_mtu(enable_adaptive, adaptive_node_id)
+    if mtu_source == "adaptive":
+        log_info(f"→ 自适应参数模式已启用，MTU：{desktop_mtu}")
+    elif mtu_source:
+        log_info(f"→ 客户端 MTU：{desktop_mtu} （来自环境变量 {mtu_source}）")
+    else:
+        log_info(
+            "→ 客户端 MTU：{value}（默认值，可通过环境变量 PT_CLIENT_MTU 覆盖）".format(
+                value=desktop_mtu
             )
-            keepalive_value = str(DEFAULT_KEEPALIVE_SECONDS)
-
-        client_mtu_raw = os.environ.get("PT_CLIENT_MTU", "").strip()
-        if client_mtu_raw:
-            desktop_mtu = client_mtu_raw
-            log_info(f"→ 客户端 MTU：{desktop_mtu} （来自环境变量 PT_CLIENT_MTU）")
-        else:
-            desktop_mtu = str(DEFAULT_CLIENT_MTU)
-            log_info(
-                "→ 客户端 MTU：{value}（默认值，可通过环境变量 PT_CLIENT_MTU 覆盖）".format(
-                    value=desktop_mtu
-                )
-            )
+        )
 
     # V2Ray 配置参数
     enable_v2ray_raw = os.environ.get("PT_ENABLE_V2RAY", "").strip().lower()

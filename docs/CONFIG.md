@@ -34,7 +34,7 @@ JSON 配置生成 WireGuard 客户端配置文件，并进一步导出二维码�
   - `address`：隧道内分配给客户端的 IP (CIDR)。
   - `dns`：至少一个 DNS 地址或域名，按 WireGuard `DNS =` 语法写入。
   - `mtu`：可选；不填则保持默认。
-  - `keepalive`：`PersistentKeepalive` 间隔秒数，未提供时默认 25；如需关闭可显式
+  - `keepalive`：`PersistentKeepalive` 间隔秒数，未提供时默认基于 20 秒加随机扰动（约 15–30s）；如需关闭可显式
     设为 0。
 - `routing`：分流策略。
   - `mode`：`global` 表示全局代理，`whitelist` 表示按域名白名单。
