@@ -7,9 +7,13 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import logging
 
 from core.config.defaults import DEFAULT_CLIENT_MTU, DEFAULT_KEEPALIVE_SECONDS
 from core.tools.connection_stats import ConnectionMetrics, ConnectionSession
+from core.logging_utils import get_logger
+
+LOGGER = get_logger(__name__)
 
 
 @dataclass
@@ -122,8 +126,12 @@ class AdaptiveParameterTuner:
                 ]
                 if data.get("current_params"):
                     self.current_params = ParameterSet.from_dict(data["current_params"])
-            except Exception:
-                pass
+                LOGGER.info(
+                    "Loaded adaptive parameter history",
+                    extra={"node_id": self.node_id, "history_entries": len(self.adjustment_history)},
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Failed to load adaptive history", exc_info=exc, extra={"node_id": self.node_id})
 
     def _save_history(self) -> None:
         """保存调整历史。Save adjustment history."""
@@ -138,6 +146,10 @@ class AdaptiveParameterTuner:
                 ensure_ascii=False,
             ),
             encoding="utf-8",
+        )
+        LOGGER.info(
+            "Saved adaptive parameter history",
+            extra={"node_id": self.node_id, "current_params": self.current_params.to_dict()},
         )
 
     def analyze_and_suggest(
@@ -156,6 +168,16 @@ class AdaptiveParameterTuner:
         """
         if current_params is None:
             current_params = self.current_params
+
+        LOGGER.info(
+            "Analyzing session for adaptive suggestions",
+            extra={
+                "node_id": self.node_id,
+                "avg_latency": session.avg_latency_ms,
+                "avg_packet_loss": session.avg_packet_loss,
+                "reconnects": session.total_reconnects,
+            },
+        )
 
         suggested = ParameterSet(
             keepalive=current_params.keepalive,
@@ -176,6 +198,16 @@ class AdaptiveParameterTuner:
             reasons.append(mtu_reason)
 
         reason = "; ".join(reasons) if reasons else "无需调整"
+
+        LOGGER.info(
+            "Adaptive suggestion computed",
+            extra={
+                "node_id": self.node_id,
+                "keepalive": suggested.keepalive,
+                "mtu": suggested.mtu,
+                "reason": reason,
+            },
+        )
 
         return suggested, reason
 
@@ -333,6 +365,17 @@ class AdaptiveParameterTuner:
         self.adjustment_history.append(adjustment)
         self._save_history()
 
+        LOGGER.info(
+            "Applied adaptive adjustment",
+            extra={
+                "node_id": self.node_id,
+                "adjustment_id": adjustment.adjustment_id,
+                "old": adjustment.old_params.to_dict(),
+                "new": adjustment.new_params.to_dict(),
+                "reason": reason,
+            },
+        )
+
         return adjustment
 
     def evaluate_adjustment(
@@ -347,6 +390,17 @@ class AdaptiveParameterTuner:
             quality_after: 调整后的质量评分
         """
         adjustment.quality_after = quality_after
+
+        LOGGER.info(
+            "Evaluated adaptive adjustment",
+            extra={
+                "node_id": adjustment.node_id,
+                "adjustment_id": adjustment.adjustment_id,
+                "quality_before": adjustment.quality_before,
+                "quality_after": quality_after,
+                "success": adjustment.success,
+            },
+        )
 
         # 判断调整是否成功
         if adjustment.quality_before is not None:
