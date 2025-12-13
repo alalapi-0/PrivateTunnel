@@ -38,6 +38,7 @@ from core.config.defaults import (
     DEFAULT_V2RAY_PORT,
     DEFAULT_V2RAY_WS_PATH,
 )
+from core.network.endpoints import Endpoint, endpoint_to_dict, load_endpoints_from_data
 from core.project_overview import generate_project_overview
 from dataclasses import dataclass
 from datetime import datetime
@@ -2044,7 +2045,12 @@ def _log_selected_platform() -> None:
         log_warning("⚠️ 尚未选择本机系统，可通过第 1 步执行环境检查。")
 
 
-def _update_server_info(data: dict[str, Any]) -> None:
+def _update_server_info(
+    data: dict[str, Any],
+    *,
+    endpoints: list[Endpoint] | None = None,
+    meta: dict[str, Any] | None = None,
+) -> None:
     """更新服务器信息，支持多节点。Update server info, supporting multi-node."""
     artifacts_dir = ARTIFACTS_DIR
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -2110,11 +2116,85 @@ def _update_server_info(data: dict[str, Any]) -> None:
                 existing = json.loads(server_file.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 existing = {}
+        if endpoints is not None:
+            existing["endpoints"] = [endpoint_to_dict(ep) for ep in endpoints]
+            if endpoints:
+                existing["real_ip"] = endpoints[0].real_ip
+                if not existing.get("endpoint"):
+                    for ep in endpoints:
+                        if ep.transport == "wireguard":
+                            existing["endpoint"] = f"{ep.real_ip}:{ep.port}"
+                            break
+
+        if meta is not None:
+            merged_meta = existing.get("meta", {}) or {}
+            for key, value in meta.items():
+                if key == "created_at" and merged_meta.get("created_at"):
+                    continue
+                merged_meta[key] = value
+            existing["meta"] = merged_meta
+
         existing.update(data)
         server_file.write_text(
             json.dumps(existing, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if endpoints:
+            summary = ", ".join(
+                f"{ep.transport}@{ep.real_ip}:{ep.port}" + (f"|{ep.domain}" if ep.domain else "")
+                for ep in endpoints
+            )
+            LOGGER.info("server.json updated with endpoints", extra={"endpoints": summary})
+
+
+def _load_server_metadata() -> dict[str, Any]:
+    server_file = ARTIFACTS_DIR / "server.json"
+    if not server_file.exists():
+        return {}
+    try:
+        return json.loads(server_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _load_saved_endpoints() -> list[Endpoint]:
+    data = _load_server_metadata()
+    return load_endpoints_from_data(data)
+
+
+def _print_endpoint_overview() -> None:
+    endpoints = _load_saved_endpoints()
+    if not endpoints:
+        log_warning("⚠️ server.json 未包含 endpoint 列表，可能需要重新部署。")
+        return
+
+    log_info("→ 当前记录的出口列表：")
+    for idx, ep in enumerate(endpoints, start=1):
+        base = f"[{idx}] {ep.transport} {ep.real_ip}:{ep.port}"
+        domain_part = ""
+        if ep.domain:
+            domain_part = f" | domain={ep.domain}"
+        if ep.front_domain:
+            domain_part += f" | front_domain={ep.front_domain}"
+        ws_part = f" | ws_path={ep.ws_path}" if ep.ws_path else ""
+        log_info(f"   - {base}{domain_part}{ws_part}")
+
+
+def _parse_port_from_endpoint(endpoint: str | None) -> Optional[int]:
+    if not endpoint or ":" not in endpoint:
+        return None
+    try:
+        _, port_str = endpoint.rsplit(":", 1)
+        return int(port_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def _select_endpoint(endpoints: list[Endpoint], transport: str) -> Endpoint | None:
+    for ep in endpoints:
+        if ep.transport == transport:
+            return ep
+    return None
 
 
 def _wireguard_windows_candidate_paths() -> list[Path]:
@@ -3294,6 +3374,7 @@ def diagnose_current_connection() -> None:
     """一键诊断当前 WireGuard 连接状态并记录日志。"""
 
     log_section("🩺 诊断当前连接状态")
+    _print_endpoint_overview()
     summary: list[str] = []
 
     def run_command(command: list[str], description: str, timeout: int = 20) -> subprocess.CompletedProcess[str] | None:
@@ -3444,11 +3525,23 @@ def view_v2ray_status() -> None:
     if not enabled:
         return
 
+    endpoints = _load_saved_endpoints()
+    endpoint = _select_endpoint(endpoints, "v2ray_ws_tls")
+
     domain = metadata.get("domain", "")
     port = metadata.get("port")
     ws_path = metadata.get("ws_path", DEFAULT_V2RAY_WS_PATH)
     uuid = metadata.get("uuid")
+    if endpoint:
+        domain = endpoint.domain or domain
+        port = endpoint.port
+        ws_path = endpoint.ws_path or ws_path
+        log_info(
+            f"→ Endpoint: {endpoint.transport} {endpoint.real_ip}:{endpoint.port} | domain={endpoint.domain} | front_domain={endpoint.front_domain}"
+        )
     log_info(f"→ 域名/SNI：{domain}")
+    if endpoint and endpoint.front_domain:
+        log_info(f"→ front_domain（Host/SNI）：{endpoint.front_domain}")
     log_info(f"→ 端口：{port}")
     log_info(f"→ WebSocket 路径：{ws_path}")
     if metadata.get("cert_path"):
@@ -3477,6 +3570,7 @@ def view_v2ray_status() -> None:
         server_port=int(port),
         ws_path=ws_path,
         uuid=uuid,
+        front_domain=endpoint.front_domain if endpoint else None,
     )
     save_v2ray_config(new_config, str(client_path))
     vmess_url = generate_vmess_url(
@@ -3484,6 +3578,7 @@ def view_v2ray_status() -> None:
         server_port=int(port),
         ws_path=ws_path,
         uuid=uuid,
+        front_domain=endpoint.front_domain if endpoint else None,
     )
     vmess_path.write_text(vmess_url, encoding="utf-8")
     log_success("✅ 已重新生成客户端配置和 VMess 导入链接")
@@ -3780,18 +3875,29 @@ def _deploy_wireguard_to_instance(
         server_pub = server_info.get("server_pub", "")
         endpoint_ip = server_info.get("endpoint_ip", ip)
         wan_interface = server_info.get("wan_if", "")
-        
+
         endpoint = f"{endpoint_ip}:{LISTEN_PORT}" if endpoint_ip else None
-        
+        endpoint_port = _parse_port_from_endpoint(endpoint) or LISTEN_PORT
+
+        endpoint_wg = Endpoint(
+            real_ip=endpoint_ip,
+            port=endpoint_port,
+            domain=None,
+            transport="wireguard",
+        )
+        endpoints: list[Endpoint] = [endpoint_wg]
+
         # 更新服务器信息
         server_data = {
             "id": instance_id,
             "ip": ip,
+            "real_ip": endpoint_ip,
             "server_pub": server_pub,
             "endpoint": endpoint,
+            "port": endpoint_port,
             "wan_interface": wan_interface,
         }
-        
+
         if use_multi_node:
             from core.tools.multi_node_manager import MultiNodeManager, NodeStatus
             manager = MultiNodeManager()
@@ -3804,7 +3910,12 @@ def _deploy_wireguard_to_instance(
             )
             manager.update_node_status(node_id, NodeStatus.ACTIVE)
         else:
-            _update_server_info(server_data)
+            meta_update = {
+                "provider": "vultr",
+                "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+                "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+            }
+            _update_server_info(server_data, endpoints=[endpoint_wg], meta=meta_update)
         
         log_success("✅ 服务器信息已更新")
     except Exception as exc:
@@ -3866,18 +3977,30 @@ def _deploy_wireguard_to_instance(
         vmess_path = ARTIFACTS_DIR / "v2ray_vmess.txt"
         metadata_path = ARTIFACTS_DIR / "v2ray_server.json"
 
-        client_config = generate_v2ray_client_config(
-            server_domain=v2ray_domain,
-            server_port=v2ray_port,
+        endpoint_v2 = Endpoint(
+            real_ip=ip,
+            port=int(v2ray_port),
+            domain=v2ray_domain,
+            front_domain=None,
+            transport="v2ray_ws_tls",
             ws_path=v2ray_ws_path,
+        )
+        endpoints.append(endpoint_v2)
+
+        client_config = generate_v2ray_client_config(
+            server_domain=endpoint_v2.domain or endpoint_v2.real_ip,
+            server_port=endpoint_v2.port,
+            ws_path=endpoint_v2.ws_path,
             uuid=v2ray_uuid,
+            front_domain=endpoint_v2.front_domain,
         )
         save_v2ray_config(client_config, str(client_path))
         vmess_url = generate_vmess_url(
-            server_domain=v2ray_domain,
-            server_port=v2ray_port,
-            ws_path=v2ray_ws_path,
+            server_domain=endpoint_v2.domain or endpoint_v2.real_ip,
+            server_port=endpoint_v2.port,
+            ws_path=endpoint_v2.ws_path,
             uuid=v2ray_uuid,
+            front_domain=endpoint_v2.front_domain,
         )
         vmess_path.write_text(vmess_url, encoding="utf-8")
 
@@ -4854,9 +4977,11 @@ def prepare_wireguard_access() -> None:
         server_info: dict[str, Any] = {
             "id": instance_id,
             "ip": ip,
+            "real_ip": endpoint_ip,
             "server_pub": server_pub,
             "platform": SELECTED_PLATFORM or "",
             "endpoint": endpoint,
+            "port": endpoint_port,
             "desktop_ip": desktop_ip,
             "iphone_ip": iphone_ip,
             "desktop_public_key": desktop_pub,
@@ -4875,7 +5000,8 @@ def prepare_wireguard_access() -> None:
         if v2ray_enabled:
             server_info["v2ray_port"] = v2ray_port
             server_info["v2ray_uuid"] = v2ray_uuid
-            server_info["v2ray_ws_path"] = "/ray"
+            server_info["v2ray_ws_path"] = v2ray_ws_path
+            server_info["v2ray_domain"] = v2ray_domain
             # V2Ray 配置文件路径
             v2ray_client_dir = artifacts_dir / "v2ray"
             if (v2ray_client_dir / "desktop.json").exists():
@@ -4884,7 +5010,11 @@ def prepare_wireguard_access() -> None:
                 server_info["v2ray_iphone_config"] = str(v2ray_client_dir / "iphone.json")
             if (v2ray_client_dir / "vmess-url.txt").exists():
                 server_info["v2ray_vmess_url"] = str(v2ray_client_dir / "vmess-url.txt")
-        _update_server_info(server_info)
+        meta_update = {
+            "provider": "vultr",
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+        _update_server_info(server_info, endpoints=endpoints, meta=meta_update)
 
         log_info("验证指南：")
         log_info(f"  1. Windows 打开 WireGuard 导入 {_rel(desktop_conf_local)} 并连接。")

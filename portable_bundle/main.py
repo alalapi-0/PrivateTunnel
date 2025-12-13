@@ -16,7 +16,7 @@ from .core.project_overview import generate_project_overview
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 if sys.version_info < (3, 8):
     raise SystemExit(
@@ -25,6 +25,7 @@ if sys.version_info < (3, 8):
 
 import paramiko
 
+from .core.network.endpoints import Endpoint, endpoint_to_dict, load_endpoints_from_data
 from .core.port_config import resolve_listen_port
 
 
@@ -596,15 +597,15 @@ def deploy_wireguard_remote_script(
 
         log "安装 WireGuard 组件"
 
-        apt_retry() {
+        apt_retry() {{
           local desc="$1"
           shift
           local cmd=("$@")
 
-          for i in {1..10}; do
-            log "执行 apt 操作（第 ${i} 次）：${desc}"
-            if "${cmd[@]}"; then
-              log "apt 操作成功：${desc}"
+          for i in {{1..10}}; do
+            log "执行 apt 操作（第 ${{i}} 次）：${{desc}}"
+            if "${{cmd[@]}}"; then
+              log "apt 操作成功：${{desc}}"
               return 0
             fi
 
@@ -612,9 +613,9 @@ def deploy_wireguard_remote_script(
             sleep 10
           done
 
-          err "apt 操作多次重试仍失败：${desc}"
+          err "apt 操作多次重试仍失败：${{desc}}"
           return 1
-        }
+        }}
 
         apt_retry "apt-get update" apt-get update -y
         apt_retry "安装 wireguard 及相关组件" apt-get install -y \
@@ -1223,7 +1224,12 @@ def _log_selected_platform() -> None:
         log_warning("⚠️ 尚未选择本机系统，可通过第 1 步执行环境检查。")
 
 
-def _update_server_info(data: dict[str, Any]) -> None:
+def _update_server_info(
+    data: dict[str, Any],
+    *,
+    endpoints: list[Endpoint] | None = None,
+    meta: Optional[dict[str, Any]] = None,
+) -> None:
     artifacts_dir = ARTIFACTS_DIR
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     server_file = artifacts_dir / "server.json"
@@ -1233,6 +1239,30 @@ def _update_server_info(data: dict[str, Any]) -> None:
             existing = json.loads(server_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             existing = {}
+
+    if endpoints is None:
+        endpoints = load_endpoints_from_data(data) or load_endpoints_from_data(existing)
+        if not endpoints and data.get("ip") and data.get("port"):
+            try:
+                endpoints = [
+                    Endpoint(real_ip=str(data["ip"]), port=int(data["port"]), transport="wireguard")
+                ]
+            except (TypeError, ValueError):
+                endpoints = []
+
+    if endpoints:
+        existing["endpoints"] = [endpoint_to_dict(ep) for ep in endpoints]
+        if not existing.get("real_ip"):
+            existing["real_ip"] = endpoints[0].real_ip
+
+    if meta is not None:
+        merged_meta = existing.get("meta", {}) or {}
+        for key, value in meta.items():
+            if key == "created_at" and merged_meta.get("created_at"):
+                continue
+            merged_meta[key] = value
+        existing["meta"] = merged_meta
+
     existing.update(data)
     server_file.write_text(
         json.dumps(existing, ensure_ascii=False, indent=2),

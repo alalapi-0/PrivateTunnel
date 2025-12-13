@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 from typing import Dict
 
+from core.network.endpoints import Endpoint, endpoint_to_dict
+
 from core.port_config import resolve_listen_port
 from core.ssh_utils import (
     SSHAttempt,
@@ -189,10 +191,13 @@ def _record_server_info(ip: str, provision_result: dict) -> None:
     except (TypeError, ValueError):
         port = default_port
 
+    endpoint = Endpoint(real_ip=ip, port=port, transport="wireguard")
     payload = {
         "ip": ip,
+        "real_ip": ip,
         "server_pub": provision_result.get("server_pub", ""),
         "port": port,
+        "endpoints": [endpoint_to_dict(endpoint)],
     }
     path = _artifacts_dir() / "server.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

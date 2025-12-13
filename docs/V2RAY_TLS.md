@@ -26,6 +26,11 @@
 - `artifacts/v2ray_vmess.txt`：VMess 导入链接文本，便于复制粘贴。
 - 在主菜单选择“查看 / 重新生成 V2Ray 配置”可再次生成客户端配置，或查看域名/端口/证书路径等元数据。
 
+## 域前置字段（front_domain）
+
+- R5 在客户端配置层面预留了域前置字段：当 `front_domain` 提供时，生成的 V2Ray 客户端配置会使用 `front_domain` 作为 Host/SNI，而在元数据中保留真实的 `domain`（回源域名）。
+- 当前版本仅完成配置表达和占位，未对 CDN/前置链路做实际改动，后续版本将扩展 `DomainFrontingManager` 完成具体交付。
+
 ## 手动验证步骤
 
 1. 运行 `python main.py`，按照提示输入解析到服务器的域名完成部署。
