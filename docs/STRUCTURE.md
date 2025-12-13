@@ -17,6 +17,24 @@
 - `portable_bundle/` — 便携打包资源与旧版客户端/服务器支持文件。
 - `tests/` — 测试用例与覆盖检查。
 
+## Endpoint 模型（R5）
+
+- 新增 `core/network/endpoints.py` 定义统一的出口描述结构 `Endpoint`，字段包含 `real_ip`、`port`、`domain`、`front_domain`、`transport`、`ws_path`。
+- `artifacts/server.json` 现以 `endpoints` 数组记录出口信息，例如：
+
+```json
+{
+  "real_ip": "203.0.113.10",
+  "endpoints": [
+    {"real_ip": "203.0.113.10", "port": 443, "transport": "wireguard", "domain": null, "front_domain": null},
+    {"real_ip": "203.0.113.10", "port": 443, "transport": "v2ray_ws_tls", "domain": "example.com", "front_domain": "cdn.example.com", "ws_path": "/ws"}
+  ],
+  "meta": {"provider": "vultr", "created_at": "...", "updated_at": "..."}
+}
+```
+
+- 客户端配置生成、诊断输出等均通过 `Endpoint` 抽象获取地址与域名信息，为后续多出口或域前置扩展铺路。
+
 ## 入口与核心模块
 
 - **客户端入口：** `main.py` 提供 Windows 友好的交互式菜单，整合 Vultr 创建、SSH 探活、WireGuard 部署与配置下载。

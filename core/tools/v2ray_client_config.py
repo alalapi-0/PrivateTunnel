@@ -6,7 +6,7 @@ import base64
 import ipaddress
 import json
 import logging
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -19,20 +19,38 @@ def _warn_if_ip(value: str) -> None:
     logger.warning("V2Ray host/sni 建议使用域名，但收到 IP：%s", value)
 
 
+def _effective_host(server_domain: str, front_domain: Optional[str]) -> str:
+    return front_domain or server_domain
+
+
 def generate_v2ray_client_config(
     server_domain: str,
     server_port: int,
+    ws_path: str,
     uuid: str,
-    ws_path: str = "/ws",
+    front_domain: Optional[str] = None,
     local_socks_port: int = 10808,
     local_http_port: int = 10809,
 ) -> dict[str, Any]:
     """生成 V2Ray 客户端配置。"""
 
-    _warn_if_ip(server_domain)
+    effective_host = _effective_host(server_domain, front_domain)
+    _warn_if_ip(effective_host)
+
+    logger.info(
+        "v2ray client config generated: real_domain=%s, front_domain=%s, port=%s, ws_path=%s",
+        server_domain,
+        front_domain,
+        server_port,
+        ws_path,
+    )
 
     config = {
         "log": {"loglevel": "warning"},
+        "pt_metadata": {
+            "real_domain": server_domain,
+            "front_domain": front_domain,
+        },
         "inbounds": [
             {
                 "port": local_socks_port,
@@ -53,7 +71,7 @@ def generate_v2ray_client_config(
                 "settings": {
                     "vnext": [
                         {
-                            "address": server_domain,
+                            "address": effective_host,
                             "port": server_port,
                             "users": [
                                 {
@@ -68,8 +86,8 @@ def generate_v2ray_client_config(
                 "streamSettings": {
                     "network": "ws",
                     "security": "tls",
-                    "wsSettings": {"path": ws_path, "headers": {"Host": server_domain}},
-                    "tlsSettings": {"allowInsecure": True, "serverName": server_domain},
+                    "wsSettings": {"path": ws_path, "headers": {"Host": effective_host}},
+                    "tlsSettings": {"allowInsecure": True, "serverName": effective_host},
                 },
                 "tag": "proxy",
             },
@@ -96,25 +114,28 @@ def generate_vmess_url(
     uuid: str,
     ws_path: str = "/ws",
     remark: str = "PrivateTunnel-V2Ray",
+    front_domain: Optional[str] = None,
 ) -> str:
     """生成 VMess URL。"""
 
-    _warn_if_ip(server_domain)
+    effective_host = _effective_host(server_domain, front_domain)
+    _warn_if_ip(effective_host)
 
     vmess_json = {
         "v": "2",
         "ps": remark,
-        "add": server_domain,
+        "add": effective_host,
         "port": str(server_port),
         "id": uuid,
         "aid": "0",
         "scy": "auto",
         "net": "ws",
         "type": "none",
-        "host": server_domain,
+        "host": effective_host,
         "path": ws_path,
         "tls": "tls",
-        "sni": server_domain,
+        "sni": effective_host,
+        "real": server_domain,
     }
 
     json_str = json.dumps(vmess_json, separators=(",", ":"))
